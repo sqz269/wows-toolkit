@@ -74,6 +74,7 @@ struct DecodedPrimitive {
 /// Primitives whose MFM stem matches a key will have the texture applied as
 /// `baseColorTexture` on their material. Camo variants are exposed via
 /// `KHR_materials_variants` so users can switch in Blender.
+#[allow(clippy::too_many_arguments)]
 pub fn export_glb(
     visual: &VisualPrototype,
     geometry: &MergedGeometry,
@@ -82,6 +83,7 @@ pub fn export_glb(
     texture_set: &TextureSet,
     damaged: bool,
     all_render_sets: bool,
+    tex_out: &mut TextureOutput,
     writer: &mut impl Write,
 ) -> Result<(), Report<ExportError>> {
     let self_id_index = db.build_self_id_index();
@@ -110,7 +112,7 @@ pub fn export_glb(
         }
 
         for (rs_name, prim) in &named_primitives {
-            let gltf_prim = add_primitive_to_root(&mut root, &mut bin_data, prim, texture_set, &mut mat_cache)?;
+            let gltf_prim = add_primitive_to_root(&mut root, &mut bin_data, tex_out, prim, texture_set, &mut mat_cache)?;
             let mesh = root.push(json::Mesh {
                 primitives: vec![gltf_prim],
                 weights: None,
@@ -143,7 +145,7 @@ pub fn export_glb(
 
         let mut gltf_primitives = Vec::new();
         for prim in &primitives {
-            let gltf_prim = add_primitive_to_root(&mut root, &mut bin_data, prim, texture_set, &mut mat_cache)?;
+            let gltf_prim = add_primitive_to_root(&mut root, &mut bin_data, tex_out, prim, texture_set, &mut mat_cache)?;
             gltf_primitives.push(gltf_prim);
         }
 
@@ -1325,9 +1327,12 @@ pub fn export_merged_models_glb(
             return Ok(None);
         }
 
+        // Map-scene export doesn't carry PBR textures (empty TextureSet), so
+        // embed_png_texture is never called — use a local Embedded sink.
+        let mut local_tex_out = TextureOutput::Embedded;
         let mut gltf_primitives = Vec::new();
         for prim in &primitives {
-            let gltf_prim = add_primitive_to_root(root, bin_data, prim, &empty_textures, mat_cache)?;
+            let gltf_prim = add_primitive_to_root(root, bin_data, &mut local_tex_out, prim, &empty_textures, mat_cache)?;
             gltf_primitives.push(gltf_prim);
         }
 
@@ -1564,7 +1569,8 @@ pub fn export_geometry_raw(geometry: &MergedGeometry, writer: &mut impl Write) -
 
         let empty_textures = TextureSet::empty();
         let mut mat_cache = MaterialCache::new();
-        let gltf_prim = add_primitive_to_root(&mut root, &mut bin_data, &prim, &empty_textures, &mut mat_cache)?;
+        let mut local_tex_out = TextureOutput::Embedded;
+        let gltf_prim = add_primitive_to_root(&mut root, &mut bin_data, &mut local_tex_out, &prim, &empty_textures, &mut mat_cache)?;
         gltf_primitives.push(gltf_prim);
     }
 
@@ -2133,6 +2139,54 @@ fn apply_barrel_pitch(
     }
 }
 
+/// How to emit textures in the exported glTF: embedded in the GLB binary
+/// chunk (one self-contained file, the historical behaviour), or written
+/// out as sibling PNG files referenced by URI (small GLB, shared textures
+/// on disk).
+///
+/// `Embedded` is the default. `External` is intended for the shared
+/// accessory library, where every ship that mounts the same turret should
+/// reference one on-disk texture, not re-embed it per ship.
+pub enum TextureOutput {
+    /// Embed PNG bytes inside the GLB's BIN chunk. Produces large, self-
+    /// contained files. Historical behaviour.
+    Embedded,
+    /// Write PNGs to `dir` on disk; the glTF references each via a URI
+    /// relative to the GLB location (`{uri_prefix}{filename}`). Files
+    /// already written during this session are not re-written — the same
+    /// texture used by multiple materials reuses the existing PNG.
+    External {
+        /// Absolute path to the directory that receives the PNGs.
+        dir: std::path::PathBuf,
+        /// Prefix prepended to every filename when emitted as a URI.
+        /// Typically a relative path like `"textures/"` so viewers resolve
+        /// the PNGs relative to the GLB's own directory. Must include the
+        /// trailing slash if a subdirectory is intended.
+        uri_prefix: String,
+        /// Filenames already written this session (dedup).
+        written: std::collections::HashSet<String>,
+    },
+}
+
+impl TextureOutput {
+    /// Construct an [`External`] output. Creates the directory if missing.
+    pub fn external(dir: impl Into<std::path::PathBuf>, uri_prefix: impl Into<String>) -> Self {
+        let dir = dir.into();
+        let _ = std::fs::create_dir_all(&dir);
+        Self::External {
+            dir,
+            uri_prefix: uri_prefix.into(),
+            written: std::collections::HashSet::new(),
+        }
+    }
+}
+
+impl Default for TextureOutput {
+    fn default() -> Self {
+        Self::Embedded
+    }
+}
+
 /// All texture data for a ship export: base albedo, PBR auxiliary
 /// channels (normal / metallic-gloss / AO), and camouflage variants.
 ///
@@ -2199,6 +2253,11 @@ impl MaterialCache {
 /// Embed a PNG image into the glTF buffer and return a `json::texture::Info`
 /// ready to wire into any material slot (base_color, normal, MR, AO, ...).
 ///
+/// Routing: if `tex_out` is [`TextureOutput::Embedded`] the PNG bytes get
+/// appended to `bin_data` and referenced via a `bufferView`. If
+/// [`TextureOutput::External`], the PNG is written to disk (once per
+/// unique filename) and the glTF references it via a URI.
+///
 /// `uv_transform` is an optional `[scale_x, scale_y, offset_x, offset_y]`
 /// applied via `KHR_texture_transform` for tiled camouflage textures. All
 /// slots on one material share the same UV transform (they sample the
@@ -2206,34 +2265,68 @@ impl MaterialCache {
 fn embed_png_texture(
     root: &mut json::Root,
     bin_data: &mut Vec<u8>,
+    tex_out: &mut TextureOutput,
     png_bytes: &[u8],
     image_name: Option<String>,
     uv_transform: Option<[f32; 4]>,
 ) -> json::texture::Info {
-    let byte_offset = bin_data.len();
-    bin_data.extend_from_slice(png_bytes);
-    pad_to_4(bin_data);
-    let byte_length = png_bytes.len();
+    let image = match tex_out {
+        TextureOutput::Embedded => {
+            let byte_offset = bin_data.len();
+            bin_data.extend_from_slice(png_bytes);
+            pad_to_4(bin_data);
+            let byte_length = png_bytes.len();
 
-    let bv = root.push(json::buffer::View {
-        buffer: json::Index::new(0),
-        byte_length: USize64::from(byte_length),
-        byte_offset: Some(USize64::from(byte_offset)),
-        byte_stride: None,
-        target: None,
-        name: None,
-        extensions: Default::default(),
-        extras: Default::default(),
-    });
+            let bv = root.push(json::buffer::View {
+                buffer: json::Index::new(0),
+                byte_length: USize64::from(byte_length),
+                byte_offset: Some(USize64::from(byte_offset)),
+                byte_stride: None,
+                target: None,
+                name: None,
+                extensions: Default::default(),
+                extras: Default::default(),
+            });
 
-    let image = root.push(json::Image {
-        buffer_view: Some(bv),
-        mime_type: Some(json::image::MimeType("image/png".to_string())),
-        uri: None,
-        name: image_name,
-        extensions: Default::default(),
-        extras: Default::default(),
-    });
+            root.push(json::Image {
+                buffer_view: Some(bv),
+                mime_type: Some(json::image::MimeType("image/png".to_string())),
+                uri: None,
+                name: image_name,
+                extensions: Default::default(),
+                extras: Default::default(),
+            })
+        }
+        TextureOutput::External { dir, uri_prefix, written } => {
+            // Filename: prefer the glTF image name (already unique per
+            // material stem + channel suffix); fall back to a sequential
+            // placeholder only if unnamed.
+            let fallback = format!("img_{:04}", root.images.len());
+            let stem = image_name.as_deref().unwrap_or(&fallback);
+            let filename = format!("{stem}.png");
+
+            // Write once per unique filename. If the same texture is used
+            // by multiple materials (KHR_materials_variants, cross-scheme
+            // reuse), later calls skip the disk write but still push a
+            // fresh glTF Image referencing the same URI.
+            if !written.contains(&filename) {
+                let path = dir.join(&filename);
+                if let Err(e) = std::fs::write(&path, png_bytes) {
+                    eprintln!("  Warning: failed to write texture {}: {e}", path.display());
+                }
+                written.insert(filename.clone());
+            }
+
+            root.push(json::Image {
+                buffer_view: None,
+                mime_type: Some(json::image::MimeType("image/png".to_string())),
+                uri: Some(format!("{uri_prefix}{filename}")),
+                name: image_name,
+                extensions: Default::default(),
+                extras: Default::default(),
+            })
+        }
+    };
 
     let sampler = root.push(json::texture::Sampler {
         mag_filter: Some(Valid(json::texture::MagFilter::Linear)),
@@ -2284,6 +2377,7 @@ fn embed_png_texture(
 fn create_textured_material(
     root: &mut json::Root,
     bin_data: &mut Vec<u8>,
+    tex_out: &mut TextureOutput,
     albedo_png: &[u8],
     normal_png: Option<&[u8]>,
     metallic_roughness_png: Option<&[u8]>,
@@ -2292,12 +2386,13 @@ fn create_textured_material(
     image_name: Option<String>,
     uv_transform: Option<[f32; 4]>,
 ) -> json::Index<json::Material> {
-    let base_info = embed_png_texture(root, bin_data, albedo_png, image_name.clone(), uv_transform);
+    let base_info = embed_png_texture(root, bin_data, tex_out, albedo_png, image_name.clone(), uv_transform);
 
     let normal_info = normal_png.map(|png| {
         embed_png_texture(
             root,
             bin_data,
+            tex_out,
             png,
             image_name.as_deref().map(|s| format!("{s}_n")),
             uv_transform,
@@ -2307,6 +2402,7 @@ fn create_textured_material(
         embed_png_texture(
             root,
             bin_data,
+            tex_out,
             png,
             image_name.as_deref().map(|s| format!("{s}_mg")),
             uv_transform,
@@ -2316,6 +2412,7 @@ fn create_textured_material(
         embed_png_texture(
             root,
             bin_data,
+            tex_out,
             png,
             image_name.as_deref().map(|s| format!("{s}_ao")),
             uv_transform,
@@ -2384,6 +2481,7 @@ fn create_untextured_material(root: &mut json::Root, material_name: &str) -> jso
 fn add_primitive_to_root(
     root: &mut json::Root,
     bin_data: &mut Vec<u8>,
+    tex_out: &mut TextureOutput,
     prim: &DecodedPrimitive,
     texture_set: &TextureSet,
     mat_cache: &mut MaterialCache,
@@ -2574,6 +2672,7 @@ fn add_primitive_to_root(
             create_textured_material(
                 root,
                 bin_data,
+                tex_out,
                 png_bytes,
                 normal_png,
                 mr_png,
@@ -2600,6 +2699,7 @@ fn add_primitive_to_root(
                     Some(create_textured_material(
                         root,
                         bin_data,
+                        tex_out,
                         png_bytes,
                         None,
                         None,
@@ -4119,6 +4219,7 @@ fn add_hitbox_primitive_to_root(
 /// `texture_set` contains base albedo + camo variant PNGs for material textures.
 /// `armor_models` are added as additional untextured semi-transparent meshes.
 /// `hitboxes` are emitted as named cube meshes under a top-level "Hitboxes" group.
+#[allow(clippy::too_many_arguments)]
 pub fn export_ship_glb(
     sub_models: &[SubModel<'_>],
     armor_models: &[ArmorSubModel],
@@ -4128,6 +4229,7 @@ pub fn export_ship_glb(
     texture_set: &TextureSet,
     damaged: bool,
     all_render_sets: bool,
+    tex_out: &mut TextureOutput,
     writer: &mut impl Write,
 ) -> Result<(), Report<ExportError>> {
     let mut root = json::Root {
@@ -4168,7 +4270,7 @@ pub fn export_ship_glb(
 
             for (rs_name, prim) in &named_primitives {
                 let gltf_prim =
-                    add_primitive_to_root(&mut root, &mut bin_data, prim, texture_set, &mut mat_cache)?;
+                    add_primitive_to_root(&mut root, &mut bin_data, tex_out, prim, texture_set, &mut mat_cache)?;
                 // Scope the render set under its parent sub-model for
                 // collision-free, tool-readable names.
                 let mesh_name = format!("{} / {}", sub.name, rs_name);
@@ -4219,7 +4321,7 @@ pub fn export_ship_glb(
 
         let mut gltf_primitives = Vec::new();
         for prim in &primitives {
-            let gltf_prim = add_primitive_to_root(&mut root, &mut bin_data, prim, texture_set, &mut mat_cache)?;
+            let gltf_prim = add_primitive_to_root(&mut root, &mut bin_data, tex_out, prim, texture_set, &mut mat_cache)?;
             gltf_primitives.push(gltf_prim);
         }
 

@@ -129,6 +129,18 @@ pub struct ShipExportOptions {
     ///
     /// Field contract: see `run_export_ship` docs in the CLI.
     pub placements_json_path: Option<PathBuf>,
+    /// If set, write textures as PNG files to this directory and reference
+    /// them via URIs in the glTF, instead of embedding them in the GLB's
+    /// BIN chunk. Useful for the shared accessory library where many ships
+    /// should reference one on-disk copy of each texture. Default: `None`
+    /// (embedded, historical behaviour).
+    pub textures_dir: Option<PathBuf>,
+    /// Prefix prepended to every texture filename when emitted as a URI in
+    /// the glTF (e.g. `"textures/"`). Must include the trailing slash if a
+    /// subdirectory is intended. Only used when `textures_dir` is `Some`.
+    /// The default `"textures/"` works when the textures dir is placed as a
+    /// `textures/` sub-directory next to the GLB.
+    pub textures_uri_prefix: String,
 }
 
 impl Default for ShipExportOptions {
@@ -142,6 +154,8 @@ impl Default for ShipExportOptions {
             accessory_mode: AccessoryMode::Embed,
             module_overrides: std::collections::HashMap::new(),
             placements_json_path: None,
+            textures_dir: None,
+            textures_uri_prefix: "textures/".to_string(),
         }
     }
 }
@@ -1584,6 +1598,10 @@ impl ShipModelContext {
             .map(|boxes| boxes.iter().map(gltf_export::hitbox_from_splash).collect())
             .unwrap_or_default();
 
+        let mut tex_out = match &self.options.textures_dir {
+            Some(dir) => gltf_export::TextureOutput::external(dir, &self.options.textures_uri_prefix),
+            None => gltf_export::TextureOutput::Embedded,
+        };
         gltf_export::export_ship_glb(
             &sub_models,
             &armor_meshes,
@@ -1593,6 +1611,7 @@ impl ShipModelContext {
             &texture_set,
             self.options.damaged,
             self.options.all_render_sets,
+            &mut tex_out,
             writer,
         )
         .context("Failed to export ship GLB")?;

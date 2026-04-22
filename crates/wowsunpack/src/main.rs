@@ -204,6 +204,19 @@ enum Commands {
         #[arg(long)]
         all_render_sets: bool,
 
+        /// If set, write textures as PNG files into this directory and
+        /// reference them via URIs in the glTF instead of embedding them
+        /// in the GLB's BIN chunk. Directory is created if missing.
+        #[arg(long)]
+        textures_dir: Option<PathBuf>,
+
+        /// URI prefix prepended to every texture filename in the glTF
+        /// (e.g. "textures/"). Default: "textures/". Must include the
+        /// trailing slash if a subdirectory is intended. Only used with
+        /// `--textures-dir`.
+        #[arg(long)]
+        textures_uri_prefix: Option<String>,
+
         /// List available camouflage texture schemes, then exit
         #[arg(long)]
         list_textures: bool,
@@ -275,6 +288,21 @@ enum Commands {
         ///     position: [x,y,z] } }
         #[arg(long)]
         placements_json: Option<PathBuf>,
+
+        /// If set, write textures as PNG files into this directory and
+        /// reference them via URIs in the glTF instead of embedding them
+        /// in the GLB's BIN chunk. Intended for shared-library exports
+        /// where many ships reference one on-disk copy of each texture.
+        /// The directory is created if missing.
+        #[arg(long)]
+        textures_dir: Option<PathBuf>,
+
+        /// URI prefix prepended to every texture filename in the glTF
+        /// (e.g. "textures/"). Default: "textures/". Must include the
+        /// trailing slash if a subdirectory is intended. Only used when
+        /// `--textures-dir` is set.
+        #[arg(long)]
+        textures_uri_prefix: Option<String>,
 
         /// List available camouflage texture schemes, then exit
         #[arg(long)]
@@ -1042,7 +1070,7 @@ fn run() -> Result<(), Report> {
             let file_data = read_file_data(&file, no_vfs, vfs.as_ref())?;
             run_geometry(&file_data, &file.to_string_lossy(), decode)?;
         }
-        Commands::ExportModel { file, output, lod, no_textures, damaged, all_render_sets, list_textures, no_vfs } => {
+        Commands::ExportModel { file, output, lod, no_textures, damaged, all_render_sets, textures_dir, textures_uri_prefix, list_textures, no_vfs } => {
             run_export_model(&ExportModelParams {
                 file: &file,
                 output: &output,
@@ -1050,12 +1078,14 @@ fn run() -> Result<(), Report> {
                 no_textures,
                 damaged,
                 all_render_sets,
+                textures_dir: textures_dir.as_deref(),
+                textures_uri_prefix: textures_uri_prefix.as_deref(),
                 list_textures,
                 no_vfs,
                 vfs: vfs.as_ref(),
             })?;
         }
-        Commands::ExportShip { name, output, lod, list_upgrades, hull, no_textures, damaged, all_render_sets, accessories, placements_json, list_textures, debug } => {
+        Commands::ExportShip { name, output, lod, list_upgrades, hull, no_textures, damaged, all_render_sets, accessories, placements_json, textures_dir, textures_uri_prefix, list_textures, debug } => {
             let Some(vfs) = &vfs else {
                 bail!("VFS required for export-ship. Use --game-dir to specify a game install.");
             };
@@ -1074,6 +1104,8 @@ fn run() -> Result<(), Report> {
                 all_render_sets,
                 accessories.into(),
                 placements_json.as_deref(),
+                textures_dir.as_deref(),
+                textures_uri_prefix.as_deref(),
                 list_textures,
                 debug,
             )?;
@@ -1475,14 +1507,18 @@ struct ExportModelParams<'a> {
     no_textures: bool,
     damaged: bool,
     all_render_sets: bool,
+    textures_dir: Option<&'a Path>,
+    textures_uri_prefix: Option<&'a str>,
     list_textures: bool,
     no_vfs: bool,
     vfs: Option<&'a VfsPath>,
 }
 
 fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
-    let ExportModelParams { file, output, lod, no_textures, damaged, all_render_sets, list_textures, no_vfs, vfs } =
-        *params;
+    let ExportModelParams {
+        file, output, lod, no_textures, damaged, all_render_sets,
+        textures_dir, textures_uri_prefix, list_textures, no_vfs, vfs,
+    } = *params;
     use wowsunpack::export::gltf_export;
     use wowsunpack::export::ship::build_texture_set;
     use wowsunpack::export::ship::collect_mfm_info;
@@ -1575,8 +1611,15 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
             build_texture_set(&mfm_infos, vfs, db)
         };
 
+        let mut tex_out = match textures_dir {
+            Some(dir) => gltf_export::TextureOutput::external(
+                dir,
+                textures_uri_prefix.unwrap_or("textures/"),
+            ),
+            None => gltf_export::TextureOutput::Embedded,
+        };
         let mut out_file = std::fs::File::create(output).context("Failed to create output file")?;
-        gltf_export::export_glb(vp, &geom, db, lod, &texture_set, damaged, all_render_sets, &mut out_file)
+        gltf_export::export_glb(vp, &geom, db, lod, &texture_set, damaged, all_render_sets, &mut tex_out, &mut out_file)
             .context("Failed to export GLB")?;
     } else {
         // 4. Fallback: raw geometry export (no visual available).
@@ -1912,6 +1955,7 @@ fn run_export_map(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_export_ship(
     vfs: &VfsPath,
     name: &str,
@@ -1926,6 +1970,8 @@ fn run_export_ship(
     all_render_sets: bool,
     accessory_mode: wowsunpack::export::ship::AccessoryMode,
     placements_json: Option<&Path>,
+    textures_dir: Option<&Path>,
+    textures_uri_prefix: Option<&str>,
     list_textures: bool,
     debug: bool,
 ) -> Result<(), Report> {
@@ -1985,6 +2031,10 @@ fn run_export_ship(
         all_render_sets,
         accessory_mode,
         placements_json_path: placements_json.map(|p| p.to_path_buf()),
+        textures_dir: textures_dir.map(|p| p.to_path_buf()),
+        textures_uri_prefix: textures_uri_prefix
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "textures/".to_string()),
         ..Default::default()
     };
     let ctx = assets.load_ship(name, &options)?;
