@@ -253,6 +253,15 @@ enum Commands {
         #[arg(long)]
         all_render_sets: bool,
 
+        /// Which accessory mounts to embed in the ship GLB.
+        ///   embed       = everything (default, legacy behaviour)
+        ///   main-only   = Main Battery only (for pipelines that rig main
+        ///                 turrets per-ship and use a shared library for
+        ///                 secondary / AA / directors / radar / etc.)
+        ///   exclude     = no accessory meshes at all; hull + armor only
+        #[arg(long, value_enum, default_value = "embed")]
+        accessories: CliAccessoryMode,
+
         /// List available camouflage texture schemes, then exit
         #[arg(long)]
         list_textures: bool,
@@ -365,6 +374,33 @@ enum MetadataFormat {
     Plain,
     Json,
     Csv,
+}
+
+/// CLI mirror of `wowsunpack::export::ship::AccessoryMode`.
+///
+/// Kept as its own type so clap derives `--accessories embed|main-only|exclude`
+/// with the exact group-filter semantics documented in the library enum.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum CliAccessoryMode {
+    /// Embed every accessory mount (Main Battery + Secondary + AA + ...)
+    /// directly in the ship GLB. Default.
+    Embed,
+    /// Keep only Main Battery mounts embedded. Use when main turrets are
+    /// rigged per-ship and everything else comes from a shared library.
+    MainOnly,
+    /// Emit only hull parts (and their armor) — no accessory meshes.
+    Exclude,
+}
+
+impl From<CliAccessoryMode> for wowsunpack::export::ship::AccessoryMode {
+    fn from(m: CliAccessoryMode) -> Self {
+        use wowsunpack::export::ship::AccessoryMode;
+        match m {
+            CliAccessoryMode::Embed => AccessoryMode::Embed,
+            CliAccessoryMode::MainOnly => AccessoryMode::MainOnly,
+            CliAccessoryMode::Exclude => AccessoryMode::Exclude,
+        }
+    }
 }
 
 fn load_idx_file(path: PathBuf) -> Result<idx::IdxFile, Report> {
@@ -994,7 +1030,7 @@ fn run() -> Result<(), Report> {
                 vfs: vfs.as_ref(),
             })?;
         }
-        Commands::ExportShip { name, output, lod, list_upgrades, hull, no_textures, damaged, all_render_sets, list_textures, debug } => {
+        Commands::ExportShip { name, output, lod, list_upgrades, hull, no_textures, damaged, all_render_sets, accessories, list_textures, debug } => {
             let Some(vfs) = &vfs else {
                 bail!("VFS required for export-ship. Use --game-dir to specify a game install.");
             };
@@ -1011,6 +1047,7 @@ fn run() -> Result<(), Report> {
                 no_textures,
                 damaged,
                 all_render_sets,
+                accessories.into(),
                 list_textures,
                 debug,
             )?;
@@ -1861,6 +1898,7 @@ fn run_export_ship(
     no_textures: bool,
     damaged: bool,
     all_render_sets: bool,
+    accessory_mode: wowsunpack::export::ship::AccessoryMode,
     list_textures: bool,
     debug: bool,
 ) -> Result<(), Report> {
@@ -1918,6 +1956,7 @@ fn run_export_ship(
         textures: !no_textures,
         damaged,
         all_render_sets,
+        accessory_mode,
         ..Default::default()
     };
     let ctx = assets.load_ship(name, &options)?;

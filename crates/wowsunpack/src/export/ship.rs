@@ -52,6 +52,40 @@ use super::texture;
 // Public types
 // ---------------------------------------------------------------------------
 
+/// Which mounted accessories to embed in a ship-level export.
+///
+/// Driven by `MountSpecies::display_group`; the matching group names are in
+/// [`mount_group`]. Hull sub-models are always emitted regardless of mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum AccessoryMode {
+    /// Embed every mount's mesh (and its per-mount armor zones) in the GLB.
+    /// Historical default — produces a fully-self-contained ship with every
+    /// secondary turret, AA gun, director, etc. baked in.
+    Embed,
+    /// Embed only Main Battery mounts. Use when Main guns are manually rigged
+    /// per-ship in Blender and everything else comes from a shared-asset
+    /// library at Unity import time.
+    MainOnly,
+    /// Emit only hull parts (and their armor) — no mount meshes, no per-mount
+    /// armor. Companion placement data for the sidecar's `accessories[]`
+    /// section is assumed to come from a separate call (or from the visual's
+    /// node tree walk downstream).
+    Exclude,
+}
+
+impl AccessoryMode {
+    /// Return true if this group should be embedded under the mode.
+    /// `display_group` is [`MountSpecies::display_group`]'s string.
+    pub fn includes_group(self, display_group: &str) -> bool {
+        match self {
+            AccessoryMode::Embed => true,
+            AccessoryMode::MainOnly => display_group == "Main Battery",
+            AccessoryMode::Exclude => false,
+        }
+    }
+}
+
 /// Options controlling ship model export.
 #[derive(Debug, Clone)]
 pub struct ShipExportOptions {
@@ -74,6 +108,13 @@ pub struct ShipExportOptions {
     /// `_patch_`); downstream consumers filter by name. `_hide` is still
     /// excluded. Default: false (preserves historical single-LOD behaviour).
     pub all_render_sets: bool,
+    /// Which accessory mounts to embed in the ship GLB. Default:
+    /// [`AccessoryMode::Embed`] — every mount is baked in. Use
+    /// [`AccessoryMode::MainOnly`] when main turrets are rigged per-ship
+    /// (Blender side) but secondaries / AAs / directors come from a
+    /// shared-asset library at import time; use [`AccessoryMode::Exclude`]
+    /// for a pure hull+armor export.
+    pub accessory_mode: AccessoryMode,
     /// Module overrides: component type key (e.g. "artillery") to component name.
     /// Overrides the default component for specific types.
     pub module_overrides: std::collections::HashMap<crate::game_params::keys::ComponentType, String>,
@@ -87,6 +128,7 @@ impl Default for ShipExportOptions {
             textures: true,
             damaged: false,
             all_render_sets: false,
+            accessory_mode: AccessoryMode::Embed,
             module_overrides: std::collections::HashMap::new(),
         }
     }
@@ -1232,8 +1274,14 @@ impl ShipModelContext {
             });
         }
 
-        // Mounted components.
+        // Mounted components. Filtered by `accessory_mode` so the caller can
+        // keep main turrets (or nothing) in the ship GLB while secondaries /
+        // AAs / etc. come from a shared-asset library downstream.
         for mount in &self.mounts {
+            let group = mount_group(mount.species);
+            if !self.options.accessory_mode.includes_group(group) {
+                continue;
+            }
             let turret_data = &self.turret_models[mount.turret_model_index];
             let turret_geom = &turret_geoms[mount.turret_model_index];
 
@@ -1242,7 +1290,7 @@ impl ShipModelContext {
                 visual: &turret_data.visual,
                 geometry: turret_geom,
                 transform: mount.transform,
-                group: mount_group(mount.species),
+                group,
                 barrel_pitch: mount.barrel_pitch.clone(),
             });
         }
@@ -1345,7 +1393,13 @@ impl ShipModelContext {
         }
 
         // Turret armor: instance per mount with that mount's transform.
+        // Follows the same accessory-mode filter as the mount meshes so the
+        // two stay consistent.
         for mount in &self.mounts {
+            let group = mount_group(mount.species);
+            if !self.options.accessory_mode.includes_group(group) {
+                continue;
+            }
             let turret_geom = &turret_geoms[mount.turret_model_index];
             for am in &turret_geom.armor_models {
                 let mut subs = gltf_export::armor_sub_models_by_zone(am, armor_map, mount.mount_armor.as_ref());
