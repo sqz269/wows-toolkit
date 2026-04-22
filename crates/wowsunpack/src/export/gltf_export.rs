@@ -2602,6 +2602,53 @@ fn add_armor_primitive_to_root(
         attributes.insert(Valid(json::mesh::Semantic::Colors(0)), color_acc);
     }
 
+    // --- _MATERIAL_ID (custom user-defined attribute, u16 scalar) ---
+    //
+    // Emitted as a glTF 2.0 custom vertex attribute (leading `_` per spec)
+    // so Unity can resolve `RaycastHit.triangleIndex → material_id →
+    // sidecar.armor.materials_table[material_id].thickness_mm` at raycast
+    // time. Blender's glTF importer preserves this as a named attribute
+    // layer. Value range is u8 natively (from `ArmorTriangle.material_id`);
+    // stored as u16 to leave headroom for a future packed `(layer << 8) |
+    // material_id` encoding without a schema break.
+    if !armor.material_ids.is_empty() {
+        // Buffer view stride must be multiple-of-4 for u16, but glTF allows
+        // tightly-packed scalars. We pad the view length, not the stride.
+        let byte_offset = bin_data.len();
+        for &mid in &armor.material_ids {
+            bin_data.extend_from_slice(&mid.to_le_bytes());
+        }
+        pad_to_4(bin_data);
+        let byte_length = bin_data.len() - byte_offset;
+
+        let mid_bv = root.push(json::buffer::View {
+            buffer: json::Index::new(0),
+            byte_length: USize64::from(byte_length),
+            byte_offset: Some(USize64::from(byte_offset)),
+            byte_stride: None,
+            target: Some(Valid(json::buffer::Target::ArrayBuffer)),
+            name: None,
+            extensions: Default::default(),
+            extras: Default::default(),
+        });
+
+        let mid_acc = root.push(json::Accessor {
+            buffer_view: Some(mid_bv),
+            byte_offset: Some(USize64(0)),
+            count: USize64::from(armor.material_ids.len()),
+            component_type: Valid(json::accessor::GenericComponentType(json::accessor::ComponentType::U16)),
+            type_: Valid(json::accessor::Type::Scalar),
+            min: None,
+            max: None,
+            name: None,
+            normalized: false,
+            sparse: None,
+            extensions: Default::default(),
+            extras: Default::default(),
+        });
+        attributes.insert(Valid(json::mesh::Semantic::Extras("MATERIAL_ID".to_string())), mid_acc);
+    }
+
     // --- Indices ---
     let byte_offset = bin_data.len();
     for &idx in &armor.indices {
@@ -2861,6 +2908,14 @@ pub struct ArmorSubModel {
     /// Per-vertex RGBA color encoding armor thickness.
     /// All 3 vertices of a triangle share the same color.
     pub colors: Vec<[f32; 4]>,
+    /// Per-vertex collision material ID, zero-extended to u16.
+    ///
+    /// All 3 vertices of a triangle share the same id. Emitted as the glTF
+    /// custom attribute `_MATERIAL_ID` so Unity can resolve
+    /// `RaycastHit.triangleIndex → material_id → sidecar.armor.materials_table`
+    /// for per-plate thickness at hit resolution. u16 leaves headroom for a
+    /// future packed `(layer_index << 8) | material_id` encoding.
+    pub material_ids: Vec<u16>,
     /// Optional world-space transform (column-major 4x4).
     /// Used for turret armor instances positioned at mount points.
     pub transform: Option<[f32; 16]>,
@@ -2881,12 +2936,14 @@ impl ArmorSubModel {
         let mut normals = Vec::with_capacity(vert_count);
         let mut indices = Vec::with_capacity(vert_count);
         let mut colors = Vec::with_capacity(vert_count);
+        let mut material_ids = Vec::with_capacity(vert_count);
 
         for (ti, tri) in armor.triangles.iter().enumerate() {
             let mat_id = tri.material_id as u32;
             let layer = tri.layer_index as u32;
             let thickness_mm = lookup_thickness(mat_id, layer, mount_armor, armor_map);
             let color = thickness_to_color(thickness_mm);
+            let mat_id_u16 = tri.material_id as u16;
 
             // Negate Z for left→right-handed conversion.
             for v in 0..3 {
@@ -2896,10 +2953,11 @@ impl ArmorSubModel {
                 normals.push([nx, ny, -nz]);
                 indices.push((ti * 3 + v) as u32);
                 colors.push(color);
+                material_ids.push(mat_id_u16);
             }
         }
 
-        Self { name: armor.name.clone(), positions, normals, indices, colors, transform: None }
+        Self { name: armor.name.clone(), positions, normals, indices, colors, material_ids, transform: None }
     }
 }
 
@@ -3623,8 +3681,10 @@ pub fn armor_sub_models_by_zone(
             let mut normals = Vec::with_capacity(vert_count);
             let mut indices = Vec::with_capacity(vert_count);
             let mut colors = Vec::with_capacity(vert_count);
+            let mut material_ids = Vec::with_capacity(vert_count);
 
             for (vi, (tri, color)) in tris.iter().enumerate() {
+                let mat_id_u16 = tri.material_id as u16;
                 for v in 0..3 {
                     // Negate Z: converts left-handed (BigWorld) to right-handed
                     // (glTF) so these triangles land in the same frame as the
@@ -3637,10 +3697,19 @@ pub fn armor_sub_models_by_zone(
                     normals.push([nx, ny, -nz]);
                     indices.push((vi * 3 + v) as u32);
                     colors.push(*color);
+                    material_ids.push(mat_id_u16);
                 }
             }
 
-            ArmorSubModel { name: format!("Armor_{}", zone_name), positions, normals, indices, colors, transform: None }
+            ArmorSubModel {
+                name: format!("Armor_{}", zone_name),
+                positions,
+                normals,
+                indices,
+                colors,
+                material_ids,
+                transform: None,
+            }
         })
         .collect()
 }
