@@ -2112,10 +2112,28 @@ fn apply_barrel_pitch(
     }
 }
 
-/// All texture data for a ship export: base albedo + camouflage variants.
+/// All texture data for a ship export: base albedo, PBR auxiliary
+/// channels (normal / metallic-gloss / AO), and camouflage variants.
+///
+/// PBR auxiliary channels populate the *base* (default-appearance) maps
+/// only; camo variants are albedo-only. See
+/// `tools/toolkit_integration/pbr_textures.md` in the downstream pipeline
+/// repo for the Phase A (raw pass-through) semantics and the Phase B
+/// swizzler plan.
 pub struct TextureSet {
     /// Base albedo PNGs keyed by MFM stem — the default ship appearance.
     pub base: HashMap<String, Vec<u8>>,
+    /// Base normal-map PNGs keyed by MFM stem. Phase A: WG `normalMap`
+    /// passed through unmodified (typically BC5/DXN → glTF-compatible).
+    pub normal_base: HashMap<String, Vec<u8>>,
+    /// Base metallic-roughness PNGs keyed by MFM stem. **Phase A: WG
+    /// `metallicGlossMap` passed through with non-glTF channel packing
+    /// (metallic + gloss, not glTF's G=roughness / B=metallic).**
+    /// Consumers must remap in their shader until the Phase B swizzler lands.
+    pub metallic_roughness_base: HashMap<String, Vec<u8>>,
+    /// Base occlusion PNGs keyed by MFM stem. WG `ambientOcclusionMap`
+    /// (usually R-channel grayscale, matches glTF convention).
+    pub occlusion_base: HashMap<String, Vec<u8>>,
     /// Camouflage variant PNGs: scheme name → (MFM stem → PNG bytes).
     /// Only stems that have a texture for this scheme are included.
     pub camo_schemes: Vec<(String, HashMap<String, Vec<u8>>)>,
@@ -2126,7 +2144,14 @@ pub struct TextureSet {
 
 impl TextureSet {
     pub fn empty() -> Self {
-        Self { base: HashMap::new(), camo_schemes: Vec::new(), tiled_uv_transforms: HashMap::new() }
+        Self {
+            base: HashMap::new(),
+            normal_base: HashMap::new(),
+            metallic_roughness_base: HashMap::new(),
+            occlusion_base: HashMap::new(),
+            camo_schemes: Vec::new(),
+            tiled_uv_transforms: HashMap::new(),
+        }
     }
 }
 
@@ -2150,19 +2175,20 @@ impl MaterialCache {
     }
 }
 
-/// Embed a PNG image in the glTF binary buffer and create a textured material.
-/// Returns the material index.
+/// Embed a PNG image into the glTF buffer and return a `json::texture::Info`
+/// ready to wire into any material slot (base_color, normal, MR, AO, ...).
 ///
-/// `uv_transform` is an optional `[scale_x, scale_y, offset_x, offset_y]` applied
-/// via `KHR_texture_transform` for tiled camouflage textures.
-fn create_textured_material(
+/// `uv_transform` is an optional `[scale_x, scale_y, offset_x, offset_y]`
+/// applied via `KHR_texture_transform` for tiled camouflage textures. All
+/// slots on one material share the same UV transform (they sample the
+/// same UV set).
+fn embed_png_texture(
     root: &mut json::Root,
     bin_data: &mut Vec<u8>,
     png_bytes: &[u8],
-    material_name: &str,
     image_name: Option<String>,
     uv_transform: Option<[f32; 4]>,
-) -> json::Index<json::Material> {
+) -> json::texture::Info {
     let byte_offset = bin_data.len();
     bin_data.extend_from_slice(png_bytes);
     pad_to_4(bin_data);
@@ -2216,15 +2242,89 @@ fn create_textured_material(
         }),
     });
 
-    let texture_info =
-        json::texture::Info { index: texture, tex_coord: 0, extensions: tex_transform_ext, extras: Default::default() };
+    json::texture::Info { index: texture, tex_coord: 0, extensions: tex_transform_ext, extras: Default::default() }
+}
+
+/// Embed a PBR textured material into the glTF root.
+///
+/// Returns the material index. `albedo_png` is required (produces the
+/// `baseColorTexture` slot); the other three channels are optional and
+/// map to `normalTexture`, `pbrMetallicRoughness.metallicRoughnessTexture`,
+/// and `occlusionTexture` respectively when present.
+///
+/// `uv_transform` applies uniformly to every populated slot.
+///
+/// **Phase A**: the extra channels pass through WG's raw DDS bytes under
+/// the glTF slot names with no channel swizzling. `metallic_roughness_png`
+/// in particular will not render correctly in standard glTF viewers until
+/// the Phase B swizzler lands — Unity shaders must remap channels.
+/// See `tools/toolkit_integration/pbr_textures.md` in the pipeline repo.
+#[allow(clippy::too_many_arguments)]
+fn create_textured_material(
+    root: &mut json::Root,
+    bin_data: &mut Vec<u8>,
+    albedo_png: &[u8],
+    normal_png: Option<&[u8]>,
+    metallic_roughness_png: Option<&[u8]>,
+    occlusion_png: Option<&[u8]>,
+    material_name: &str,
+    image_name: Option<String>,
+    uv_transform: Option<[f32; 4]>,
+) -> json::Index<json::Material> {
+    let base_info = embed_png_texture(root, bin_data, albedo_png, image_name.clone(), uv_transform);
+
+    let normal_info = normal_png.map(|png| {
+        embed_png_texture(
+            root,
+            bin_data,
+            png,
+            image_name.as_deref().map(|s| format!("{s}_n")),
+            uv_transform,
+        )
+    });
+    let mr_info = metallic_roughness_png.map(|png| {
+        embed_png_texture(
+            root,
+            bin_data,
+            png,
+            image_name.as_deref().map(|s| format!("{s}_mg")),
+            uv_transform,
+        )
+    });
+    let ao_info = occlusion_png.map(|png| {
+        embed_png_texture(
+            root,
+            bin_data,
+            png,
+            image_name.as_deref().map(|s| format!("{s}_ao")),
+            uv_transform,
+        )
+    });
+
+    let normal_tex = normal_info.map(|info| json::material::NormalTexture {
+        index: info.index,
+        scale: 1.0,
+        tex_coord: 0,
+        extensions: Default::default(),
+        extras: Default::default(),
+    });
+    let occlusion_tex = ao_info.map(|info| json::material::OcclusionTexture {
+        index: info.index,
+        strength: json::material::StrengthFactor(1.0),
+        tex_coord: 0,
+        extensions: Default::default(),
+        extras: Default::default(),
+    });
 
     root.push(json::Material {
         name: Some(material_name.to_string()),
         pbr_metallic_roughness: json::material::PbrMetallicRoughness {
-            base_color_texture: Some(texture_info),
+            base_color_texture: Some(base_info),
+            metallic_roughness_texture: mr_info,
             ..Default::default()
         },
+        normal_texture: normal_tex,
+        occlusion_texture: occlusion_tex,
         ..Default::default()
     })
 }
@@ -2420,7 +2520,23 @@ fn add_primitive_to_root(
     if !mat_cache.materials.contains_key(&cache_key) {
         // Create the default material (base albedo or untextured).
         let default_mat = if let Some(png_bytes) = prim.mfm_stem.as_ref().and_then(|stem| texture_set.base.get(stem)) {
-            create_textured_material(root, bin_data, png_bytes, &prim.material_name, prim.mfm_stem.clone(), None)
+            // Base material gets PBR auxiliary channels (Phase A: raw WG
+            // pass-through, see tools/toolkit_integration/pbr_textures.md).
+            let stem = prim.mfm_stem.as_ref();
+            let normal_png = stem.and_then(|s| texture_set.normal_base.get(s)).map(|v| v.as_slice());
+            let mr_png = stem.and_then(|s| texture_set.metallic_roughness_base.get(s)).map(|v| v.as_slice());
+            let ao_png = stem.and_then(|s| texture_set.occlusion_base.get(s)).map(|v| v.as_slice());
+            create_textured_material(
+                root,
+                bin_data,
+                png_bytes,
+                normal_png,
+                mr_png,
+                ao_png,
+                &prim.material_name,
+                prim.mfm_stem.clone(),
+                None,
+            )
         } else {
             create_untextured_material(root, &prim.material_name)
         };
@@ -2434,10 +2550,15 @@ fn add_primitive_to_root(
                 prim.mfm_stem.as_ref().and_then(|stem| {
                     let png_bytes = scheme_textures.get(stem)?;
                     let uv_xform = texture_set.tiled_uv_transforms.get(&(scheme_idx, stem.clone())).copied();
+                    // Camo variants: albedo only for Phase A. Per-camo
+                    // normal/MG/AO paths TBD in Phase B.
                     Some(create_textured_material(
                         root,
                         bin_data,
                         png_bytes,
+                        None,
+                        None,
+                        None,
                         &format!("{} [{}]", prim.material_name, scheme_name),
                         Some(format!("{stem}_{scheme_name}")),
                         uv_xform,

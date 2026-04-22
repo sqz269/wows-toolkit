@@ -1463,7 +1463,7 @@ impl ShipModelContext {
             for sub in &sub_models {
                 all_mfm_infos.extend(collect_mfm_info(sub.visual, &db));
             }
-            let mut tex_set = build_texture_set(&all_mfm_infos, &self.vfs);
+            let mut tex_set = build_texture_set(&all_mfm_infos, &self.vfs, &db);
             let per_ship_count = tex_set.camo_schemes.len();
 
             // Merge material-based camo textures (mat_Steel, mat_Yamato_KoF, etc.).
@@ -1662,9 +1662,14 @@ struct MatCamoScheme {
 // ---------------------------------------------------------------------------
 
 /// Resolved MFM info: stem (leaf name without `.mfm`) and full VFS path.
+///
+/// `material_mfm_path_id` is the MFM's `selfId` hash (matches
+/// `render_set.material_mfm_path_id`) — used to resolve PBR auxiliary
+/// texture references via `texture::load_pbr_channels`.
 pub struct MfmInfo {
     pub stem: String,
     pub full_path: String,
+    pub material_mfm_path_id: u64,
 }
 
 /// Collect MFM stems and full paths from a visual's render sets.
@@ -1685,16 +1690,32 @@ pub fn collect_mfm_info(visual: &VisualPrototype, db: &PrototypeDatabase<'_>) ->
 
         if seen.insert(stem.to_string()) {
             let full_path = db.reconstruct_path(path_idx, &self_id_index);
-            result.push(MfmInfo { stem: stem.to_string(), full_path });
+            result.push(MfmInfo {
+                stem: stem.to_string(),
+                full_path,
+                material_mfm_path_id: rs.material_mfm_path_id,
+            });
         }
     }
 
     result
 }
 
-/// Build a `TextureSet` from MFM infos: base albedo + all camo schemes.
-pub fn build_texture_set(mfm_infos: &[MfmInfo], vfs: &VfsPath) -> TextureSet {
+/// Build a `TextureSet` from MFM infos: base albedo + PBR auxiliary
+/// channels (normal / metallic-gloss / AO) + all camo schemes.
+///
+/// `db` is required to resolve MFM → `normalMap` / `metallicGlossMap` /
+/// `ambientOcclusionMap` texture hashes. The PBR channels populate only
+/// the base (default-appearance) maps in Phase A — camo-variant PBR is
+/// left for Phase B once per-camo normal/MG paths are confirmed.
+///
+/// See `tools/toolkit_integration/pbr_textures.md` in the downstream
+/// pipeline repo for the channel-packing plan.
+pub fn build_texture_set(mfm_infos: &[MfmInfo], vfs: &VfsPath, db: &PrototypeDatabase<'_>) -> TextureSet {
     let mut base = HashMap::new();
+    let mut normal_base = HashMap::new();
+    let mut metallic_roughness_base = HashMap::new();
+    let mut occlusion_base = HashMap::new();
 
     let mut seen_stems = HashSet::new();
     let mut unique_infos: Vec<&MfmInfo> = Vec::new();
@@ -1703,6 +1724,10 @@ pub fn build_texture_set(mfm_infos: &[MfmInfo], vfs: &VfsPath) -> TextureSet {
             unique_infos.push(info);
         }
     }
+
+    // Build the path-id index once; PBR channel resolution reuses it
+    // across every MFM in the ship.
+    let self_id_index = db.build_self_id_index();
 
     // Load base albedo textures.
     for info in &unique_infos {
@@ -1714,6 +1739,20 @@ pub fn build_texture_set(mfm_infos: &[MfmInfo], vfs: &VfsPath) -> TextureSet {
                 Err(e) => {
                     eprintln!("  Warning: failed to decode base texture for {}: {e}", info.stem);
                 }
+            }
+        }
+
+        // Load PBR auxiliary channels (normal / MG / AO) via MFM property lookup.
+        if info.material_mfm_path_id != 0 {
+            let channels = texture::load_pbr_channels(vfs, db, &self_id_index, info.material_mfm_path_id);
+            if let Some(png) = channels.normal {
+                normal_base.insert(info.stem.clone(), png);
+            }
+            if let Some(png) = channels.metallic_roughness {
+                metallic_roughness_base.insert(info.stem.clone(), png);
+            }
+            if let Some(png) = channels.occlusion {
+                occlusion_base.insert(info.stem.clone(), png);
             }
         }
     }
@@ -1742,7 +1781,14 @@ pub fn build_texture_set(mfm_infos: &[MfmInfo], vfs: &VfsPath) -> TextureSet {
         }
     }
 
-    TextureSet { base, camo_schemes, tiled_uv_transforms: HashMap::new() }
+    TextureSet {
+        base,
+        normal_base,
+        metallic_roughness_base,
+        occlusion_base,
+        camo_schemes,
+        tiled_uv_transforms: HashMap::new(),
+    }
 }
 
 /// Resolve a compound hardpoint (e.g. `HP_AGM_3_HP_AGA_1`) by finding the

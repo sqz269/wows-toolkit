@@ -1572,7 +1572,7 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
             gltf_export::TextureSet::empty()
         } else {
             let mfm_infos = collect_mfm_info(vp, db);
-            build_texture_set(&mfm_infos, vfs)
+            build_texture_set(&mfm_infos, vfs, db)
         };
 
         let mut out_file = std::fs::File::create(output).context("Failed to create output file")?;

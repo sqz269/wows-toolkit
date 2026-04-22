@@ -595,6 +595,64 @@ pub fn bake_tiledland_albedo(
     Some(png_buf)
 }
 
+// ---------------------------------------------------------------------------
+// PBR auxiliary channels (normal / metallicGloss / ambientOcclusion)
+// ---------------------------------------------------------------------------
+
+/// PBR auxiliary channels loaded for a material alongside the albedo.
+///
+/// Each field is `Some(png_bytes)` when the corresponding MFM property
+/// (`normalMap`, `metallicGlossMap`, `ambientOcclusionMap`) resolves to a
+/// readable DDS in the VFS.
+///
+/// **Phase A (current)**: PNG bytes are the raw DDS→PNG conversion with
+/// WG's original channel layout — no swizzling to match glTF conventions.
+/// Downstream consumers (Unity, Blender shader graphs) need to remap
+/// channels themselves. See `tools/toolkit_integration/pbr_textures.md`
+/// in the parent repo for the channel-packing plan and the Phase B
+/// swizzler that will make these glTF-correct.
+#[derive(Default, Debug)]
+pub struct PbrChannels {
+    /// `normalMap` — tangent-space normal map. WG typically uses BC5/DXN
+    /// (XY in RG, B reconstructed), which matches glTF convention.
+    pub normal: Option<Vec<u8>>,
+    /// `metallicGlossMap` — packed metallic + gloss. glTF expects G=roughness
+    /// B=metallic; WG packing differs and passes through raw in Phase A.
+    pub metallic_roughness: Option<Vec<u8>>,
+    /// `ambientOcclusionMap` — usually R-channel grayscale. Passes through
+    /// raw; glTF reads R for occlusion so this path is already correct.
+    pub occlusion: Option<Vec<u8>>,
+}
+
+/// Resolve PBR auxiliary texture hashes from an MFM and load their DDS
+/// bytes, converting each to PNG.
+///
+/// `mfm_path_id` is the MFM's `selfId` hash (i.e. `render_set.material_mfm_path_id`).
+/// Returns `PbrChannels::default()` (all `None`) if the MFM can't be parsed
+/// or the properties aren't present.
+pub fn load_pbr_channels(
+    vfs: &vfs::VfsPath,
+    db: &PrototypeDatabase<'_>,
+    self_id_index: &HashMap<u64, usize>,
+    mfm_path_id: u64,
+) -> PbrChannels {
+    let Some(mat) = parse_mfm_from_db(db, mfm_path_id) else {
+        return PbrChannels::default();
+    };
+
+    let load = |property: &str| -> Option<Vec<u8>> {
+        let hash = mat.get_texture_hash(property)?;
+        let dds = load_texture_by_hash(vfs, db, self_id_index, hash)?;
+        dds_to_png(&dds).ok()
+    };
+
+    PbrChannels {
+        normal: load("normalMap"),
+        metallic_roughness: load("metallicGlossMap"),
+        occlusion: load("ambientOcclusionMap"),
+    }
+}
+
 /// Try to load a texture for a model mesh, with TILEDLAND baking support.
 ///
 /// If assets.bin is available, first parses the MFM to check if it's a TILEDLAND
