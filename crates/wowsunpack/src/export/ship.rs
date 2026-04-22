@@ -155,6 +155,13 @@ pub struct ShipInfo {
     pub display_name: Option<String>,
     /// GameParam index key, e.g. "PJSB018".
     pub param_index: String,
+    /// Nation tag from GameParams typeinfo (e.g. "usa", "japan"). Empty if unresolved.
+    pub nation: String,
+    /// Species / class name from GameParams (e.g. "Destroyer", "Battleship",
+    /// "Cruiser", "AirCarrier"). Empty if unresolved.
+    pub species: String,
+    /// Tier / level from GameParams (1-11 for current WoWS tiers; 0 if unresolved).
+    pub tier: u32,
 }
 
 /// Summary of a hull upgrade for listing purposes.
@@ -270,10 +277,14 @@ impl ShipAssets {
                 .iter()
                 .find(|p| p.vehicle().and_then(|v| v.model_path()).map(|mp| mp.contains(name)).unwrap_or(false));
 
+            let (nation, species, tier) = ship_identity_from_param(param.map(|p| p.as_ref()));
             return Ok(ShipInfo {
                 model_dir: name.to_string(),
                 display_name: param.and_then(|p| self.metadata.localized_name_from_param(p)),
                 param_index: param.map(|p| p.index().to_string()).unwrap_or_default(),
+                nation,
+                species,
+                tier,
             });
         }
 
@@ -284,10 +295,14 @@ impl ShipAssets {
         {
             let dir = model_path.rsplit_once('/').map(|(d, _)| d).unwrap_or(model_path);
             let model_dir = dir.rsplit('/').next().unwrap_or(dir);
+            let (nation, species, tier) = ship_identity_from_param(Some(&param));
             return Ok(ShipInfo {
                 model_dir: model_dir.to_string(),
                 display_name: self.metadata.localized_name_from_param(&param),
                 param_index: param.index().to_string(),
+                nation,
+                species,
+                tier,
             });
         }
 
@@ -316,25 +331,32 @@ impl ShipAssets {
             }
         }
 
+        // Helper closure: build a ShipInfo from a pick-one match + re-resolve
+        // the param for nation/species/tier.
+        let build_from_match = |display: &str, idx: &str, dir: &str| -> ShipInfo {
+            let param = self.metadata.game_param_by_index(idx);
+            let (nation, species, tier) = ship_identity_from_param(param.as_deref());
+            ShipInfo {
+                model_dir: dir.to_string(),
+                display_name: Some(display.to_string()),
+                param_index: idx.to_string(),
+                nation,
+                species,
+                tier,
+            }
+        };
+
         match matches.len() {
             0 => bail!(
                 "No ship found matching '{name}'. Try using the model directory name \
                  (e.g. 'JSB039_Yamato_1945')."
             ),
-            1 => Ok(ShipInfo {
-                model_dir: matches[0].2.clone(),
-                display_name: Some(matches[0].0.clone()),
-                param_index: matches[0].1.clone(),
-            }),
+            1 => Ok(build_from_match(&matches[0].0, &matches[0].1, &matches[0].2)),
             _ => {
                 // If all matches share the same model dir, use it.
                 let unique_dirs: HashSet<&str> = matches.iter().map(|(_, _, d)| d.as_str()).collect();
                 if unique_dirs.len() == 1 {
-                    return Ok(ShipInfo {
-                        model_dir: matches[0].2.clone(),
-                        display_name: Some(matches[0].0.clone()),
-                        param_index: matches[0].1.clone(),
-                    });
+                    return Ok(build_from_match(&matches[0].0, &matches[0].1, &matches[0].2));
                 }
 
                 let listing: Vec<String> =
@@ -451,10 +473,14 @@ impl ShipAssets {
             .iter()
             .find(|p| p.vehicle().and_then(|v| v.model_path()).map(|mp| mp.contains(model_dir)).unwrap_or(false));
 
+        let (nation, species, tier) = ship_identity_from_param(param.map(|p| p.as_ref()));
         let info = ShipInfo {
             model_dir: model_dir.to_string(),
             display_name: param.and_then(|p| self.metadata.localized_name_from_param(p)),
             param_index: param.map(|p| p.index().to_string()).unwrap_or_default(),
+            nation,
+            species,
+            tier,
         };
 
         self.load_ship_inner(info, Some(vehicle), options)
@@ -1353,6 +1379,10 @@ impl ShipModelContext {
             "ship": {
                 "model_dir":    self.info.model_dir,
                 "display_name": self.info.display_name,
+                "param_index":  self.info.param_index,
+                "nation":       self.info.nation,
+                "species":      self.info.species,
+                "tier":         self.info.tier,
             },
             "pipeline": {
                 "toolkit_version": toolkit_version,
@@ -1944,6 +1974,40 @@ fn format_rfc3339_utc(time: SystemTime) -> String {
     let year = if m <= 2 { y + 1 } else { y };
 
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, m, d, hour, minute, second)
+}
+
+/// Pull nation / species / tier out of a resolved GameParam.
+///
+/// Returns empty strings and tier=0 if the param is None or doesn't expose
+/// the expected Vehicle data. Species is emitted as its canonical
+/// GameParams-side string (``"Destroyer"`` / ``"Battleship"`` / ``"Cruiser"``
+/// / ``"AirCarrier"`` / ``"Submarine"``); downstream consumers map that to
+/// their preferred short form.
+fn ship_identity_from_param(
+    param: Option<&crate::game_params::types::Param>,
+) -> (String, String, u32) {
+    let Some(param) = param else {
+        return (String::new(), String::new(), 0);
+    };
+    let nation = param.nation().to_string();
+    let species = param
+        .species()
+        .and_then(|r| r.known())
+        .map(|s| {
+            use crate::game_params::types::Species::*;
+            match s {
+                AirCarrier => "AirCarrier",
+                Battleship => "Battleship",
+                Cruiser => "Cruiser",
+                Destroyer => "Destroyer",
+                Submarine => "Submarine",
+                _ => "",
+            }
+            .to_string()
+        })
+        .unwrap_or_default();
+    let tier = param.vehicle().map(|v| v.level()).unwrap_or(0);
+    (nation, species, tier)
 }
 
 /// Map a mount's species to a display group name.
