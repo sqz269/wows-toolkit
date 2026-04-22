@@ -55,7 +55,8 @@ use super::texture;
 /// Options controlling ship model export.
 #[derive(Debug, Clone)]
 pub struct ShipExportOptions {
-    /// LOD level (0 = highest detail). Default: 0.
+    /// LOD level (0 = highest detail). Default: 0. Ignored when
+    /// `all_render_sets` is true.
     pub lod: usize,
     /// Hull upgrade selection. `None` = first/stock hull.
     /// Accepts full upgrade name (e.g. "PJUH911_Yamato_1944") or a prefix
@@ -65,8 +66,14 @@ pub struct ShipExportOptions {
     pub textures: bool,
     /// Export the damaged/destroyed hull state instead of intact.
     /// When true, crack geometry is included and patch geometry is excluded.
-    /// Default: false (intact hull).
+    /// Default: false (intact hull). Ignored when `all_render_sets` is true.
     pub damaged: bool,
+    /// Bundle every render set in the visual as its own named glTF mesh —
+    /// all LODs + both damage states at once. Render-set names encode LOD
+    /// level (`_lod1` / `_lod2` / `_lod3`) and damage state (`_crack_` /
+    /// `_patch_`); downstream consumers filter by name. `_hide` is still
+    /// excluded. Default: false (preserves historical single-LOD behaviour).
+    pub all_render_sets: bool,
     /// Module overrides: component type key (e.g. "artillery") to component name.
     /// Overrides the default component for specific types.
     pub module_overrides: std::collections::HashMap<crate::game_params::keys::ComponentType, String>,
@@ -74,7 +81,14 @@ pub struct ShipExportOptions {
 
 impl Default for ShipExportOptions {
     fn default() -> Self {
-        Self { lod: 0, hull: None, textures: true, damaged: false, module_overrides: std::collections::HashMap::new() }
+        Self {
+            lod: 0,
+            hull: None,
+            textures: true,
+            damaged: false,
+            all_render_sets: false,
+            module_overrides: std::collections::HashMap::new(),
+        }
     }
 }
 
@@ -1350,6 +1364,7 @@ impl ShipModelContext {
             self.options.lod,
             &texture_set,
             self.options.damaged,
+            self.options.all_render_sets,
             writer,
         )
         .context("Failed to export ship GLB")?;

@@ -197,6 +197,13 @@ enum Commands {
         #[arg(long)]
         damaged: bool,
 
+        /// Bundle every render set in the visual as its own named mesh — all
+        /// LODs + both damage variants in a single export. Render-set names
+        /// carry LOD/damage classification (e.g. `Bow_lod2Shape`,
+        /// `Bow_crack_MidFront_in_lod1Shape`). Ignores `--lod` / `--damaged`.
+        #[arg(long)]
+        all_render_sets: bool,
+
         /// List available camouflage texture schemes, then exit
         #[arg(long)]
         list_textures: bool,
@@ -236,6 +243,15 @@ enum Commands {
         /// Export the damaged/destroyed hull state (crack geometry instead of patches)
         #[arg(long)]
         damaged: bool,
+
+        /// Bundle every render set in the visual as its own named mesh — all
+        /// LODs + both damage variants in a single export. Render-set names
+        /// carry LOD/damage classification (e.g. `Bow_lod2Shape`,
+        /// `Bow_crack_MidFront_in_lod1Shape`). Ignores `--lod` / `--damaged`.
+        /// Useful when you want all variants at once for downstream rendering
+        /// (distant-ship LOD swapping, damage-state toggles, etc.).
+        #[arg(long)]
+        all_render_sets: bool,
 
         /// List available camouflage texture schemes, then exit
         #[arg(long)]
@@ -965,19 +981,20 @@ fn run() -> Result<(), Report> {
             let file_data = read_file_data(&file, no_vfs, vfs.as_ref())?;
             run_geometry(&file_data, &file.to_string_lossy(), decode)?;
         }
-        Commands::ExportModel { file, output, lod, no_textures, damaged, list_textures, no_vfs } => {
+        Commands::ExportModel { file, output, lod, no_textures, damaged, all_render_sets, list_textures, no_vfs } => {
             run_export_model(&ExportModelParams {
                 file: &file,
                 output: &output,
                 lod,
                 no_textures,
                 damaged,
+                all_render_sets,
                 list_textures,
                 no_vfs,
                 vfs: vfs.as_ref(),
             })?;
         }
-        Commands::ExportShip { name, output, lod, list_upgrades, hull, no_textures, damaged, list_textures, debug } => {
+        Commands::ExportShip { name, output, lod, list_upgrades, hull, no_textures, damaged, all_render_sets, list_textures, debug } => {
             let Some(vfs) = &vfs else {
                 bail!("VFS required for export-ship. Use --game-dir to specify a game install.");
             };
@@ -993,6 +1010,7 @@ fn run() -> Result<(), Report> {
                 hull.as_deref(),
                 no_textures,
                 damaged,
+                all_render_sets,
                 list_textures,
                 debug,
             )?;
@@ -1393,13 +1411,15 @@ struct ExportModelParams<'a> {
     lod: usize,
     no_textures: bool,
     damaged: bool,
+    all_render_sets: bool,
     list_textures: bool,
     no_vfs: bool,
     vfs: Option<&'a VfsPath>,
 }
 
 fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
-    let ExportModelParams { file, output, lod, no_textures, damaged, list_textures, no_vfs, vfs } = *params;
+    let ExportModelParams { file, output, lod, no_textures, damaged, all_render_sets, list_textures, no_vfs, vfs } =
+        *params;
     use wowsunpack::export::gltf_export;
     use wowsunpack::export::ship::build_texture_set;
     use wowsunpack::export::ship::collect_mfm_info;
@@ -1493,7 +1513,7 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
         };
 
         let mut out_file = std::fs::File::create(output).context("Failed to create output file")?;
-        gltf_export::export_glb(vp, &geom, db, lod, &texture_set, damaged, &mut out_file)
+        gltf_export::export_glb(vp, &geom, db, lod, &texture_set, damaged, all_render_sets, &mut out_file)
             .context("Failed to export GLB")?;
     } else {
         // 4. Fallback: raw geometry export (no visual available).
@@ -1840,6 +1860,7 @@ fn run_export_ship(
     hull_selection: Option<&str>,
     no_textures: bool,
     damaged: bool,
+    all_render_sets: bool,
     list_textures: bool,
     debug: bool,
 ) -> Result<(), Report> {
@@ -1896,6 +1917,7 @@ fn run_export_ship(
         hull: hull_selection.map(|s| s.to_string()),
         textures: !no_textures,
         damaged,
+        all_render_sets,
         ..Default::default()
     };
     let ctx = assets.load_ship(name, &options)?;

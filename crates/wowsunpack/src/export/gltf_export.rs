@@ -81,24 +81,10 @@ pub fn export_glb(
     lod: usize,
     texture_set: &TextureSet,
     damaged: bool,
+    all_render_sets: bool,
     writer: &mut impl Write,
 ) -> Result<(), Report<ExportError>> {
-    if visual.lods.is_empty() {
-        return Err(Report::new(ExportError::LodOutOfRange(lod, 0)));
-    }
-    if lod >= visual.lods.len() {
-        return Err(Report::new(ExportError::LodOutOfRange(lod, visual.lods.len() - 1)));
-    }
-
-    let lod_entry = &visual.lods[lod];
-
-    // Collect render sets for this LOD by matching LOD render_set_names to RS name_ids.
     let self_id_index = db.build_self_id_index();
-    let primitives = collect_primitives(visual, geometry, Some(db), Some(&self_id_index), lod_entry, damaged, None)?;
-
-    if primitives.is_empty() {
-        eprintln!("Warning: no primitives found for LOD {lod}");
-    }
 
     // Build glTF document.
     let mut root = json::Root {
@@ -109,15 +95,68 @@ pub fn export_glb(
         },
         ..Default::default()
     };
-
-    // Accumulate all binary data into a single buffer.
     let mut bin_data: Vec<u8> = Vec::new();
-    let mut gltf_primitives = Vec::new();
     let mut mat_cache = MaterialCache::new();
+    let mut scene_nodes: Vec<json::Index<json::Node>> = Vec::new();
 
-    for prim in &primitives {
-        let gltf_prim = add_primitive_to_root(&mut root, &mut bin_data, prim, texture_set, &mut mat_cache)?;
-        gltf_primitives.push(gltf_prim);
+    if all_render_sets {
+        // Bundle every render set as its own named mesh (all LODs + both damage
+        // states). See `collect_all_render_set_primitives` for the full rationale.
+        let named_primitives =
+            collect_all_render_set_primitives(visual, geometry, Some(db), Some(&self_id_index), None)?;
+
+        if named_primitives.is_empty() {
+            eprintln!("Warning: no render sets found in visual");
+        }
+
+        for (rs_name, prim) in &named_primitives {
+            let gltf_prim = add_primitive_to_root(&mut root, &mut bin_data, prim, texture_set, &mut mat_cache)?;
+            let mesh = root.push(json::Mesh {
+                primitives: vec![gltf_prim],
+                weights: None,
+                name: Some(rs_name.clone()),
+                extensions: Default::default(),
+                extras: Default::default(),
+            });
+            let node = root.push(json::Node {
+                mesh: Some(mesh),
+                name: Some(rs_name.clone()),
+                ..Default::default()
+            });
+            scene_nodes.push(node);
+        }
+    } else {
+        if visual.lods.is_empty() {
+            return Err(Report::new(ExportError::LodOutOfRange(lod, 0)));
+        }
+        if lod >= visual.lods.len() {
+            return Err(Report::new(ExportError::LodOutOfRange(lod, visual.lods.len() - 1)));
+        }
+
+        let lod_entry = &visual.lods[lod];
+        let primitives =
+            collect_primitives(visual, geometry, Some(db), Some(&self_id_index), lod_entry, damaged, None)?;
+
+        if primitives.is_empty() {
+            eprintln!("Warning: no primitives found for LOD {lod}");
+        }
+
+        let mut gltf_primitives = Vec::new();
+        for prim in &primitives {
+            let gltf_prim = add_primitive_to_root(&mut root, &mut bin_data, prim, texture_set, &mut mat_cache)?;
+            gltf_primitives.push(gltf_prim);
+        }
+
+        // Single collapsed mesh (historical behaviour).
+        let mesh = root.push(json::Mesh {
+            primitives: gltf_primitives,
+            weights: None,
+            name: None,
+            extensions: Default::default(),
+            extras: Default::default(),
+        });
+        let root_node = root.push(json::Node { mesh: Some(mesh), ..Default::default() });
+        scene_nodes.push(root_node);
     }
 
     // Pad binary data to 4-byte alignment.
@@ -140,21 +179,8 @@ pub fn export_glb(
         }
     }
 
-    // Create mesh with all primitives.
-    let mesh = root.push(json::Mesh {
-        primitives: gltf_primitives,
-        weights: None,
-        name: None,
-        extensions: Default::default(),
-        extras: Default::default(),
-    });
-
-    // Create a simple node hierarchy.
-    // For now, use a single root node with the mesh attached.
-    let root_node = root.push(json::Node { mesh: Some(mesh), ..Default::default() });
-
     let scene = root.push(json::Scene {
-        nodes: vec![root_node],
+        nodes: scene_nodes,
         name: None,
         extensions: Default::default(),
         extras: Default::default(),
@@ -1607,6 +1633,192 @@ const INTACT_EXCLUDE: &[&str] = &["_crack_", "_hide"];
 ///
 /// In the damaged state, patch geometry is hidden and crack geometry is shown.
 const DAMAGED_EXCLUDE: &[&str] = &["_patch_", "_hide"];
+
+/// Render set substrings to *always* skip even in all-render-sets mode.
+/// `_hide` is used by WoWS for collision-only / context-dependent meshes that
+/// never render.
+const ALL_RENDER_SETS_EXCLUDE: &[&str] = &["_hide"];
+
+/// Collect a `DecodedPrimitive` for every render set in the visual, regardless
+/// of LOD or damage state. Returns one `(render_set_name, primitive)` pair per
+/// render set, so each can become its own named mesh in the output GLB.
+///
+/// Used by `--all-render-sets` mode in `export-ship` / `export-model`: bundles
+/// every LOD + both damage variants in a single export. The render-set name
+/// carries the classification — downstream consumers parse `_lod1`, `_lod2`,
+/// `_lod3` suffixes for LOD level and `_crack_` / `_patch_` infixes for
+/// damage state. `_hide` render sets are still skipped.
+fn collect_all_render_set_primitives(
+    visual: &VisualPrototype,
+    geometry: &MergedGeometry,
+    db: Option<&PrototypeDatabase<'_>>,
+    self_id_index: Option<&HashMap<u64, usize>>,
+    barrel_pitch: Option<&BarrelPitch>,
+) -> Result<Vec<(String, DecodedPrimitive)>, Report<ExportError>> {
+    let mut result = Vec::new();
+
+    for rs in &visual.render_sets {
+        // Resolve name (fall back to hex id if no strings table).
+        let rs_name = db
+            .and_then(|db| db.strings.get_string_by_id(rs.name_id))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("rs_0x{:08X}", rs.name_id));
+
+        if ALL_RENDER_SETS_EXCLUDE.iter().any(|sub| rs_name.contains(sub)) {
+            continue;
+        }
+
+        match decode_render_set_primitive(
+            visual, geometry, db, self_id_index, rs, barrel_pitch,
+        ) {
+            Ok(Some(prim)) => result.push((rs_name, prim)),
+            Ok(None) => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(result)
+}
+
+/// Decode a single render set's vertex/index data into a `DecodedPrimitive`.
+/// Returns `Ok(None)` if the render set's buffers are missing (shouldn't
+/// happen on well-formed visuals but we'd rather warn than fail the export).
+///
+/// Extracted from `collect_primitives` so both the filtered (`--lod`/`--damaged`)
+/// and the all-render-sets paths share one decoder.
+fn decode_render_set_primitive(
+    _visual: &VisualPrototype,
+    geometry: &MergedGeometry,
+    db: Option<&PrototypeDatabase<'_>>,
+    self_id_index: Option<&HashMap<u64, usize>>,
+    rs: &crate::models::visual::RenderSet,
+    barrel_pitch: Option<&BarrelPitch>,
+) -> Result<Option<DecodedPrimitive>, Report<ExportError>> {
+    let vertices_mapping_id = rs.vertices_mapping_id;
+    let indices_mapping_id = rs.indices_mapping_id;
+
+    let vert_mapping = geometry
+        .vertices_mapping
+        .iter()
+        .find(|m| m.mapping_id == vertices_mapping_id)
+        .ok_or_else(|| Report::new(ExportError::VerticesMappingNotFound { id: vertices_mapping_id }))?;
+
+    let idx_mapping = geometry
+        .indices_mapping
+        .iter()
+        .find(|m| m.mapping_id == indices_mapping_id)
+        .ok_or_else(|| Report::new(ExportError::IndicesMappingNotFound { id: indices_mapping_id }))?;
+
+    let vbuf_idx = vert_mapping.merged_buffer_index as usize;
+    if vbuf_idx >= geometry.merged_vertices.len() {
+        return Err(Report::new(ExportError::BufferIndexOutOfRange {
+            index: vbuf_idx,
+            count: geometry.merged_vertices.len(),
+        }));
+    }
+    let vert_proto = &geometry.merged_vertices[vbuf_idx];
+
+    let ibuf_idx = idx_mapping.merged_buffer_index as usize;
+    if ibuf_idx >= geometry.merged_indices.len() {
+        return Err(Report::new(ExportError::BufferIndexOutOfRange {
+            index: ibuf_idx,
+            count: geometry.merged_indices.len(),
+        }));
+    }
+    let idx_proto = &geometry.merged_indices[ibuf_idx];
+
+    let decoded_vertices =
+        vert_proto.data.decode().map_err(|e| Report::new(ExportError::VertexDecode(format!("{e:?}"))))?;
+    let decoded_indices =
+        idx_proto.data.decode().map_err(|e| Report::new(ExportError::IndexDecode(format!("{e:?}"))))?;
+
+    let format = vertex_format::parse_vertex_format(&vert_proto.format_name);
+    let stride = vert_proto.stride_in_bytes as usize;
+
+    if format.stride != stride {
+        eprintln!(
+            "Warning: format \"{}\" parsed stride {} != geometry stride {}; using geometry stride",
+            vert_proto.format_name, format.stride, stride
+        );
+    }
+
+    let vert_offset = vert_mapping.items_offset as usize;
+    let vert_count = vert_mapping.items_count as usize;
+    let vert_start = vert_offset * stride;
+    let vert_end = vert_start + vert_count * stride;
+
+    if vert_end > decoded_vertices.len() {
+        return Err(Report::new(ExportError::VertexDecode(format!(
+            "vertex range {}..{} exceeds buffer size {}",
+            vert_start,
+            vert_end,
+            decoded_vertices.len()
+        ))));
+    }
+    let vert_slice = &decoded_vertices[vert_start..vert_end];
+
+    let idx_offset = idx_mapping.items_offset as usize;
+    let idx_count = idx_mapping.items_count as usize;
+    let index_size = idx_proto.index_size as usize;
+    let idx_start = idx_offset * index_size;
+    let idx_end = idx_start + idx_count * index_size;
+
+    if idx_end > decoded_indices.len() {
+        return Err(Report::new(ExportError::IndexDecode(format!(
+            "index range {}..{} exceeds buffer size {}",
+            idx_start,
+            idx_end,
+            decoded_indices.len()
+        ))));
+    }
+    let idx_slice = &decoded_indices[idx_start..idx_end];
+
+    let indices: Vec<u32> = match index_size {
+        2 => idx_slice.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as u32).collect(),
+        4 => idx_slice.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        _ => {
+            return Err(Report::new(ExportError::IndexDecode(format!("unsupported index size: {index_size}"))));
+        }
+    };
+
+    let mut verts = unpack_vertices(vert_slice, stride, &format);
+
+    if let Some(bp) = barrel_pitch {
+        apply_barrel_pitch(&mut verts.positions, &mut verts.normals, vert_slice, stride, &format, bp);
+    }
+
+    let material_name = db
+        .and_then(|db| db.strings.get_string_by_id(rs.material_name_id))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("material_0x{:08X}", rs.material_name_id));
+
+    let (mfm_stem, mfm_full_path) = if rs.material_mfm_path_id != 0 {
+        self_id_index
+            .and_then(|idx_map| idx_map.get(&rs.material_mfm_path_id))
+            .and_then(|&idx| {
+                db.map(|db| {
+                    let full_path = db.reconstruct_path(idx, self_id_index.unwrap());
+                    let leaf = &db.paths_storage[idx].name;
+                    let stem = leaf.strip_suffix(".mfm").unwrap_or(leaf).to_string();
+                    (Some(stem), Some(full_path))
+                })
+            })
+            .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+
+    Ok(Some(DecodedPrimitive {
+        positions: verts.positions,
+        normals: verts.normals,
+        uvs: verts.uvs,
+        indices,
+        material_name,
+        mfm_stem,
+        mfm_full_path,
+        mfm_path_id: rs.material_mfm_path_id,
+    }))
+}
 
 /// Collect and decode all render set primitives for a given LOD.
 ///
@@ -3414,8 +3626,15 @@ pub fn armor_sub_models_by_zone(
 
             for (vi, (tri, color)) in tris.iter().enumerate() {
                 for v in 0..3 {
-                    positions.push(tri.vertices[v]);
-                    normals.push(tri.normals[v]);
+                    // Negate Z: converts left-handed (BigWorld) to right-handed
+                    // (glTF) so these triangles land in the same frame as the
+                    // hull's `unpack_vertices` output. Without this the armor
+                    // zone meshes come out mirrored along the ship-length axis
+                    // (bow armor ends up next to the hull's stern section).
+                    let [px, py, pz] = tri.vertices[v];
+                    positions.push([px, py, -pz]);
+                    let [nx, ny, nz] = tri.normals[v];
+                    normals.push([nx, ny, -nz]);
                     indices.push((vi * 3 + v) as u32);
                     colors.push(*color);
                 }
@@ -3463,6 +3682,7 @@ pub fn export_ship_glb(
     lod: usize,
     texture_set: &TextureSet,
     damaged: bool,
+    all_render_sets: bool,
     writer: &mut impl Write,
 ) -> Result<(), Report<ExportError>> {
     let mut root = json::Root {
@@ -3483,6 +3703,48 @@ pub fn export_ship_glb(
     let self_id_index = db.build_self_id_index();
 
     for sub in sub_models {
+        if all_render_sets {
+            // Bundle every render set (all LODs + intact + damaged) as its own
+            // named mesh. Render-set names already encode LOD level (`_lod1`
+            // etc.) + damage state (`_crack_` / `_patch_`); downstream
+            // consumers filter by name.
+            let named_primitives = collect_all_render_set_primitives(
+                sub.visual,
+                sub.geometry,
+                Some(db),
+                Some(&self_id_index),
+                sub.barrel_pitch.as_ref(),
+            )?;
+
+            if named_primitives.is_empty() {
+                eprintln!("Warning: sub-model '{}' has no render sets", sub.name);
+                continue;
+            }
+
+            for (rs_name, prim) in &named_primitives {
+                let gltf_prim =
+                    add_primitive_to_root(&mut root, &mut bin_data, prim, texture_set, &mut mat_cache)?;
+                // Scope the render set under its parent sub-model for
+                // collision-free, tool-readable names.
+                let mesh_name = format!("{} / {}", sub.name, rs_name);
+                let mesh = root.push(json::Mesh {
+                    primitives: vec![gltf_prim],
+                    weights: None,
+                    name: Some(mesh_name.clone()),
+                    extensions: Default::default(),
+                    extras: Default::default(),
+                });
+                let node = root.push(json::Node {
+                    mesh: Some(mesh),
+                    name: Some(mesh_name),
+                    matrix: sub.transform.map(negate_z_transform),
+                    ..Default::default()
+                });
+                grouped_nodes.entry(sub.group).or_default().push(node);
+            }
+            continue;
+        }
+
         // Validate LOD — skip sub-models that don't have enough LODs.
         if sub.visual.lods.is_empty() || lod >= sub.visual.lods.len() {
             eprintln!(
