@@ -2337,11 +2337,26 @@ fn create_textured_material(
         extras: Default::default(),
     });
 
+    // Factors multiply the texture channel. With an MR texture present we
+    // want the texture value to pass through unscaled (factors = 1.0).
+    // Without it, glTF's default metallicFactor=1.0 would render the
+    // material as rough metal — wrong for the 99% of legacy ship materials
+    // that are painted dielectric. Override to metallic=0, roughness=0.8
+    // so they render as matte painted surfaces. Consumers that know better
+    // (Unity shader with WG-specific MFM data) can override downstream.
+    let (metallic_factor, roughness_factor) = if mr_info.is_some() {
+        (json::material::StrengthFactor(1.0), json::material::StrengthFactor(1.0))
+    } else {
+        (json::material::StrengthFactor(0.0), json::material::StrengthFactor(0.8))
+    };
+
     root.push(json::Material {
         name: Some(material_name.to_string()),
         pbr_metallic_roughness: json::material::PbrMetallicRoughness {
             base_color_texture: Some(base_info),
             metallic_roughness_texture: mr_info,
+            metallic_factor,
+            roughness_factor,
             ..Default::default()
         },
         normal_texture: normal_tex,
@@ -2350,9 +2365,18 @@ fn create_textured_material(
     })
 }
 
-/// Create an untextured material.
+/// Create an untextured material. Defaults to matte dielectric rather than
+/// glTF's default rough metal (see note in `create_textured_material`).
 fn create_untextured_material(root: &mut json::Root, material_name: &str) -> json::Index<json::Material> {
-    root.push(json::Material { name: Some(material_name.to_string()), ..Default::default() })
+    root.push(json::Material {
+        name: Some(material_name.to_string()),
+        pbr_metallic_roughness: json::material::PbrMetallicRoughness {
+            metallic_factor: json::material::StrengthFactor(0.0),
+            roughness_factor: json::material::StrengthFactor(0.8),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
 }
 
 /// Add a decoded primitive's data to the glTF root and binary buffer.
