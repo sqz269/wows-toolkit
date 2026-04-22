@@ -342,6 +342,17 @@ enum Commands {
         /// Hull upgrade to use (e.g. "A" for stock, "B" for upgraded)
         #[arg(long)]
         hull: Option<String>,
+
+        /// Write the parsed ArmorMap + per-zone aggregation to the given JSON
+        /// file (in addition to the human-readable stdout summary). Shape:
+        ///   { ship, materials_table: { "<mat_id>": { thickness_mm, layers,
+        ///     zones } }, zones: { "<zone>": { default_thickness_mm,
+        ///     max_thickness_mm, plate_count } }, hidden_zones: [...] }.
+        ///
+        /// Consumed by the Unity sidecar builder to populate
+        /// `armor.materials_table` + `armor.zones`.
+        #[arg(long)]
+        json: Option<PathBuf>,
     },
     /// Parse and inspect an assets.bin (PrototypeDatabase) file
     AssetsBin {
@@ -1095,12 +1106,12 @@ fn run() -> Result<(), Report> {
                 max_texture_size,
             )?;
         }
-        Commands::Armor { name, hull } => {
+        Commands::Armor { name, hull, json } => {
             let Some(vfs) = &vfs else {
                 bail!("VFS required for armor inspection. Use --game-dir to specify a game install.");
             };
 
-            run_armor(vfs, &name, &game_dir, game_version, hull.as_deref())?;
+            run_armor(vfs, &name, &game_dir, game_version, hull.as_deref(), json.as_deref())?;
         }
         Commands::DumpUvs { name, hull } => {
             let Some(vfs) = &vfs else {
@@ -2026,6 +2037,7 @@ fn run_armor(
     game_dir: &Path,
     game_version: Option<u64>,
     hull_selection: Option<&str>,
+    json_path: Option<&Path>,
 ) -> Result<(), Report> {
     use wowsunpack::export::ship::ShipAssets;
     use wowsunpack::export::ship::ShipExportOptions;
@@ -2290,6 +2302,162 @@ fn run_armor(
         }
     }
 
+    if let Some(json_path) = json_path {
+        write_armor_materials_json(&ctx, json_path)?;
+        let sz = std::fs::metadata(json_path).map(|m| m.len()).unwrap_or(0);
+        println!("\nArmor materials table → {} ({} bytes)", json_path.display(), sz);
+    }
+
+    Ok(())
+}
+
+/// Emit the parsed `ArmorMap` + geometry-derived zone aggregation as JSON for
+/// sidecar consumption. Shape mirrors the `armor.*` section documented in
+/// `tools/toolkit_integration/ARCHITECTURE.md` §"Primary: sidecar
+/// `armor.materials_table`".
+fn write_armor_materials_json(
+    ctx: &wowsunpack::export::ship::ShipModelContext,
+    path: &Path,
+) -> Result<(), Report> {
+    use serde_json::json;
+    use wowsunpack::export::gltf_export::collision_material_name;
+    use wowsunpack::export::gltf_export::zone_from_material_name;
+    use wowsunpack::models::geometry;
+
+    // --- Zone aggregation: walk every armor triangle, group by zone. ---
+    //
+    // Per-zone: count plates (triangles treated as plates here — one zone can
+    // have thousands; consumer cares about triangle-based default thickness,
+    // not literal plate-count accuracy), track max + default (mode) thickness.
+    #[derive(Default)]
+    struct ZoneAccum {
+        /// (material_id → triangle count) for default-thickness mode.
+        mat_counts: std::collections::HashMap<u32, usize>,
+        /// max observed thickness (across layers summed per material).
+        max_thickness_mm: f32,
+        plate_count: usize,
+    }
+    let mut zones: std::collections::BTreeMap<String, ZoneAccum> = std::collections::BTreeMap::new();
+    // Per-material: which zones it appears in.
+    let mut mat_to_zones: std::collections::HashMap<u32, std::collections::BTreeSet<String>> =
+        std::collections::HashMap::new();
+    // Per-material: union of (material_id, layer_index) pairs actually used by geometry.
+    let mut mat_seen: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+
+    let armor_map = ctx.armor_map();
+
+    let all_geom_bytes: Vec<&[u8]> = ctx.hull_geom_bytes().into_iter().chain(ctx.turret_geom_bytes()).collect();
+    for geom_bytes in &all_geom_bytes {
+        let Ok(geom) = geometry::parse_geometry(geom_bytes) else {
+            continue;
+        };
+        for am in &geom.armor_models {
+            for tri in &am.triangles {
+                let mat_id = tri.material_id as u32;
+                let mat_name = collision_material_name(tri.material_id);
+                let zone = zone_from_material_name(mat_name).to_string();
+
+                mat_seen.insert(mat_id);
+                mat_to_zones.entry(mat_id).or_default().insert(zone.clone());
+
+                // Total thickness = sum of all layers for this material id
+                // (geometry doesn't partition per-triangle by layer at this
+                // aggregation level; the per-vertex _MATERIAL_ID attribute is
+                // what gives runtime hit resolution its layer precision).
+                let total_thickness = armor_map
+                    .and_then(|m| m.get(&mat_id))
+                    .map(|layers| layers.values().sum::<f32>())
+                    .unwrap_or(0.0);
+
+                let acc = zones.entry(zone).or_default();
+                acc.plate_count += 1;
+                *acc.mat_counts.entry(mat_id).or_insert(0) += 1;
+                if total_thickness > acc.max_thickness_mm {
+                    acc.max_thickness_mm = total_thickness;
+                }
+            }
+        }
+    }
+
+    // --- materials_table: id → { thickness_mm, layers, zones }. ---
+    //
+    // Include every id the geometry actually references AND every id the
+    // armor map carries (some materials may be unused in the current hull
+    // but still part of the table, e.g. turret-scoped materials).
+    let mut materials_table = serde_json::Map::new();
+    let material_ids: std::collections::BTreeSet<u32> = {
+        let mut set = mat_seen.clone();
+        if let Some(map) = armor_map {
+            for &id in map.keys() {
+                set.insert(id);
+            }
+        }
+        set
+    };
+    for mat_id in &material_ids {
+        let layers: Vec<f32> = armor_map
+            .and_then(|m| m.get(mat_id))
+            .map(|layers_map| layers_map.values().copied().collect())
+            .unwrap_or_default();
+        // `layers.iter().sum()` on an empty iterator yields `-0.0`, which
+        // serialises as "-0.0" — ugly for sidecar diffs. Collapse to +0.0.
+        let thickness_mm: f32 = if layers.is_empty() { 0.0 } else { layers.iter().sum() };
+        let zones_list: Vec<String> =
+            mat_to_zones.get(mat_id).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+
+        materials_table.insert(
+            mat_id.to_string(),
+            json!({
+                "thickness_mm": thickness_mm,
+                "layers":       layers,
+                "zones":        zones_list,
+            }),
+        );
+    }
+
+    // --- zones: default_thickness_mm (mode over triangles weighted by mat
+    // thickness), max_thickness_mm, plate_count. ---
+    let mut zones_out = serde_json::Map::new();
+    for (zone, acc) in &zones {
+        // "default" thickness = thickness of the material with the most
+        // triangles in this zone. More representative than mean for damage
+        // zones where a thin outer plate wraps around a thick citadel.
+        let default_mat = acc.mat_counts.iter().max_by_key(|&(_, c)| *c).map(|(m, _)| *m);
+        let default_thickness_mm = default_mat
+            .and_then(|m| armor_map.and_then(|amap| amap.get(&m)))
+            .map(|layers| layers.values().sum::<f32>())
+            .unwrap_or(0.0);
+
+        zones_out.insert(
+            zone.clone(),
+            json!({
+                "default_thickness_mm": default_thickness_mm,
+                "max_thickness_mm":     acc.max_thickness_mm,
+                "plate_count":          acc.plate_count,
+            }),
+        );
+    }
+
+    // --- Hidden zones: matches `print_armor_layers` tagging logic above. ---
+    let hidden_zones: Vec<&str> = vec!["Hull", "SteeringGear", "Default"];
+
+    let info = ctx.info();
+    let manifest = json!({
+        "ship": {
+            "model_dir":    info.model_dir,
+            "display_name": info.display_name,
+        },
+        "materials_table": materials_table,
+        "zones":           zones_out,
+        "hidden_zones":    hidden_zones,
+    });
+
+    let file =
+        std::fs::File::create(path).context_with(|| format!("Failed to create {}", path.display()))?;
+    let mut writer = std::io::BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, &manifest)
+        .map_err(|e| rootcause::report!("Failed to serialize armor JSON: {e}"))?;
+    writer.write_all(b"\n").ok();
     Ok(())
 }
 
