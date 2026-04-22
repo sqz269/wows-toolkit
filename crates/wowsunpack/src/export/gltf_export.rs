@@ -3670,14 +3670,216 @@ pub struct BarrelPitch {
     pub barrel_bone_indices: Vec<u8>,
 }
 
+/// Parsed hitbox (splash-box) ready for GLB emission as a named cube mesh.
+///
+/// Mirrors `geometry::SplashBox` but pre-applies Z-negation so the rest of the
+/// export pipeline can treat it like any other vertex data. `min` / `max` stay
+/// in native WoWS units (metres scaling happens at FBX export time).
+pub struct Hitbox {
+    pub name: String,
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+}
+
+/// Convert a parsed `SplashBox` into a Z-negated `Hitbox`.
+///
+/// BigWorld (left-handed) → glTF (right-handed) per the project's Z-negation
+/// convention. After flipping Z, `min.z`/`max.z` swap so the invariant
+/// `min.z < max.z` is preserved (otherwise the downstream cube-corner
+/// generator would emit zero-volume boxes).
+pub fn hitbox_from_splash(sb: &crate::models::geometry::SplashBox) -> Hitbox {
+    let (min_z, max_z) = (-sb.max[2], -sb.min[2]);
+    Hitbox { name: sb.name.clone(), min: [sb.min[0], sb.min[1], min_z], max: [sb.max[0], sb.max[1], max_z] }
+}
+
+/// Build a cube primitive (8 vertices, 12 triangles, 6 face normals) for a
+/// hitbox AABB, push its buffers into `bin_data`, and return the glTF
+/// `Primitive`.
+///
+/// Each face gets its own 4 vertices so normals stay flat (no smoothing).
+/// Material is a translucent neutral so hitboxes don't fight the armor
+/// visualization for viewer real-estate.
+fn add_hitbox_primitive_to_root(
+    root: &mut json::Root,
+    bin_data: &mut Vec<u8>,
+    hb: &Hitbox,
+) -> Result<json::mesh::Primitive, Report<ExportError>> {
+    // Build 24 vertices (6 faces × 4 corners) + 36 indices (6 faces × 2 tris).
+    let [x0, y0, z0] = hb.min;
+    let [x1, y1, z1] = hb.max;
+
+    // Per-face (normal, 4 corners in CCW when viewed from outside).
+    // Corner ordering picked so triangles (0,1,2) + (0,2,3) wind CCW.
+    let faces: [([f32; 3], [[f32; 3]; 4]); 6] = [
+        // -X face (normal pointing -X, CCW viewed from -X)
+        ([-1.0, 0.0, 0.0], [[x0, y0, z1], [x0, y0, z0], [x0, y1, z0], [x0, y1, z1]]),
+        // +X face
+        ([1.0, 0.0, 0.0], [[x1, y0, z0], [x1, y0, z1], [x1, y1, z1], [x1, y1, z0]]),
+        // -Y face
+        ([0.0, -1.0, 0.0], [[x0, y0, z0], [x0, y0, z1], [x1, y0, z1], [x1, y0, z0]]),
+        // +Y face
+        ([0.0, 1.0, 0.0], [[x0, y1, z1], [x0, y1, z0], [x1, y1, z0], [x1, y1, z1]]),
+        // -Z face
+        ([0.0, 0.0, -1.0], [[x1, y0, z0], [x1, y1, z0], [x0, y1, z0], [x0, y0, z0]]),
+        // +Z face
+        ([0.0, 0.0, 1.0], [[x0, y0, z1], [x0, y1, z1], [x1, y1, z1], [x1, y0, z1]]),
+    ];
+
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(24);
+    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(24);
+    let mut indices: Vec<u32> = Vec::with_capacity(36);
+
+    for (normal, corners) in &faces {
+        let base = positions.len() as u32;
+        for corner in corners {
+            positions.push(*corner);
+            normals.push(*normal);
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    let mut attributes = BTreeMap::new();
+
+    // --- Positions ---
+    let (min, max) = bounding_coords(&positions);
+    let byte_offset = bin_data.len();
+    for p in &positions {
+        bin_data.extend_from_slice(&p[0].to_le_bytes());
+        bin_data.extend_from_slice(&p[1].to_le_bytes());
+        bin_data.extend_from_slice(&p[2].to_le_bytes());
+    }
+    pad_to_4(bin_data);
+    let byte_length = bin_data.len() - byte_offset;
+    let pos_bv = root.push(json::buffer::View {
+        buffer: json::Index::new(0),
+        byte_length: USize64::from(byte_length),
+        byte_offset: Some(USize64::from(byte_offset)),
+        byte_stride: None,
+        target: Some(Valid(json::buffer::Target::ArrayBuffer)),
+        name: None,
+        extensions: Default::default(),
+        extras: Default::default(),
+    });
+    let pos_acc = root.push(json::Accessor {
+        buffer_view: Some(pos_bv),
+        byte_offset: Some(USize64(0)),
+        count: USize64::from(positions.len()),
+        component_type: Valid(json::accessor::GenericComponentType(json::accessor::ComponentType::F32)),
+        type_: Valid(json::accessor::Type::Vec3),
+        min: Some(json::Value::from(min.to_vec())),
+        max: Some(json::Value::from(max.to_vec())),
+        name: None,
+        normalized: false,
+        sparse: None,
+        extensions: Default::default(),
+        extras: Default::default(),
+    });
+    attributes.insert(Valid(json::mesh::Semantic::Positions), pos_acc);
+
+    // --- Normals ---
+    let byte_offset = bin_data.len();
+    for n in &normals {
+        bin_data.extend_from_slice(&n[0].to_le_bytes());
+        bin_data.extend_from_slice(&n[1].to_le_bytes());
+        bin_data.extend_from_slice(&n[2].to_le_bytes());
+    }
+    pad_to_4(bin_data);
+    let byte_length = bin_data.len() - byte_offset;
+    let norm_bv = root.push(json::buffer::View {
+        buffer: json::Index::new(0),
+        byte_length: USize64::from(byte_length),
+        byte_offset: Some(USize64::from(byte_offset)),
+        byte_stride: None,
+        target: Some(Valid(json::buffer::Target::ArrayBuffer)),
+        name: None,
+        extensions: Default::default(),
+        extras: Default::default(),
+    });
+    let norm_acc = root.push(json::Accessor {
+        buffer_view: Some(norm_bv),
+        byte_offset: Some(USize64(0)),
+        count: USize64::from(normals.len()),
+        component_type: Valid(json::accessor::GenericComponentType(json::accessor::ComponentType::F32)),
+        type_: Valid(json::accessor::Type::Vec3),
+        min: None,
+        max: None,
+        name: None,
+        normalized: false,
+        sparse: None,
+        extensions: Default::default(),
+        extras: Default::default(),
+    });
+    attributes.insert(Valid(json::mesh::Semantic::Normals), norm_acc);
+
+    // --- Indices ---
+    let byte_offset = bin_data.len();
+    for &idx in &indices {
+        bin_data.extend_from_slice(&idx.to_le_bytes());
+    }
+    pad_to_4(bin_data);
+    let byte_length = bin_data.len() - byte_offset;
+    let idx_bv = root.push(json::buffer::View {
+        buffer: json::Index::new(0),
+        byte_length: USize64::from(byte_length),
+        byte_offset: Some(USize64::from(byte_offset)),
+        byte_stride: None,
+        target: Some(Valid(json::buffer::Target::ElementArrayBuffer)),
+        name: None,
+        extensions: Default::default(),
+        extras: Default::default(),
+    });
+    let idx_acc = root.push(json::Accessor {
+        buffer_view: Some(idx_bv),
+        byte_offset: Some(USize64(0)),
+        count: USize64::from(indices.len()),
+        component_type: Valid(json::accessor::GenericComponentType(json::accessor::ComponentType::U32)),
+        type_: Valid(json::accessor::Type::Scalar),
+        min: None,
+        max: None,
+        name: None,
+        normalized: false,
+        sparse: None,
+        extensions: Default::default(),
+        extras: Default::default(),
+    });
+
+    // Translucent neutral fill — hitboxes exist for downstream zone
+    // classification, not visualization, so they read as semi-transparent
+    // volumes in the viewer.
+    let material = root.push(json::Material {
+        name: Some(format!("hitbox_{}", hb.name)),
+        alpha_mode: Valid(json::material::AlphaMode::Blend),
+        pbr_metallic_roughness: json::material::PbrMetallicRoughness {
+            base_color_factor: json::material::PbrBaseColorFactor([0.4, 0.7, 1.0, 0.25]),
+            metallic_factor: json::material::StrengthFactor(0.0),
+            roughness_factor: json::material::StrengthFactor(1.0),
+            ..Default::default()
+        },
+        double_sided: true,
+        ..Default::default()
+    });
+
+    Ok(json::mesh::Primitive {
+        attributes,
+        indices: Some(idx_acc),
+        material: Some(material),
+        mode: Valid(json::mesh::Mode::Triangles),
+        targets: None,
+        extensions: None,
+        extras: Default::default(),
+    })
+}
+
 /// Export multiple sub-models as a single GLB with separate named meshes/nodes.
 ///
 /// Each sub-model becomes a separate selectable object in Blender.
 /// `texture_set` contains base albedo + camo variant PNGs for material textures.
 /// `armor_models` are added as additional untextured semi-transparent meshes.
+/// `hitboxes` are emitted as named cube meshes under a top-level "Hitboxes" group.
 pub fn export_ship_glb(
     sub_models: &[SubModel<'_>],
     armor_models: &[ArmorSubModel],
+    hitboxes: &[Hitbox],
     db: &PrototypeDatabase<'_>,
     lod: usize,
     texture_set: &TextureSet,
@@ -3826,6 +4028,32 @@ pub fn export_ship_glb(
     }
     if !armor_nodes.is_empty() {
         grouped_nodes.insert("Armor", armor_nodes);
+    }
+
+    // Hitboxes: splash-box AABBs emitted as named cube meshes under a
+    // "Hitboxes" top-level group. Preserves the raw `CM_SB_*` names so
+    // downstream zone classification (Blender + Unity) has the full sub-zone
+    // info (per-magazine citadel volumes, per-turret barbettes, etc.).
+    let mut hitbox_nodes: Vec<json::Index<json::Node>> = Vec::new();
+    for hb in hitboxes {
+        let gltf_prim = add_hitbox_primitive_to_root(&mut root, &mut bin_data, hb)?;
+        let mesh = root.push(json::Mesh {
+            primitives: vec![gltf_prim],
+            weights: None,
+            name: Some(hb.name.clone()),
+            extensions: Default::default(),
+            extras: Default::default(),
+        });
+        let node = root.push(json::Node {
+            mesh: Some(mesh),
+            name: Some(hb.name.clone()),
+            matrix: None,
+            ..Default::default()
+        });
+        hitbox_nodes.push(node);
+    }
+    if !hitbox_nodes.is_empty() {
+        grouped_nodes.insert("Hitboxes", hitbox_nodes);
     }
 
     // Build scene hierarchy: one parent node per group.

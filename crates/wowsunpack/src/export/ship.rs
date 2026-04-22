@@ -1543,9 +1543,21 @@ impl ShipModelContext {
             }
         }
 
+        // Hitboxes: parse the hull `.splash` file into named cube AABBs.
+        // Default on — data is ~1 KB per ship and gives downstream consumers
+        // per-magazine citadel volumes, per-turret barbettes, etc. that the
+        // armor-zone-only classification can't express. Silent skip if the
+        // ship has no `.splash` file (some older / smaller hulls).
+        let hitboxes: Vec<gltf_export::Hitbox> = self
+            .hull_splash_bytes()
+            .and_then(|bytes| geometry::parse_splash_file(bytes).ok())
+            .map(|boxes| boxes.iter().map(gltf_export::hitbox_from_splash).collect())
+            .unwrap_or_default();
+
         gltf_export::export_ship_glb(
             &sub_models,
             &armor_meshes,
+            &hitboxes,
             &db,
             self.options.lod,
             &texture_set,
