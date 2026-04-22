@@ -1538,7 +1538,7 @@ pub fn export_geometry_raw(geometry: &MergedGeometry, writer: &mut impl Write) -
         let idx_slice = &decoded_indices[idx_start..idx_end];
 
         // Parse indices as u32.
-        let indices: Vec<u32> = match index_size {
+        let mut indices: Vec<u32> = match index_size {
             2 => idx_slice.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as u32).collect(),
             4 => idx_slice.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
             _ => {
@@ -1546,6 +1546,7 @@ pub fn export_geometry_raw(geometry: &MergedGeometry, writer: &mut impl Write) -
                 continue;
             }
         };
+        flip_triangle_winding(&mut indices);
 
         let verts = unpack_vertices(vert_slice, stride, &format);
 
@@ -1773,13 +1774,14 @@ fn decode_render_set_primitive(
     }
     let idx_slice = &decoded_indices[idx_start..idx_end];
 
-    let indices: Vec<u32> = match index_size {
+    let mut indices: Vec<u32> = match index_size {
         2 => idx_slice.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as u32).collect(),
         4 => idx_slice.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
         _ => {
             return Err(Report::new(ExportError::IndexDecode(format!("unsupported index size: {index_size}"))));
         }
     };
+    flip_triangle_winding(&mut indices);
 
     let mut verts = unpack_vertices(vert_slice, stride, &format);
 
@@ -1942,13 +1944,14 @@ fn collect_primitives(
         let idx_slice = &decoded_indices[idx_start..idx_end];
 
         // Parse indices as u32.
-        let indices: Vec<u32> = match index_size {
+        let mut indices: Vec<u32> = match index_size {
             2 => idx_slice.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as u32).collect(),
             4 => idx_slice.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
             _ => {
                 return Err(Report::new(ExportError::IndexDecode(format!("unsupported index size: {index_size}"))));
             }
         };
+        flip_triangle_winding(&mut indices);
 
         // Indices are already 0-based relative to the vertex slice
         // (items_offset is applied when extracting the vertex slice).
@@ -2027,7 +2030,10 @@ fn unpack_vertices(data: &[u8], stride: usize, format: &VertexFormat) -> Unpacke
             let y = f32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap());
             let z = f32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap());
             // Negate Z: converts left-handed (BigWorld) to right-handed (glTF).
-            // This implicitly reverses triangle winding and flips normals consistently.
+            // Mirroring across XY reverses the effective triangle winding in
+            // world space; callers MUST pair this with flip_triangle_winding()
+            // on the index buffer so glTF sees CCW front-faces. Vertex normals
+            // are separately negated below to stay consistent.
             positions.push([x, y, -z]);
         }
 
@@ -2048,6 +2054,21 @@ fn unpack_vertices(data: &[u8], stride: usize, format: &VertexFormat) -> Unpacke
     }
 
     UnpackedVertices { positions, normals, uvs }
+}
+
+/// Reverse triangle winding in place. Each 3-index group `[a, b, c]` becomes
+/// `[a, c, b]`.
+///
+/// Required companion to the Z-negation in `unpack_vertices`: negating Z on
+/// vertex positions mirrors the mesh across the XY plane, which reverses the
+/// effective triangle winding in world space. glTF front-facing convention is
+/// CCW; without flipping the index order here the resulting glTF is CW and
+/// fails backface-culling in strict viewers (Blender's face-orientation
+/// overlay shows the whole mesh red; Unity's default shader culls it).
+pub(super) fn flip_triangle_winding(indices: &mut [u32]) {
+    for tri in indices.chunks_exact_mut(3) {
+        tri.swap(1, 2);
+    }
 }
 
 /// Convert a column-major 4x4 transform from left-handed to right-handed
@@ -3016,6 +3037,8 @@ impl InteractiveArmorMesh {
             });
         }
 
+        // Z-negation above mirrors the mesh; restore CCW winding for glTF.
+        flip_triangle_winding(&mut indices);
         Self { name: armor.name.clone(), positions, normals, indices, colors, triangle_info, transform: None }
     }
 }
@@ -3078,6 +3101,8 @@ impl ArmorSubModel {
             }
         }
 
+        // Z-negation above mirrors the mesh; restore CCW winding for glTF.
+        flip_triangle_winding(&mut indices);
         Self { name: armor.name.clone(), positions, normals, indices, colors, material_ids, transform: None }
     }
 }
@@ -3214,13 +3239,14 @@ pub fn collect_hull_meshes(
         }
         let idx_slice = &decoded_indices[idx_start..idx_end];
 
-        let indices: Vec<u32> = match index_size {
+        let mut indices: Vec<u32> = match index_size {
             2 => idx_slice.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as u32).collect(),
             4 => idx_slice.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
             _ => {
                 return Err(Report::new(ExportError::IndexDecode(format!("unsupported index size: {index_size}"))));
             }
         };
+        flip_triangle_winding(&mut indices);
 
         let mut verts = unpack_vertices(vert_slice, stride, &format);
 
@@ -3821,6 +3847,9 @@ pub fn armor_sub_models_by_zone(
                     material_ids.push(mat_id_u16);
                 }
             }
+
+            // Z-negation above mirrors the mesh; restore CCW winding for glTF.
+            flip_triangle_winding(&mut indices);
 
             ArmorSubModel {
                 name: format!("Armor_{}", zone_name),

@@ -630,6 +630,17 @@ pub struct PbrChannels {
 /// `mfm_path_id` is the MFM's `selfId` hash (i.e. `render_set.material_mfm_path_id`).
 /// Returns `PbrChannels::default()` (all `None`) if the MFM can't be parsed
 /// or the properties aren't present.
+///
+/// The `metallicGlossMap` channel is swizzled from WG's packing
+/// (R=cavity/specOcc, G=metallic, B=gloss, A=unused) to the glTF
+/// metallicRoughnessTexture convention (R=unused, G=roughness, B=metallic,
+/// A=unused) via [`repack_wg_mg_to_gltf_mr`]. `normalMap` and
+/// `ambientOcclusionMap` pass through unchanged (already glTF-compatible).
+///
+/// Packing authority: WoWS `PBS_ship_metallic` shader fxo metadata,
+/// cross-referenced with empirical channel statistics on 4 PBS
+/// materials. See `tools/toolkit_integration/pbr_textures.md` in the
+/// pipeline repo for the full derivation.
 pub fn load_pbr_channels(
     vfs: &vfs::VfsPath,
     db: &PrototypeDatabase<'_>,
@@ -640,17 +651,70 @@ pub fn load_pbr_channels(
         return PbrChannels::default();
     };
 
-    let load = |property: &str| -> Option<Vec<u8>> {
+    let load_raw = |property: &str| -> Option<Vec<u8>> {
         let hash = mat.get_texture_hash(property)?;
         let dds = load_texture_by_hash(vfs, db, self_id_index, hash)?;
         dds_to_png(&dds).ok()
     };
 
-    PbrChannels {
-        normal: load("normalMap"),
-        metallic_roughness: load("metallicGlossMap"),
-        occlusion: load("ambientOcclusionMap"),
+    let normal = load_raw("normalMap");
+    let occlusion = load_raw("ambientOcclusionMap");
+    let metallic_roughness = load_raw("metallicGlossMap")
+        .and_then(|png| repack_wg_mg_to_gltf_mr(&png).ok());
+
+    PbrChannels { normal, metallic_roughness, occlusion }
+}
+
+/// Repack WG's `metallicGlossMap` PNG into a glTF-conformant
+/// `metallicRoughnessTexture` PNG.
+///
+/// WG packing (observed + confirmed against PBS_ship_metallic.fxo strings
+/// in the SEA-group shader backup):
+///   R = cavity / specular occlusion (continuous, panel-line detail)
+///   G = metallic mask (bimodal 0/1)
+///   B = gloss (continuous, higher = smoother)
+///   A = unused (BC1 no-alpha path, always 255)
+///
+/// glTF metallicRoughnessTexture packing (spec):
+///   R = unused (or occlusion when using combined ORM)
+///   G = roughness (linear; higher = rougher)
+///   B = metallic
+///   A = unused
+///
+/// Swizzle:
+///   out.R = in.R         (preserve cavity; no-op if consumer ignores R)
+///   out.G = 255 - in.B   (roughness = 1 - gloss)
+///   out.B = in.G         (metallic passes through)
+///   out.A = 255
+///
+/// The gloss→roughness inversion is *linear* here. The WG shader may
+/// apply a `g_legacyGlossRemap` power curve before the inversion; when
+/// that property is present the output won't perfectly match in-engine
+/// appearance, but the mapping will be qualitatively correct (dielectric
+/// vs conductor, smooth vs rough).
+pub fn repack_wg_mg_to_gltf_mr(png_bytes: &[u8]) -> Result<Vec<u8>, Report<TextureError>> {
+    use image_dds::image::ImageReader;
+
+    let reader = ImageReader::new(Cursor::new(png_bytes))
+        .with_guessed_format()
+        .map_err(|e| Report::new(TextureError::DdsDecode(e.to_string())))?;
+    let img = reader.decode().map_err(|e| Report::new(TextureError::DdsDecode(e.to_string())))?;
+    let mut rgba = img.into_rgba8();
+
+    for pixel in rgba.pixels_mut() {
+        let [r, g, b, _a] = pixel.0;
+        // R: pass-through cavity/specOcc (glTF readers that use combined
+        // ORM pack occlusion in R; dedicated consumers can ignore it).
+        // G: roughness = 255 - gloss.
+        // B: metallic from WG's G channel.
+        pixel.0 = [r, 255u8.saturating_sub(b), g, 255];
     }
+
+    let mut out = Vec::new();
+    PngEncoder::new(&mut out)
+        .write_image(rgba.as_raw(), rgba.width(), rgba.height(), ExtendedColorType::Rgba8)
+        .map_err(|e| Report::new(TextureError::PngEncode(e.to_string())))?;
+    Ok(out)
 }
 
 /// Try to load a texture for a model mesh, with TILEDLAND baking support.
