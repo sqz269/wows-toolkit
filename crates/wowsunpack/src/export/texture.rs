@@ -181,6 +181,67 @@ pub fn load_dds_from_vfs(vfs: &vfs::VfsPath, path: &str) -> Option<Vec<u8>> {
     if data.is_empty() { None } else { Some(data) }
 }
 
+/// WG splits the mip pyramid across files: `.dd0` = top mip (e.g. 4096²),
+/// `.dd1` = one level down (2048²), `.dd2` = two levels down (1024²),
+/// `.dds` = bundled mip tail (≤512²). See CHANGELOG in
+/// `tools/toolkit_integration/pbr_textures.md` for the investigation.
+pub const DDS_MIP_SUFFIXES: [&str; 4] = [".dd0", ".dd1", ".dd2", ".dds"];
+
+/// Dumps raw WG DDS files (every available mip level) to a sibling
+/// directory, preserving the original filenames. Intended for Unity-side
+/// Texture Streaming pipelines that want the full mip chain in BC-
+/// compressed form rather than the decoded PNG top-mip that glTF sees.
+///
+/// Usage pattern: every texture-load function takes
+/// `Option<&mut RawDdsDumper>`; when set, as soon as the function
+/// identifies a VFS path that resolves, it calls
+/// `dumper.dump_all_mips(vfs, resolved_path)` to persist every
+/// available mip-level file to the dump directory.
+pub struct RawDdsDumper {
+    dir: std::path::PathBuf,
+    /// Deduplication: output filenames already written this session.
+    written: std::collections::HashSet<String>,
+}
+
+impl RawDdsDumper {
+    pub fn new(dir: impl Into<std::path::PathBuf>) -> Self {
+        let dir = dir.into();
+        let _ = std::fs::create_dir_all(&dir);
+        Self { dir, written: std::collections::HashSet::new() }
+    }
+
+    /// Given a VFS path that resolved to one mip-level file (e.g. `_a.dd0`),
+    /// enumerate and dump every available mip level under the same base
+    /// (`.dd0`, `.dd1`, `.dd2`, `.dds`) into the dump directory.
+    ///
+    /// Writes each file once per session (dedup'd by output filename).
+    /// Silently skips suffixes that don't exist in the VFS.
+    pub fn dump_all_mips(&mut self, vfs: &vfs::VfsPath, resolved_path: &str) {
+        // Strip the mip-level suffix from `resolved_path`. If it doesn't end
+        // in a known mip suffix, the caller gave us an unexpected path;
+        // skip.
+        let stem = match DDS_MIP_SUFFIXES.iter().find_map(|s| resolved_path.strip_suffix(s)) {
+            Some(s) => s,
+            None => return,
+        };
+
+        for suffix in DDS_MIP_SUFFIXES {
+            let full_path = format!("{stem}{suffix}");
+            let filename = full_path.rsplit_once('/').map(|(_, n)| n.to_string()).unwrap_or(full_path.clone());
+            if self.written.contains(&filename) {
+                continue;
+            }
+            if let Some(bytes) = load_dds_from_vfs(vfs, &full_path) {
+                let out = self.dir.join(&filename);
+                if let Err(e) = std::fs::write(&out, &bytes) {
+                    eprintln!("  Warning: failed to write raw DDS {}: {e}", out.display());
+                }
+                self.written.insert(filename);
+            }
+        }
+    }
+}
+
 /// MFM name suffixes that don't appear in texture filenames.
 ///
 /// E.g. MFM `AGM034_16in50_Mk7_skinned.mfm` → texture `AGM034_16in50_Mk7_camo_01.dds`.
@@ -222,7 +283,15 @@ const TEXTURE_CHANNEL_SUFFIXES: &[&str] = &["_a", "_mg", "_mgn"];
 /// turret models where the texture name differs from the MFM name.
 ///
 /// Returns `(base_name, dds_bytes)` if found, or `None`.
-pub fn load_texture_bytes(vfs: &vfs::VfsPath, mfm_stem: &str, scheme: &str) -> Option<(String, Vec<u8>)> {
+///
+/// If `raw_dds_dumper` is `Some`, also dumps every available mip level of
+/// the resolved texture to the dumper's directory as a side effect.
+pub fn load_texture_bytes(
+    vfs: &vfs::VfsPath,
+    mfm_stem: &str,
+    scheme: &str,
+    raw_dds_dumper: Option<&mut RawDdsDumper>,
+) -> Option<(String, Vec<u8>)> {
     for base in texture_base_names(mfm_stem) {
         // Try explicit albedo channel first ({base}_{scheme}_a), then direct ({base}_{scheme}).
         let candidates = [
@@ -238,6 +307,9 @@ pub fn load_texture_bytes(vfs: &vfs::VfsPath, mfm_stem: &str, scheme: &str) -> O
             {
                 let mut data = Vec::new();
                 if std::io::Read::read_to_end(&mut file, &mut data).is_ok() && !data.is_empty() {
+                    if let Some(d) = raw_dds_dumper {
+                        d.dump_all_mips(vfs, path);
+                    }
                     return Some((base, data));
                 }
             }
@@ -259,7 +331,14 @@ pub fn load_texture_bytes(vfs: &vfs::VfsPath, mfm_stem: &str, scheme: &str) -> O
 ///
 /// `mfm_full_path` is the full VFS path to the MFM file (e.g. ending in `.mfm`).
 /// Returns DDS bytes if found.
-pub fn load_base_albedo_bytes(vfs: &vfs::VfsPath, mfm_full_path: &str) -> Option<Vec<u8>> {
+///
+/// If `raw_dds_dumper` is `Some`, also dumps every available mip level of
+/// the resolved texture to the dumper's directory as a side effect.
+pub fn load_base_albedo_bytes(
+    vfs: &vfs::VfsPath,
+    mfm_full_path: &str,
+    raw_dds_dumper: Option<&mut RawDdsDumper>,
+) -> Option<Vec<u8>> {
     let dir = mfm_full_path.rsplit_once('/')?.0;
     let mfm_filename = mfm_full_path.rsplit_once('/')?.1;
     let stem = mfm_filename.strip_suffix(".mfm")?;
@@ -295,6 +374,9 @@ pub fn load_base_albedo_bytes(vfs: &vfs::VfsPath, mfm_full_path: &str) -> Option
             {
                 let mut data = Vec::new();
                 if std::io::Read::read_to_end(&mut file, &mut data).is_ok() && !data.is_empty() {
+                    if let Some(d) = raw_dds_dumper {
+                        d.dump_all_mips(vfs, path);
+                    }
                     return Some(data);
                 }
             }
@@ -378,6 +460,7 @@ fn load_texture_by_hash(
     db: &PrototypeDatabase<'_>,
     self_id_index: &HashMap<u64, usize>,
     texture_hash: u64,
+    raw_dds_dumper: Option<&mut RawDdsDumper>,
 ) -> Option<Vec<u8>> {
     let &path_idx = self_id_index.get(&texture_hash)?;
     let full_path = db.reconstruct_path(path_idx, self_id_index);
@@ -387,6 +470,9 @@ fn load_texture_by_hash(
 
     for path in dd0_path.iter().chain(std::iter::once(&full_path)) {
         if let Some(data) = load_dds_from_vfs(vfs, path) {
+            if let Some(d) = raw_dds_dumper {
+                d.dump_all_mips(vfs, path);
+            }
             return Some(data);
         }
     }
@@ -447,7 +533,7 @@ pub fn bake_tiledland_albedo(
     let sheen_amount = mat.get_float("sheen").unwrap_or(0.0);
 
     // Load and decode the tile atlas (array texture).
-    let ah_dds_bytes = load_texture_by_hash(vfs, db, self_id_index, ah_hash)?;
+    let ah_dds_bytes = load_texture_by_hash(vfs, db, self_id_index, ah_hash, None)?;
     let ah_dds = image_dds::ddsfile::Dds::read(&mut Cursor::new(&ah_dds_bytes)).ok()?;
     let num_layers = ah_dds.get_num_array_layers().max(1);
     // Decode only mip 0 of all layers.
@@ -463,7 +549,7 @@ pub fn bake_tiledland_albedo(
         layer_indices.iter().map(|&idx| ah_surface.get_image(idx, 0, 0)).collect();
 
     // Load and decode the blend map.
-    let blend_dds_bytes = load_texture_by_hash(vfs, db, self_id_index, blend_hash)?;
+    let blend_dds_bytes = load_texture_by_hash(vfs, db, self_id_index, blend_hash, None)?;
     let blend_img = {
         let dds = image_dds::ddsfile::Dds::read(&mut Cursor::new(&blend_dds_bytes)).ok()?;
         image_dds::image_from_dds(&dds, 0).ok()?
@@ -646,14 +732,17 @@ pub fn load_pbr_channels(
     db: &PrototypeDatabase<'_>,
     self_id_index: &HashMap<u64, usize>,
     mfm_path_id: u64,
+    mut raw_dds_dumper: Option<&mut RawDdsDumper>,
 ) -> PbrChannels {
     let Some(mat) = parse_mfm_from_db(db, mfm_path_id) else {
         return PbrChannels::default();
     };
 
-    let load_raw = |property: &str| -> Option<Vec<u8>> {
+    // Closure-local loader — threads the dumper by reborrowing so each
+    // property resolution can independently trigger mip dumps.
+    let mut load_raw = |property: &str| -> Option<Vec<u8>> {
         let hash = mat.get_texture_hash(property)?;
-        let dds = load_texture_by_hash(vfs, db, self_id_index, hash)?;
+        let dds = load_texture_by_hash(vfs, db, self_id_index, hash, raw_dds_dumper.as_deref_mut())?;
         dds_to_png(&dds).ok()
     };
 
@@ -752,7 +841,7 @@ pub fn load_or_bake_albedo(
     // Fall back to simple filename-based lookup (works for standard PBS materials).
     // Force alpha=255 since model albedo textures often store non-opacity data
     // (height, roughness) in the alpha channel which would cause unwanted transparency.
-    let dds_bytes = load_base_albedo_bytes(vfs, mfm_full_path)?;
+    let dds_bytes = load_base_albedo_bytes(vfs, mfm_full_path, None)?;
     let mut png = dds_to_png_resized(&dds_bytes, max_size).ok()?;
     force_png_opaque(&mut png);
     Some(png)

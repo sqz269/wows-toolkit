@@ -217,6 +217,14 @@ enum Commands {
         #[arg(long)]
         textures_uri_prefix: Option<String>,
 
+        /// If set, dump raw WG DDS files (all mip levels — .dd0, .dd1,
+        /// .dd2, .dds) to this directory alongside the glTF output,
+        /// preserving WG filenames verbatim. Independent of
+        /// --textures-dir; both can be set. Enables Unity-side Texture
+        /// Streaming with the full mip chain in BC-compressed form.
+        #[arg(long)]
+        raw_dds_dir: Option<PathBuf>,
+
         /// List available camouflage texture schemes, then exit
         #[arg(long)]
         list_textures: bool,
@@ -303,6 +311,14 @@ enum Commands {
         /// `--textures-dir` is set.
         #[arg(long)]
         textures_uri_prefix: Option<String>,
+
+        /// If set, dump raw WG DDS files (all mip levels — .dd0, .dd1,
+        /// .dd2, .dds) to this directory alongside the GLB, preserving
+        /// WG filenames verbatim. Independent of --textures-dir; both
+        /// can be set. Enables Unity-side Texture Streaming with the
+        /// full mip chain in BC-compressed form.
+        #[arg(long)]
+        raw_dds_dir: Option<PathBuf>,
 
         /// List available camouflage texture schemes, then exit
         #[arg(long)]
@@ -1070,7 +1086,7 @@ fn run() -> Result<(), Report> {
             let file_data = read_file_data(&file, no_vfs, vfs.as_ref())?;
             run_geometry(&file_data, &file.to_string_lossy(), decode)?;
         }
-        Commands::ExportModel { file, output, lod, no_textures, damaged, all_render_sets, textures_dir, textures_uri_prefix, list_textures, no_vfs } => {
+        Commands::ExportModel { file, output, lod, no_textures, damaged, all_render_sets, textures_dir, textures_uri_prefix, raw_dds_dir, list_textures, no_vfs } => {
             run_export_model(&ExportModelParams {
                 file: &file,
                 output: &output,
@@ -1080,12 +1096,13 @@ fn run() -> Result<(), Report> {
                 all_render_sets,
                 textures_dir: textures_dir.as_deref(),
                 textures_uri_prefix: textures_uri_prefix.as_deref(),
+                raw_dds_dir: raw_dds_dir.as_deref(),
                 list_textures,
                 no_vfs,
                 vfs: vfs.as_ref(),
             })?;
         }
-        Commands::ExportShip { name, output, lod, list_upgrades, hull, no_textures, damaged, all_render_sets, accessories, placements_json, textures_dir, textures_uri_prefix, list_textures, debug } => {
+        Commands::ExportShip { name, output, lod, list_upgrades, hull, no_textures, damaged, all_render_sets, accessories, placements_json, textures_dir, textures_uri_prefix, raw_dds_dir, list_textures, debug } => {
             let Some(vfs) = &vfs else {
                 bail!("VFS required for export-ship. Use --game-dir to specify a game install.");
             };
@@ -1106,6 +1123,7 @@ fn run() -> Result<(), Report> {
                 placements_json.as_deref(),
                 textures_dir.as_deref(),
                 textures_uri_prefix.as_deref(),
+                raw_dds_dir.as_deref(),
                 list_textures,
                 debug,
             )?;
@@ -1509,6 +1527,7 @@ struct ExportModelParams<'a> {
     all_render_sets: bool,
     textures_dir: Option<&'a Path>,
     textures_uri_prefix: Option<&'a str>,
+    raw_dds_dir: Option<&'a Path>,
     list_textures: bool,
     no_vfs: bool,
     vfs: Option<&'a VfsPath>,
@@ -1517,7 +1536,7 @@ struct ExportModelParams<'a> {
 fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
     let ExportModelParams {
         file, output, lod, no_textures, damaged, all_render_sets,
-        textures_dir, textures_uri_prefix, list_textures, no_vfs, vfs,
+        textures_dir, textures_uri_prefix, raw_dds_dir, list_textures, no_vfs, vfs,
     } = *params;
     use wowsunpack::export::gltf_export;
     use wowsunpack::export::ship::build_texture_set;
@@ -1608,7 +1627,7 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
             gltf_export::TextureSet::empty()
         } else {
             let mfm_infos = collect_mfm_info(vp, db);
-            build_texture_set(&mfm_infos, vfs, db)
+            build_texture_set(&mfm_infos, vfs, db, raw_dds_dir)
         };
 
         let mut tex_out = match textures_dir {
@@ -1972,6 +1991,7 @@ fn run_export_ship(
     placements_json: Option<&Path>,
     textures_dir: Option<&Path>,
     textures_uri_prefix: Option<&str>,
+    raw_dds_dir: Option<&Path>,
     list_textures: bool,
     debug: bool,
 ) -> Result<(), Report> {
@@ -2035,6 +2055,7 @@ fn run_export_ship(
         textures_uri_prefix: textures_uri_prefix
             .map(|s| s.to_string())
             .unwrap_or_else(|| "textures/".to_string()),
+        raw_dds_dir: raw_dds_dir.map(|p| p.to_path_buf()),
         ..Default::default()
     };
     let ctx = assets.load_ship(name, &options)?;

@@ -141,6 +141,13 @@ pub struct ShipExportOptions {
     /// The default `"textures/"` works when the textures dir is placed as a
     /// `textures/` sub-directory next to the GLB.
     pub textures_uri_prefix: String,
+    /// If set, dump raw WG DDS files (every available mip level —
+    /// `.dd0`, `.dd1`, `.dd2`, `.dds`) to this directory as a parallel
+    /// data stream. Preserves WG filenames verbatim so downstream
+    /// consumers (Unity's DDS importer, Texture Streaming) see the full
+    /// mip chain in BC-compressed form. Independent of `textures_dir`
+    /// (PNG export for glTF): both can be set simultaneously.
+    pub raw_dds_dir: Option<PathBuf>,
 }
 
 impl Default for ShipExportOptions {
@@ -156,6 +163,7 @@ impl Default for ShipExportOptions {
             placements_json_path: None,
             textures_dir: None,
             textures_uri_prefix: "textures/".to_string(),
+            raw_dds_dir: None,
         }
     }
 }
@@ -1261,7 +1269,7 @@ impl ShipModelContext {
             }
 
             let image = texture_cache.entry(mfm_path.clone()).or_insert_with(|| {
-                let dds_bytes = texture::load_base_albedo_bytes(&self.vfs, &mfm_path)?;
+                let dds_bytes = texture::load_base_albedo_bytes(&self.vfs, &mfm_path, None)?;
                 let dds = image_dds::ddsfile::Dds::read(&mut Cursor::new(&dds_bytes)).ok()?;
                 image_dds::image_from_dds(&dds, 0).ok()
             });
@@ -1477,7 +1485,12 @@ impl ShipModelContext {
             for sub in &sub_models {
                 all_mfm_infos.extend(collect_mfm_info(sub.visual, &db));
             }
-            let mut tex_set = build_texture_set(&all_mfm_infos, &self.vfs, &db);
+            let mut tex_set = build_texture_set(
+                &all_mfm_infos,
+                &self.vfs,
+                &db,
+                self.options.raw_dds_dir.as_deref(),
+            );
             let per_ship_count = tex_set.camo_schemes.len();
 
             // Merge material-based camo textures (mat_Steel, mat_Yamato_KoF, etc.).
@@ -1730,7 +1743,12 @@ pub fn collect_mfm_info(visual: &VisualPrototype, db: &PrototypeDatabase<'_>) ->
 ///
 /// See `tools/toolkit_integration/pbr_textures.md` in the downstream
 /// pipeline repo for the channel-packing plan.
-pub fn build_texture_set(mfm_infos: &[MfmInfo], vfs: &VfsPath, db: &PrototypeDatabase<'_>) -> TextureSet {
+pub fn build_texture_set(
+    mfm_infos: &[MfmInfo],
+    vfs: &VfsPath,
+    db: &PrototypeDatabase<'_>,
+    raw_dds_dir: Option<&std::path::Path>,
+) -> TextureSet {
     let mut base = HashMap::new();
     let mut normal_base = HashMap::new();
     let mut metallic_roughness_base = HashMap::new();
@@ -1748,9 +1766,13 @@ pub fn build_texture_set(mfm_infos: &[MfmInfo], vfs: &VfsPath, db: &PrototypeDat
     // across every MFM in the ship.
     let self_id_index = db.build_self_id_index();
 
+    // One dumper per ship; session-scoped dedup means the same texture
+    // referenced by multiple materials writes to disk only once.
+    let mut raw_dds_dumper = raw_dds_dir.map(|d| texture::RawDdsDumper::new(d.to_path_buf()));
+
     // Load base albedo textures.
     for info in &unique_infos {
-        if let Some(dds_bytes) = texture::load_base_albedo_bytes(vfs, &info.full_path) {
+        if let Some(dds_bytes) = texture::load_base_albedo_bytes(vfs, &info.full_path, raw_dds_dumper.as_mut()) {
             match texture::dds_to_png(&dds_bytes) {
                 Ok(png_bytes) => {
                     base.insert(info.stem.clone(), png_bytes);
@@ -1763,7 +1785,10 @@ pub fn build_texture_set(mfm_infos: &[MfmInfo], vfs: &VfsPath, db: &PrototypeDat
 
         // Load PBR auxiliary channels (normal / MG / AO) via MFM property lookup.
         if info.material_mfm_path_id != 0 {
-            let channels = texture::load_pbr_channels(vfs, db, &self_id_index, info.material_mfm_path_id);
+            let channels = texture::load_pbr_channels(
+                vfs, db, &self_id_index, info.material_mfm_path_id,
+                raw_dds_dumper.as_mut(),
+            );
             if let Some(png) = channels.normal {
                 normal_base.insert(info.stem.clone(), png);
             }
@@ -1784,7 +1809,9 @@ pub fn build_texture_set(mfm_infos: &[MfmInfo], vfs: &VfsPath, db: &PrototypeDat
     for scheme in &schemes {
         let mut scheme_textures = HashMap::new();
         for info in &unique_infos {
-            if let Some((_base_name, dds_bytes)) = texture::load_texture_bytes(vfs, &info.stem, scheme) {
+            if let Some((_base_name, dds_bytes)) =
+                texture::load_texture_bytes(vfs, &info.stem, scheme, raw_dds_dumper.as_mut())
+            {
                 match texture::dds_to_png(&dds_bytes) {
                     Ok(png_bytes) => {
                         scheme_textures.insert(info.stem.clone(), png_bytes);
