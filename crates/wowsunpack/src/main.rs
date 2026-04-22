@@ -262,6 +262,20 @@ enum Commands {
         #[arg(long, value_enum, default_value = "embed")]
         accessories: CliAccessoryMode,
 
+        /// Optional sidecar-ready placements manifest. When set, writes a JSON
+        /// file containing every resolved mount placement (turrets, secondaries,
+        /// antiair, torpedoes, accessories) alongside the GLB. Emits regardless
+        /// of `--accessories` — hull-only exports still produce the full
+        /// placement list so the Unity sidecar can be populated from a single
+        /// `export-ship` call.
+        ///
+        /// Entry shape:
+        ///   { instance_id, asset_id, hp_name, scope, category, subcategory,
+        ///     species, transform: { matrix: [16 floats, col-major, metres],
+        ///     position: [x,y,z] } }
+        #[arg(long)]
+        placements_json: Option<PathBuf>,
+
         /// List available camouflage texture schemes, then exit
         #[arg(long)]
         list_textures: bool,
@@ -1030,7 +1044,7 @@ fn run() -> Result<(), Report> {
                 vfs: vfs.as_ref(),
             })?;
         }
-        Commands::ExportShip { name, output, lod, list_upgrades, hull, no_textures, damaged, all_render_sets, accessories, list_textures, debug } => {
+        Commands::ExportShip { name, output, lod, list_upgrades, hull, no_textures, damaged, all_render_sets, accessories, placements_json, list_textures, debug } => {
             let Some(vfs) = &vfs else {
                 bail!("VFS required for export-ship. Use --game-dir to specify a game install.");
             };
@@ -1048,6 +1062,7 @@ fn run() -> Result<(), Report> {
                 damaged,
                 all_render_sets,
                 accessories.into(),
+                placements_json.as_deref(),
                 list_textures,
                 debug,
             )?;
@@ -1899,6 +1914,7 @@ fn run_export_ship(
     damaged: bool,
     all_render_sets: bool,
     accessory_mode: wowsunpack::export::ship::AccessoryMode,
+    placements_json: Option<&Path>,
     list_textures: bool,
     debug: bool,
 ) -> Result<(), Report> {
@@ -1957,6 +1973,7 @@ fn run_export_ship(
         damaged,
         all_render_sets,
         accessory_mode,
+        placements_json_path: placements_json.map(|p| p.to_path_buf()),
         ..Default::default()
     };
     let ctx = assets.load_ship(name, &options)?;
@@ -1976,6 +1993,14 @@ fn run_export_ship(
 
     let file_size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
     println!("Exported to {} ({} bytes)", output.display(), file_size);
+
+    // Placements manifest is emitted regardless of --accessories mode so a
+    // hull-only GLB can still drive a complete sidecar.
+    if let Some(path) = placements_json {
+        ctx.write_placements_json(path)?;
+        let json_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        println!("Placements manifest → {} ({} bytes)", path.display(), json_size);
+    }
 
     if has_armor {
         print_armor_legend();

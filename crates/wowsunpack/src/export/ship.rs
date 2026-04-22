@@ -21,7 +21,10 @@ use std::collections::HashSet;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use rootcause::prelude::*;
 use vfs::VfsPath;
@@ -118,6 +121,14 @@ pub struct ShipExportOptions {
     /// Module overrides: component type key (e.g. "artillery") to component name.
     /// Overrides the default component for specific types.
     pub module_overrides: std::collections::HashMap<crate::game_params::keys::ComponentType, String>,
+    /// If set, write a JSON manifest of every resolved mount placement to this
+    /// path alongside the GLB. Emitted regardless of [`accessory_mode`] — the
+    /// placements JSON is the canonical source for the Unity sidecar's typed
+    /// sections (turrets / secondaries / antiair / torpedoes / accessories),
+    /// so it stays complete even when the GLB omits accessory meshes.
+    ///
+    /// Field contract: see `run_export_ship` docs in the CLI.
+    pub placements_json_path: Option<PathBuf>,
 }
 
 impl Default for ShipExportOptions {
@@ -130,6 +141,7 @@ impl Default for ShipExportOptions {
             all_render_sets: false,
             accessory_mode: AccessoryMode::Embed,
             module_overrides: std::collections::HashMap::new(),
+            placements_json_path: None,
         }
     }
 }
@@ -892,6 +904,7 @@ impl ShipAssets {
                 mount_armor: mi.mount_armor().cloned(),
                 species: mi.species(),
                 barrel_pitch,
+                model_path: mi.model_path().to_string(),
             });
         }
 
@@ -1242,6 +1255,125 @@ impl ShipModelContext {
         Ok(result)
     }
 
+    /// Write a JSON manifest of every resolved mount placement.
+    ///
+    /// See the `--placements-json` CLI flag for the output contract. The shape
+    /// is sidecar-ready: one typed section per [`MountSpecies`] group (main →
+    /// `turrets`, secondary → `secondaries`, aaircraft → `antiair`, torpedo →
+    /// `torpedoes`, everything else → `accessories`). Each entry carries a
+    /// per-asset instance_id, the GameParams scope/category/subcategory parsed
+    /// from the mount's model path, and a column-major world-space transform
+    /// in metres (native × 15).
+    ///
+    /// Emits regardless of the configured [`AccessoryMode`] so a hull-only GLB
+    /// export can still produce a complete placement manifest.
+    #[cfg(feature = "json")]
+    pub fn write_placements_json(&self, path: &Path) -> Result<(), Report> {
+        use crate::game_params::types::MountSpecies;
+        use serde_json::json;
+
+        // --- Sections, keyed by MountSpecies group. ---
+        let mut turrets = Vec::new();
+        let mut secondaries = Vec::new();
+        let mut antiair = Vec::new();
+        let mut torpedoes = Vec::new();
+        let mut accessories = Vec::new();
+
+        // Per-asset-id running counter for instance_id uniqueness.
+        let mut asset_counts: HashMap<String, usize> = HashMap::new();
+
+        for mount in &self.mounts {
+            let turret = &self.turret_models[mount.turret_model_index];
+            let asset_id = turret.name.clone();
+            let counter = asset_counts.entry(asset_id.clone()).or_insert(0);
+            let ship_stem =
+                self.info.display_name.as_deref().unwrap_or(self.info.model_dir.as_str()).to_string();
+            let instance_id = format!("{}_{}_{:02}", ship_stem, asset_id, *counter);
+            *counter += 1;
+
+            // Derive scope / category / subcategory from the model VFS path.
+            // Expected shape: content/gameplay/<scope>/<category>[/<subcategory>...]/<Asset>/<Asset>.model
+            let (scope, category, subcategory) = parse_mount_path_taxonomy(&mount.model_path);
+
+            // Build the world-space transform. `mount.armor_transform` is the
+            // raw hardpoint transform (no yaw correction), exactly what the
+            // sidecar wants — a per-placement frame that downstream prefabs can
+            // orient around. Apply `negate_z_transform` for consistency with
+            // every other vertex/transform exit point in the GLB export, then
+            // scale translation by 15 to land in metres.
+            let raw = mount.armor_transform.unwrap_or(IDENTITY_4X4);
+            let mut matrix = super::gltf_export::negate_z_transform(raw);
+            matrix[12] *= NATIVE_TO_METRES;
+            matrix[13] *= NATIVE_TO_METRES;
+            matrix[14] *= NATIVE_TO_METRES;
+            let position = [matrix[12], matrix[13], matrix[14]];
+
+            let species_str: Option<&'static str> = mount.species.map(|s| match s {
+                MountSpecies::Main => "Main",
+                MountSpecies::Secondary => "Secondary",
+                MountSpecies::AAircraft => "AAircraft",
+                MountSpecies::Torpedo => "Torpedo",
+                MountSpecies::DCharge => "DCharge",
+                MountSpecies::FireControl => "FireControl",
+                MountSpecies::Search => "Search",
+                MountSpecies::MissileGun => "MissileGun",
+                MountSpecies::Decoration => "Decoration",
+            });
+
+            let entry = json!({
+                "instance_id": instance_id,
+                "asset_id":    asset_id,
+                "hp_name":     mount.hp_name,
+                "scope":       scope,
+                "category":    category,
+                "subcategory": subcategory,
+                "species":     species_str,
+                "transform": {
+                    "matrix":   matrix.as_slice(),
+                    "position": position.as_slice(),
+                },
+            });
+
+            match mount.species {
+                Some(MountSpecies::Main) => turrets.push(entry),
+                Some(MountSpecies::Secondary) => secondaries.push(entry),
+                Some(MountSpecies::AAircraft) => antiair.push(entry),
+                Some(MountSpecies::Torpedo) => torpedoes.push(entry),
+                // Everything else (FireControl, Search, MissileGun, Decoration,
+                // DCharge, None) is a bulk accessory.
+                _ => accessories.push(entry),
+            }
+        }
+
+        let now = format_rfc3339_utc(SystemTime::now());
+        let toolkit_version = env!("CARGO_PKG_VERSION");
+
+        let manifest = json!({
+            "schema_version": 1,
+            "ship": {
+                "model_dir":    self.info.model_dir,
+                "display_name": self.info.display_name,
+            },
+            "pipeline": {
+                "toolkit_version": toolkit_version,
+                "generated_at":    now,
+            },
+            "turrets":     turrets,
+            "secondaries": secondaries,
+            "antiair":     antiair,
+            "torpedoes":   torpedoes,
+            "accessories": accessories,
+        });
+
+        let file = std::fs::File::create(path)
+            .context_with(|| format!("Failed to create placements JSON at {}", path.display()))?;
+        let mut writer = std::io::BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, &manifest)
+            .map_err(|e| rootcause::report!("Failed to serialize placements JSON: {e}"))?;
+        writer.write_all(b"\n").ok();
+        Ok(())
+    }
+
     /// Export the loaded ship model to GLB format.
     pub fn export_glb(&self, writer: &mut impl Write) -> Result<(), Report> {
         let db = assets_bin::parse_assets_bin(&self.assets_bin_bytes).context("Failed to re-parse assets.bin")?;
@@ -1462,6 +1594,11 @@ struct ResolvedMount {
     species: Option<crate::game_params::types::MountSpecies>,
     /// Per-vertex barrel pitch configuration (if pitchDeadZones applies).
     barrel_pitch: Option<super::gltf_export::BarrelPitch>,
+    /// Full GameParams model path, e.g.
+    /// `content/gameplay/usa/gun/main/AGM034_16in50_Mk7/AGM034_16in50_Mk7.model`.
+    /// Preserved from the `MountPoint` so downstream placement-manifest emission
+    /// can derive scope/category/subcategory/asset_id without a second lookup.
+    model_path: String,
 }
 
 /// Pre-resolved material-based camouflage scheme (owned data, no lifetimes).
@@ -1709,6 +1846,92 @@ fn mat4_rotation_inverse(m: &[f32; 16]) -> [f32; 16] {
         m[2], m[6], m[10], 0.0, // col 2 = original row 2
         0.0, 0.0, 0.0, 1.0, // no translation
     ]
+}
+
+/// Native WoWS unit → metres conversion factor.
+///
+/// BigWorld-derived game data expresses translations in "native" units where
+/// 1 unit ≈ 15 m. The sidecar and Unity consume metric, so the placements
+/// manifest multiplies translation components by this factor on emit.
+const NATIVE_TO_METRES: f32 = 15.0;
+
+/// Identity 4x4 column-major matrix — translation (0,0,0), no rotation.
+/// Used as the fallback transform for a mount whose hardpoint couldn't be
+/// resolved (the mount is still emitted so downstream logic sees the asset_id).
+const IDENTITY_4X4: [f32; 16] =
+    [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+
+/// Extract `(scope, category, subcategory)` from a mount's GameParams model path.
+///
+/// Example: `content/gameplay/usa/gun/main/AGM034_16in50_Mk7/AGM034_16in50_Mk7.model`
+/// yields `("usa", "gun", "main")`. Paths with more nesting have the full
+/// subtree (joined by `/`) collapsed into `subcategory`; paths with only
+/// scope + category yield `subcategory = None`.
+///
+/// Returns `(None, None, None)` for an unrecognised shape (e.g. empty string)
+/// rather than silently inventing fields — the sidecar prefers missing over
+/// wrong when the toolkit can't classify.
+fn parse_mount_path_taxonomy(model_path: &str) -> (Option<String>, Option<String>, Option<String>) {
+    // Strip the root `content/gameplay/` prefix when present. Everything else
+    // is kept case-sensitive per CLAUDE.md ("VFS path casing") — we never
+    // case-fold these tokens.
+    let tail = model_path
+        .strip_prefix("content/gameplay/")
+        .or_else(|| model_path.strip_prefix("/content/gameplay/"))
+        .unwrap_or(model_path);
+
+    // Drop the trailing `<AssetId>/<AssetId>.model` so the remaining segments
+    // are just the taxonomy. Walk segments and stop at the first one that
+    // matches the following segment's stem (that's the asset dir).
+    let mut segs: Vec<&str> = tail.split('/').collect();
+    // Drop the `.model` leaf.
+    if segs.last().is_some_and(|s| s.ends_with(".model") || s.ends_with(".geometry") || s.ends_with(".visual")) {
+        segs.pop();
+    }
+    // Drop the asset dir (same stem as the popped file).
+    if segs.len() >= 2 {
+        let last = segs[segs.len() - 1];
+        let prev = segs[segs.len() - 2];
+        if last == prev {
+            segs.pop();
+        } else if segs.len() >= 2 {
+            // Asset dir without matching leaf stem — still pop one.
+            segs.pop();
+        }
+    }
+
+    let scope = segs.first().map(|s| s.to_string());
+    let category = segs.get(1).map(|s| s.to_string());
+    let subcategory = if segs.len() > 2 { Some(segs[2..].join("/")) } else { None };
+
+    (scope, category, subcategory)
+}
+
+/// Format a `SystemTime` as an RFC 3339 UTC timestamp (seconds precision).
+///
+/// Avoids pulling `chrono` into the wowsunpack crate; the placements manifest
+/// only wants a monotonic "when was this generated" marker for audit.
+fn format_rfc3339_utc(time: SystemTime) -> String {
+    let secs = time.duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    // Civil-date conversion (Howard Hinnant's algorithm, public domain).
+    let days = secs.div_euclid(86_400);
+    let time_of_day = secs.rem_euclid(86_400);
+    let hour = (time_of_day / 3600) as u32;
+    let minute = ((time_of_day % 3600) / 60) as u32;
+    let second = (time_of_day % 60) as u32;
+
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5) + 1;
+    let m = if mp < 10 { mp + 3 } else { mp.wrapping_sub(9) };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, m, d, hour, minute, second)
 }
 
 /// Map a mount's species to a display group name.
