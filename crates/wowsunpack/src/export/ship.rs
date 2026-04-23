@@ -1287,7 +1287,7 @@ impl ShipModelContext {
                     self.armor_map.as_ref(),
                     mount.mount_armor.as_ref(),
                 );
-                mesh.transform = mount.armor_transform.map(gltf_export::negate_z_transform);
+                mesh.transform = mount.armor_transform.map(gltf_export::negate_z_and_scale_to_metres);
                 mesh.name = format!("{} [{}]", mesh.name, mount.hp_name);
                 result.push(mesh);
             }
@@ -1326,7 +1326,7 @@ impl ShipModelContext {
             let mut meshes =
                 gltf_export::collect_hull_meshes(&part.visual, &geom, &db, lod, damaged, mount.barrel_pitch.as_ref())?;
             for mesh in &mut meshes {
-                mesh.transform = mount.transform.map(gltf_export::negate_z_transform);
+                mesh.transform = mount.transform.map(gltf_export::negate_z_and_scale_to_metres);
                 mesh.name = format!("{} [{}]", mesh.name, mount.hp_name);
             }
             result.extend(meshes);
@@ -1423,14 +1423,10 @@ impl ShipModelContext {
             // Build the world-space transform. `mount.armor_transform` is the
             // raw hardpoint transform (no yaw correction), exactly what the
             // sidecar wants — a per-placement frame that downstream prefabs can
-            // orient around. Apply `negate_z_transform` for consistency with
-            // every other vertex/transform exit point in the GLB export, then
-            // scale translation by 15 to land in metres.
+            // orient around. The GLB export uses the same helper, so placements
+            // and mesh transforms land in the same metric space.
             let raw = mount.armor_transform.unwrap_or(IDENTITY_4X4);
-            let mut matrix = super::gltf_export::negate_z_transform(raw);
-            matrix[12] *= NATIVE_TO_METRES;
-            matrix[13] *= NATIVE_TO_METRES;
-            matrix[14] *= NATIVE_TO_METRES;
+            let matrix = super::gltf_export::negate_z_and_scale_to_metres(raw);
             let position = [matrix[12], matrix[13], matrix[14]];
 
             let species_str: Option<&'static str> = mount.species.map(|s| match s {
@@ -2228,13 +2224,6 @@ fn mat4_rotation_inverse(m: &[f32; 16]) -> [f32; 16] {
         0.0, 0.0, 0.0, 1.0, // no translation
     ]
 }
-
-/// Native WoWS unit → metres conversion factor.
-///
-/// BigWorld-derived game data expresses translations in "native" units where
-/// 1 unit ≈ 15 m. The sidecar and Unity consume metric, so the placements
-/// manifest multiplies translation components by this factor on emit.
-const NATIVE_TO_METRES: f32 = 15.0;
 
 /// Identity 4x4 column-major matrix — translation (0,0,0), no rotation.
 /// Used as the fallback transform for a mount whose hardpoint couldn't be

@@ -1553,7 +1553,8 @@ pub fn export_geometry_raw(geometry: &MergedGeometry, writer: &mut impl Write) -
         };
         flip_triangle_winding(&mut indices);
 
-        let verts = unpack_vertices(vert_slice, stride, &format);
+        let mut verts = unpack_vertices(vert_slice, stride, &format);
+        scale_positions_to_metres(&mut verts.positions);
 
         // Build a DecodedPrimitive for reuse with add_primitive_to_root.
         let prim = DecodedPrimitive {
@@ -1794,6 +1795,11 @@ fn decode_render_set_primitive(
     if let Some(bp) = barrel_pitch {
         apply_barrel_pitch(&mut verts.positions, &mut verts.normals, vert_slice, stride, &format, bp);
     }
+    // Scale AFTER barrel pitch: the pitch matrix's translation is a
+    // native-space pivot and must see native positions to rotate about
+    // the right point. Once rotated, a uniform 15× lift into metres is
+    // the last transformation this path applies.
+    scale_positions_to_metres(&mut verts.positions);
 
     let material_name = db
         .and_then(|db| db.strings.get_string_by_id(rs.material_name_id))
@@ -1969,6 +1975,7 @@ fn collect_primitives(
         if let Some(bp) = barrel_pitch {
             apply_barrel_pitch(&mut verts.positions, &mut verts.normals, vert_slice, stride, &format, bp);
         }
+        scale_positions_to_metres(&mut verts.positions);
 
         // Material name for this render set.
         let material_name = db
@@ -2087,6 +2094,52 @@ pub(super) fn negate_z_transform(m: [f32; 16]) -> [f32; 16] {
         -m[8], -m[9], m[10], m[11], // col 2: negate col 2, but row 2 double-negates
         m[12], m[13], -m[14], m[15], // col 3: negate Z translation
     ]
+}
+
+/// Native WoWS → metres scale factor (1 native unit ≈ 15 m).
+///
+/// Every vertex position and every node transform emitted by this module is
+/// pre-scaled to metres so downstream consumers (Unity, Blender previews, web
+/// viewers) work in a single metric coordinate system without a container
+/// scale. Only the raw vertex bytes in the WG geometry prototypes are native;
+/// everything this file writes is metric.
+///
+/// Barrel-pitch rotations must be applied BEFORE scaling because the pitch
+/// matrix's translation column encodes a native-space pivot. See
+/// [`scale_positions_to_metres`].
+pub const NATIVE_TO_METRES: f32 = 15.0;
+
+/// Scale every position component by [`NATIVE_TO_METRES`] in place.
+///
+/// Call this exactly once per mesh, after any coordinate-space conversion
+/// (Z-negation, barrel-pitch rotation) is complete. Scaling earlier changes
+/// the meaning of pivot offsets encoded in pitch matrices; scaling later
+/// (e.g. per-accessor in the glTF buffer write) would split the invariant
+/// across too many sites.
+pub(super) fn scale_positions_to_metres(positions: &mut [[f32; 3]]) {
+    for p in positions.iter_mut() {
+        p[0] *= NATIVE_TO_METRES;
+        p[1] *= NATIVE_TO_METRES;
+        p[2] *= NATIVE_TO_METRES;
+    }
+}
+
+/// Scale only the translation column of a column-major 4x4 by
+/// [`NATIVE_TO_METRES`]. The 3x3 rotation/scale part is untouched.
+pub(super) fn scale_translation_to_metres(m: &mut [f32; 16]) {
+    m[12] *= NATIVE_TO_METRES;
+    m[13] *= NATIVE_TO_METRES;
+    m[14] *= NATIVE_TO_METRES;
+}
+
+/// Z-negate (left→right-handed) AND scale translation to metres. The
+/// canonical mount-transform conversion: every `HP_*` or armor hardpoint
+/// transform fed from the visual skeleton goes through this before being
+/// written into the glTF scene graph.
+pub(super) fn negate_z_and_scale_to_metres(m: [f32; 16]) -> [f32; 16] {
+    let mut out = negate_z_transform(m);
+    scale_translation_to_metres(&mut out);
+    out
 }
 
 /// Apply a pitch rotation to vertices whose dominant bone is a barrel bone.
@@ -3163,6 +3216,10 @@ impl InteractiveArmorMesh {
 
         // Z-negation above mirrors the mesh; restore CCW winding for glTF.
         flip_triangle_winding(&mut indices);
+
+        // Native → metres. Must match hull + armor-sub-model convention.
+        scale_positions_to_metres(&mut positions);
+
         Self { name: armor.name.clone(), positions, normals, indices, colors, triangle_info, transform: None }
     }
 }
@@ -3227,6 +3284,10 @@ impl ArmorSubModel {
 
         // Z-negation above mirrors the mesh; restore CCW winding for glTF.
         flip_triangle_winding(&mut indices);
+
+        // Native → metres. Must match hull + zone-split armor convention.
+        scale_positions_to_metres(&mut positions);
+
         Self { name: armor.name.clone(), positions, normals, indices, colors, material_ids, transform: None }
     }
 }
@@ -3378,6 +3439,7 @@ pub fn collect_hull_meshes(
         if let Some(bp) = barrel_pitch {
             apply_barrel_pitch(&mut verts.positions, &mut verts.normals, vert_slice, stride, &format, bp);
         }
+        scale_positions_to_metres(&mut verts.positions);
 
         // Resolve full MFM path for texture lookup.
         let mfm_path = if rs.material_mfm_path_id != 0 {
@@ -3975,6 +4037,11 @@ pub fn armor_sub_models_by_zone(
             // Z-negation above mirrors the mesh; restore CCW winding for glTF.
             flip_triangle_winding(&mut indices);
 
+            // Native → metres. Armor vertices come from a different decode
+            // path than hull `unpack_vertices`, but the glTF consumers expect
+            // the same metric coordinate system.
+            scale_positions_to_metres(&mut positions);
+
             ArmorSubModel {
                 name: format!("Armor_{}", zone_name),
                 positions,
@@ -4015,24 +4082,31 @@ pub struct BarrelPitch {
 
 /// Parsed hitbox (splash-box) ready for GLB emission as a named cube mesh.
 ///
-/// Mirrors `geometry::SplashBox` but pre-applies Z-negation so the rest of the
-/// export pipeline can treat it like any other vertex data. `min` / `max` stay
-/// in native WoWS units (metres scaling happens at FBX export time).
+/// Mirrors `geometry::SplashBox` but pre-applies Z-negation AND the native-
+/// to-metres scale so the rest of the export pipeline can treat it like any
+/// other vertex data. Downstream consumers see metric extents without
+/// applying a container scale.
 pub struct Hitbox {
     pub name: String,
     pub min: [f32; 3],
     pub max: [f32; 3],
 }
 
-/// Convert a parsed `SplashBox` into a Z-negated `Hitbox`.
+/// Convert a parsed `SplashBox` into a Z-negated, metric `Hitbox`.
 ///
-/// BigWorld (left-handed) → glTF (right-handed) per the project's Z-negation
-/// convention. After flipping Z, `min.z`/`max.z` swap so the invariant
-/// `min.z < max.z` is preserved (otherwise the downstream cube-corner
-/// generator would emit zero-volume boxes).
+/// Applies two transforms in fixed order:
+/// 1. Z negation (BigWorld left-handed → glTF right-handed). After flipping,
+///    `min.z`/`max.z` swap so the invariant `min.z < max.z` is preserved.
+/// 2. Uniform × [`NATIVE_TO_METRES`] on every component so the emitted cube
+///    extents are in metres — matching the hull + armor convention.
 pub fn hitbox_from_splash(sb: &crate::models::geometry::SplashBox) -> Hitbox {
     let (min_z, max_z) = (-sb.max[2], -sb.min[2]);
-    Hitbox { name: sb.name.clone(), min: [sb.min[0], sb.min[1], min_z], max: [sb.max[0], sb.max[1], max_z] }
+    let s = NATIVE_TO_METRES;
+    Hitbox {
+        name: sb.name.clone(),
+        min: [sb.min[0] * s, sb.min[1] * s, min_z * s],
+        max: [sb.max[0] * s, sb.max[1] * s, max_z * s],
+    }
 }
 
 /// Build a cube primitive (8 vertices, 12 triangles, 6 face normals) for a
