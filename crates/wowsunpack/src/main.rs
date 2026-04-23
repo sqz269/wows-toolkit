@@ -233,6 +233,46 @@ enum Commands {
         #[clap(long)]
         no_vfs: bool,
     },
+    /// Batch variant of `export-model` — export many sub-models in one
+    /// invocation, sharing VFS + assets.bin parsing across all items.
+    ///
+    /// The per-invocation cost of `export-model` is dominated by parsing
+    /// assets.bin (~10 s on current builds); the actual geometry export is
+    /// milliseconds. Batching turns an O(N × 10 s) sequential loop into
+    /// O(10 s + N × export_time). Useful for building a shared accessory
+    /// library across a fleet.
+    ///
+    /// Input manifest JSON shape:
+    /// ```
+    /// {
+    ///   "shared": {
+    ///     "all_render_sets": true,
+    ///     "no_textures": false,
+    ///     "damaged": false,
+    ///     "lod": 0,
+    ///     "textures_uri_prefix": "textures/"
+    ///   },
+    ///   "items": [
+    ///     {
+    ///       "geometry":     "content/gameplay/usa/misc/AM019_Ventilators_1/AM019_Ventilators_1.geometry",
+    ///       "output":       "accessories/usa/misc/AM019_Ventilators_1/AM019_Ventilators_1.glb",
+    ///       "textures_dir": "accessories/usa/misc/AM019_Ventilators_1/textures",
+    ///       "raw_dds_dir":  "accessories/usa/misc/AM019_Ventilators_1/textures_dds"
+    ///     },
+    ///     ...
+    ///   ]
+    /// }
+    /// ```
+    BatchExportModel {
+        /// Path to the manifest JSON describing shared settings and the list
+        /// of per-item exports.
+        manifest: PathBuf,
+
+        /// Continue on per-item failures (default). When false, the first
+        /// failure aborts the batch.
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        keep_going: bool,
+    },
     /// Export all sub-models of a ship to a single GLB file.
     /// Each sub-model becomes a separate named object in Blender.
     ExportShip {
@@ -296,6 +336,20 @@ enum Commands {
         ///     position: [x,y,z] } }
         #[arg(long)]
         placements_json: Option<PathBuf>,
+
+        /// Optional companion JSON for decorative `.skel_ext` placements
+        /// (ventilators, bollards, hatches, fire gear, etc.). Emits every
+        /// affine matrix found in the ship's 8 `.skel_ext` files, globally
+        /// deduped at 1 cm position. These are UNRESOLVED candidates — no
+        /// asset_id; downstream tooling matches against a legacy gmconvert
+        /// scan or a cross-ship p0→asset_id database and merges into the
+        /// primary placements JSON's `accessories[]` section.
+        ///
+        /// For a Montana-class ship: ~57k candidates, 8-10 MB compact JSON.
+        /// Skip if you don't need decoratives (existing HP_* hardpoints are
+        /// fully captured by --placements-json alone).
+        #[arg(long)]
+        skel_ext_candidates_json: Option<PathBuf>,
 
         /// If set, write textures as PNG files into this directory and
         /// reference them via URIs in the glTF instead of embedding them
@@ -1102,7 +1156,13 @@ fn run() -> Result<(), Report> {
                 vfs: vfs.as_ref(),
             })?;
         }
-        Commands::ExportShip { name, output, lod, list_upgrades, hull, no_textures, damaged, all_render_sets, accessories, placements_json, textures_dir, textures_uri_prefix, raw_dds_dir, list_textures, debug } => {
+        Commands::BatchExportModel { manifest, keep_going } => {
+            let Some(vfs) = vfs.as_ref() else {
+                bail!("VFS required for batch-export-model. Use --game-dir to specify a game install.");
+            };
+            run_batch_export_model(&manifest, keep_going, vfs)?;
+        }
+        Commands::ExportShip { name, output, lod, list_upgrades, hull, no_textures, damaged, all_render_sets, accessories, placements_json, skel_ext_candidates_json, textures_dir, textures_uri_prefix, raw_dds_dir, list_textures, debug } => {
             let Some(vfs) = &vfs else {
                 bail!("VFS required for export-ship. Use --game-dir to specify a game install.");
             };
@@ -1121,6 +1181,7 @@ fn run() -> Result<(), Report> {
                 all_render_sets,
                 accessories.into(),
                 placements_json.as_deref(),
+                skel_ext_candidates_json.as_deref(),
                 textures_dir.as_deref(),
                 textures_uri_prefix.as_deref(),
                 raw_dds_dir.as_deref(),
@@ -1538,11 +1599,61 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
         file, output, lod, no_textures, damaged, all_render_sets,
         textures_dir, textures_uri_prefix, raw_dds_dir, list_textures, no_vfs, vfs,
     } = *params;
+    use wowsunpack::models::assets_bin;
+
+    // 1. Load assets.bin (if available via VFS). Stored in a locally-owned
+    //    Vec<u8> so the PrototypeDatabase can borrow from it.
+    let assets_bin_data: Option<Vec<u8>> = if let Some(vfs) = vfs {
+        load_assets_bin(vfs).ok()
+    } else {
+        None
+    };
+    let db = assets_bin_data.as_deref().map(assets_bin::parse_assets_bin).transpose()?;
+
+    export_one_model(
+        file, output, lod, no_textures, damaged, all_render_sets,
+        textures_dir, textures_uri_prefix, raw_dds_dir, list_textures,
+        no_vfs, vfs, db.as_ref(),
+        /* verbose: */ true,
+    )
+}
+
+/// Read the full `content/assets.bin` blob out of the VFS into memory.
+fn load_assets_bin(vfs: &VfsPath) -> Result<Vec<u8>, Report> {
+    let mut buf = Vec::new();
+    vfs.join("content/assets.bin")
+        .context("VFS path error")?
+        .open_file()
+        .context("Could not find content/assets.bin in VFS")?
+        .read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Inner export routine shared by the single-model and batch commands.
+///
+/// Takes a pre-parsed `PrototypeDatabase` so the caller can amortize the
+/// assets.bin parse cost across many invocations.
+#[allow(clippy::too_many_arguments)]
+fn export_one_model(
+    file: &Path,
+    output: &Path,
+    lod: usize,
+    no_textures: bool,
+    damaged: bool,
+    all_render_sets: bool,
+    textures_dir: Option<&Path>,
+    textures_uri_prefix: Option<&str>,
+    raw_dds_dir: Option<&Path>,
+    list_textures: bool,
+    no_vfs: bool,
+    vfs: Option<&VfsPath>,
+    db: Option<&wowsunpack::models::assets_bin::PrototypeDatabase<'_>>,
+    verbose: bool,
+) -> Result<(), Report> {
     use wowsunpack::export::gltf_export;
     use wowsunpack::export::ship::build_texture_set;
     use wowsunpack::export::ship::collect_mfm_info;
     use wowsunpack::export::texture;
-    use wowsunpack::models::assets_bin;
     use wowsunpack::models::geometry;
     use wowsunpack::models::visual;
 
@@ -1551,39 +1662,22 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
     let geom = geometry::parse_geometry(&geom_data).context("Failed to parse geometry")?;
 
     let file_str = file.to_string_lossy();
-    println!("Geometry: {file_str}");
-    println!(
-        "  {} vertex buffers, {} index buffers, {} vertices mappings, {} indices mappings",
-        geom.merged_vertices.len(),
-        geom.merged_indices.len(),
-        geom.vertices_mapping.len(),
-        geom.indices_mapping.len(),
-    );
+    if verbose {
+        println!("Geometry: {file_str}");
+        println!(
+            "  {} vertex buffers, {} index buffers, {} vertices mappings, {} indices mappings",
+            geom.merged_vertices.len(),
+            geom.merged_indices.len(),
+            geom.vertices_mapping.len(),
+            geom.indices_mapping.len(),
+        );
+    }
 
     // 2. Try to find a matching .visual (requires VFS + assets.bin).
     //    Derive the visual suffix by replacing .geometry with .visual in the filename.
     let visual_suffix = file_str.strip_suffix(".geometry").map(|stem| format!("{stem}.visual"));
 
-    // Load assets.bin into function scope so the borrow for PrototypeDatabase lives long enough.
-    let assets_bin_data = if let (Some(vfs), Some(_)) = (vfs, &visual_suffix) {
-        let result: Result<Vec<u8>, Report> = (|| {
-            let mut buf = Vec::new();
-            vfs.join("content/assets.bin")
-                .context("VFS path error")?
-                .open_file()
-                .context("Could not find content/assets.bin in VFS")?
-                .read_to_end(&mut buf)?;
-            Ok(buf)
-        })();
-        result.ok()
-    } else {
-        None
-    };
-
-    // Parse assets.bin and try to resolve a matching .visual.
-    let db = assets_bin_data.as_deref().map(assets_bin::parse_assets_bin).transpose()?;
-
-    let resolved_visual = if let (Some(db), Some(vis_suffix)) = (&db, &visual_suffix) {
+    let resolved_visual = if let (Some(db), Some(vis_suffix)) = (db, &visual_suffix) {
         let self_id_index = db.build_self_id_index();
         match db.resolve_path(vis_suffix, &self_id_index) {
             Ok((vis_location, vis_full_path)) if vis_location.blob_index == 1 => {
@@ -1591,13 +1685,15 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
                     .get_prototype_data(vis_location, visual::VISUAL_ITEM_SIZE)
                     .context("Failed to get visual prototype data")?;
                 let vp = visual::parse_visual(vis_data).context("Failed to parse VisualPrototype")?;
-                println!("Visual: {vis_full_path}");
-                println!(
-                    "  {} render sets, {} LODs, {} nodes",
-                    vp.render_sets.len(),
-                    vp.lods.len(),
-                    vp.nodes.name_ids.len()
-                );
+                if verbose {
+                    println!("Visual: {vis_full_path}");
+                    println!(
+                        "  {} render sets, {} LODs, {} nodes",
+                        vp.render_sets.len(),
+                        vp.lods.len(),
+                        vp.nodes.name_ids.len()
+                    );
+                }
                 Some(vp)
             }
             _ => None,
@@ -1607,7 +1703,7 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
     };
 
     // 3. If we have a visual, use the full export pipeline.
-    if let (Some(vp), Some(db), Some(vfs)) = (&resolved_visual, &db, vfs) {
+    if let (Some(vp), Some(db), Some(vfs)) = (&resolved_visual, db, vfs) {
         if list_textures {
             let mfm_infos = collect_mfm_info(vp, db);
             let stems: Vec<String> = mfm_infos.iter().map(|i| i.stem.clone()).collect();
@@ -1623,11 +1719,23 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
             return Ok(());
         }
 
-        let texture_set = if no_textures {
-            gltf_export::TextureSet::empty()
-        } else {
+        // DDS dump is a side effect of `build_texture_set`. Run the loader
+        // if EITHER the caller wants textures in the GLB or they requested
+        // a raw-DDS dump for Unity streaming. When only raw_dds_dir is set
+        // (Unity-authoritative pipelines that skip PNG generation), we
+        // still populate the TextureSet, then discard it so nothing lands
+        // in the GLB.
+        let load_textures = !no_textures || raw_dds_dir.is_some();
+        let texture_set = if load_textures {
             let mfm_infos = collect_mfm_info(vp, db);
-            build_texture_set(&mfm_infos, vfs, db, raw_dds_dir)
+            let tex_set = build_texture_set(&mfm_infos, vfs, db, raw_dds_dir);
+            if no_textures {
+                gltf_export::TextureSet::empty()
+            } else {
+                tex_set
+            }
+        } else {
+            gltf_export::TextureSet::empty()
         };
 
         let mut tex_out = match textures_dir {
@@ -1637,6 +1745,9 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
             ),
             None => gltf_export::TextureOutput::Embedded,
         };
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
         let mut out_file = std::fs::File::create(output).context("Failed to create output file")?;
         gltf_export::export_glb(vp, &geom, db, lod, &texture_set, damaged, all_render_sets, &mut tex_out, &mut out_file)
             .context("Failed to export GLB")?;
@@ -1646,14 +1757,160 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
             println!("No visual found; texture listing not available for raw geometry export.");
             return Ok(());
         }
-        println!("No matching .visual found; exporting raw geometry.");
+        if verbose {
+            println!("No matching .visual found; exporting raw geometry.");
+        }
 
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
         let mut out_file = std::fs::File::create(output).context("Failed to create output file")?;
         gltf_export::export_geometry_raw(&geom, &mut out_file).context("Failed to export raw geometry GLB")?;
     }
 
-    let file_size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
-    println!("Exported to {} ({} bytes)", output.display(), file_size);
+    if verbose {
+        let file_size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
+        println!("Exported to {} ({} bytes)", output.display(), file_size);
+    }
+
+    Ok(())
+}
+
+// ─── Batch export ────────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct BatchSharedOptions {
+    #[serde(default)]
+    all_render_sets: bool,
+    #[serde(default)]
+    no_textures: bool,
+    #[serde(default)]
+    damaged: bool,
+    #[serde(default)]
+    lod: usize,
+    #[serde(default)]
+    textures_uri_prefix: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchItem {
+    geometry: PathBuf,
+    output: PathBuf,
+    #[serde(default)]
+    textures_dir: Option<PathBuf>,
+    #[serde(default)]
+    raw_dds_dir: Option<PathBuf>,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchManifest {
+    #[serde(default)]
+    shared: BatchSharedOptions,
+    items: Vec<BatchItem>,
+}
+
+impl Default for BatchSharedOptions {
+    fn default() -> Self {
+        Self {
+            all_render_sets: false,
+            no_textures: false,
+            damaged: false,
+            lod: 0,
+            textures_uri_prefix: None,
+        }
+    }
+}
+
+fn run_batch_export_model(manifest_path: &Path, keep_going: bool, vfs: &VfsPath) -> Result<(), Report> {
+    use std::time::Instant;
+    use wowsunpack::models::assets_bin;
+
+    let t_start = Instant::now();
+
+    // Parse manifest.
+    let manifest_text = std::fs::read_to_string(manifest_path)
+        .context_with(|| format!("Failed to read manifest: {}", manifest_path.display()))?;
+    let manifest: BatchManifest = serde_json::from_str(&manifest_text)
+        .map_err(|e| rootcause::report!("Failed to parse manifest JSON: {e}"))?;
+
+    println!(
+        "batch-export-model: {} items from {}",
+        manifest.items.len(),
+        manifest_path.display()
+    );
+
+    // Load + parse assets.bin once — this is the dominant cost we're amortizing.
+    let t_bin = Instant::now();
+    let assets_bin_data = load_assets_bin(vfs).context("Failed to load content/assets.bin")?;
+    let db = assets_bin::parse_assets_bin(&assets_bin_data).context("Failed to parse assets.bin")?;
+    println!("assets.bin parsed in {:.2}s", t_bin.elapsed().as_secs_f64());
+
+    // Process each item. Print one line per item — no more verbose per-export
+    // output since we'd spam for N items.
+    let shared = &manifest.shared;
+    let tex_prefix = shared.textures_uri_prefix.as_deref();
+    let total = manifest.items.len();
+    let mut built = 0usize;
+    let mut failed = 0usize;
+    let mut first_errors: Vec<String> = Vec::new();
+
+    for (i, item) in manifest.items.iter().enumerate() {
+        let res = export_one_model(
+            &item.geometry,
+            &item.output,
+            shared.lod,
+            shared.no_textures,
+            shared.damaged,
+            shared.all_render_sets,
+            item.textures_dir.as_deref(),
+            tex_prefix,
+            item.raw_dds_dir.as_deref(),
+            /* list_textures: */ false,
+            /* no_vfs: */ false,
+            Some(vfs),
+            Some(&db),
+            /* verbose: */ false,
+        );
+
+        let label = item.geometry
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| item.geometry.display().to_string());
+
+        match res {
+            Ok(()) => {
+                built += 1;
+                println!("  [{:>4}/{}] {} built", i + 1, total, label);
+            }
+            Err(e) => {
+                failed += 1;
+                let msg = format!("{}: {}", label, e);
+                if first_errors.len() < 5 {
+                    first_errors.push(msg.clone());
+                }
+                println!("  [{:>4}/{}] {} FAIL: {}", i + 1, total, label, e);
+                if !keep_going {
+                    bail!("batch aborted (keep_going=false) at item {}: {}", i + 1, e);
+                }
+            }
+        }
+    }
+
+    let elapsed = t_start.elapsed().as_secs_f64();
+    println!(
+        "\nbatch done: built={} failed={} total={} in {:.1}s ({:.2}s/item)",
+        built,
+        failed,
+        total,
+        elapsed,
+        if total > 0 { elapsed / total as f64 } else { 0.0 }
+    );
+    if !first_errors.is_empty() {
+        println!("first errors:");
+        for e in &first_errors {
+            println!("  {e}");
+        }
+    }
 
     Ok(())
 }
@@ -1989,6 +2246,7 @@ fn run_export_ship(
     all_render_sets: bool,
     accessory_mode: wowsunpack::export::ship::AccessoryMode,
     placements_json: Option<&Path>,
+    skel_ext_candidates_json: Option<&Path>,
     textures_dir: Option<&Path>,
     textures_uri_prefix: Option<&str>,
     raw_dds_dir: Option<&Path>,
@@ -2082,6 +2340,14 @@ fn run_export_ship(
         ctx.write_placements_json(path)?;
         let json_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         println!("Placements manifest → {} ({} bytes)", path.display(), json_size);
+    }
+
+    // Optional skel_ext candidate dump. Emits every affine matrix from the
+    // ship's 8 `.skel_ext` files as unresolved placement candidates.
+    if let Some(path) = skel_ext_candidates_json {
+        ctx.write_skel_ext_candidates_json(path)?;
+        let json_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        println!("Skel-ext candidates → {} ({} bytes)", path.display(), json_size);
     }
 
     if has_armor {

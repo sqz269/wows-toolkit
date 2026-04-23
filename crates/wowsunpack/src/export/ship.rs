@@ -526,6 +526,11 @@ impl ShipAssets {
         // Load hull sub-models.
         let hull_parts = self.load_sub_models(&db, &self_id_index, &visual_paths)?;
 
+        // Load per-segment `.skel_ext` files for decorative placements.
+        // Silently yields an empty vec if a ship has no `.skel_ext` assets.
+        let skel_ext_paths = self.find_skel_ext_paths(&db, &self_id_index, &info.model_dir);
+        let skel_ext_files = self.load_skel_ext_files(&skel_ext_paths)?;
+
         // Load turret/mount models from GameParams.
         let mount_points: Vec<MountPoint> = vehicle
             .and_then(|v| self.select_hull_mount_points(v, options.hull.as_deref(), &options.module_overrides))
@@ -551,6 +556,7 @@ impl ShipAssets {
             hull_parts,
             turret_models,
             mounts,
+            skel_ext_files,
             info,
             options: options.clone(),
             mat_camo_schemes,
@@ -818,6 +824,74 @@ impl ShipAssets {
         Ok(result)
     }
 
+    /// Find all `.skel_ext` VFS paths whose parent directory is the ship's
+    /// model_dir. A typical ship has 8: 4 base (Bow / MidFront / MidBack /
+    /// Stern) + 4 `_ep` variants.
+    fn find_skel_ext_paths(
+        &self,
+        db: &PrototypeDatabase<'_>,
+        self_id_index: &HashMap<u64, usize>,
+        model_dir: &str,
+    ) -> Vec<(String, String)> {
+        let needle = format!("/{model_dir}/");
+        let mut result = Vec::new();
+        for (i, entry) in db.paths_storage.iter().enumerate() {
+            if !entry.name.ends_with(".skel_ext") {
+                continue;
+            }
+            let full_path = db.reconstruct_path(i, self_id_index);
+            if full_path.contains(&needle) {
+                // Segment stem: strip "{model_dir}_" prefix and ".skel_ext"
+                // suffix, e.g. "ASB017_Montana_1945_MidFront_ep.skel_ext"
+                // → "MidFront_ep".
+                let stem_with_ext = entry.name.as_str();
+                let stem = stem_with_ext
+                    .strip_suffix(".skel_ext")
+                    .unwrap_or(stem_with_ext);
+                let prefix = format!("{model_dir}_");
+                let segment = stem.strip_prefix(&prefix).unwrap_or(stem).to_string();
+                result.push((segment, full_path));
+            }
+        }
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result
+    }
+
+    /// Load `.skel_ext` bytes for each segment path.
+    fn load_skel_ext_files(
+        &self,
+        skel_ext_paths: &[(String, String)],
+    ) -> Result<Vec<OwnedSkelExt>, Report> {
+        let mut out = Vec::new();
+        for (segment, vfs_path) in skel_ext_paths {
+            let vfs_joined = match self.vfs.join(vfs_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Warning: skipping skel_ext '{vfs_path}' (bad VFS join): {e}");
+                    continue;
+                }
+            };
+            let mut file = match vfs_joined.open_file() {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("Warning: skipping skel_ext '{vfs_path}' (could not open): {e}");
+                    continue;
+                }
+            };
+            let mut bytes = Vec::new();
+            if let Err(e) = file.read_to_end(&mut bytes) {
+                eprintln!("Warning: failed to read skel_ext '{vfs_path}': {e}");
+                continue;
+            }
+            out.push(OwnedSkelExt {
+                segment: segment.clone(),
+                vfs_path: vfs_path.clone(),
+                bytes,
+            });
+        }
+        Ok(out)
+    }
+
     /// Select mount points for the chosen hull upgrade, with optional module overrides.
     fn select_hull_mount_points(
         &self,
@@ -1047,6 +1121,9 @@ pub struct ShipModelContext {
     hull_parts: Vec<OwnedSubModel>,
     turret_models: Vec<OwnedSubModel>,
     mounts: Vec<ResolvedMount>,
+    /// Per-segment `.skel_ext` files (decorative placements, loaded from VFS).
+    /// Empty if the ship's model_dir has no `.skel_ext` files.
+    skel_ext_files: Vec<OwnedSkelExt>,
     info: ShipInfo,
     options: ShipExportOptions,
     mat_camo_schemes: Vec<MatCamoScheme>,
@@ -1393,6 +1470,11 @@ impl ShipModelContext {
             }
         }
 
+        // Skel-ext candidates are emitted to a separate companion file
+        // (see `write_skel_ext_candidates_json`) rather than inlined here,
+        // so the primary placements JSON stays compact for ships with
+        // many decorative props (~100k affine matrices → 40+ MB inline).
+
         let now = format_rfc3339_utc(SystemTime::now());
         let toolkit_version = env!("CARGO_PKG_VERSION");
 
@@ -1415,6 +1497,11 @@ impl ShipModelContext {
             "antiair":     antiair,
             "torpedoes":   torpedoes,
             "accessories": accessories,
+            "skel_ext_summary": {
+                "files": self.skel_ext_files.len(),
+                "segments": self.skel_ext_files.iter().map(|f| f.segment.as_str()).collect::<Vec<_>>(),
+                "note": "Decorative skel_ext placements are emitted to a companion file via `--skel-ext-candidates-json` (see `write_skel_ext_candidates_json`).",
+            },
         });
 
         let file = std::fs::File::create(path)
@@ -1423,6 +1510,129 @@ impl ShipModelContext {
         serde_json::to_writer_pretty(&mut writer, &manifest)
             .map_err(|e| rootcause::report!("Failed to serialize placements JSON: {e}"))?;
         writer.write_all(b"\n").ok();
+        Ok(())
+    }
+
+    /// Write a companion JSON with every skel_ext affine matrix found in the
+    /// ship's `.skel_ext` files.
+    ///
+    /// This output is **unresolved candidates**, not the final placements:
+    /// each entry carries a 4×4 metric glTF transform plus the per-placement
+    /// p0 and p1 hashes, but no asset_id (that's downstream). The Python
+    /// resolver tool (`tools/skel_ext_resolve.py` in the pipeline repo) reads
+    /// this file together with a legacy gmconvert scan (for ships we have
+    /// one) or a cross-ship p0→asset_id fingerprint database (future) and
+    /// fills in the `accessories[]` section of the main placements JSON.
+    ///
+    /// Emitted as **compact JSON** (no pretty-printing): for Montana, ~57k
+    /// candidates → 6-8 MB, vs. 40+ MB pretty. Still JSON-parseable.
+    ///
+    /// Global dedupe at 1 cm: a real placement appears ~40-60× across
+    /// segments for LOD/render-set variants. Keeping one per 1-cm position
+    /// bucket preserves unique placements while cutting noise ~2×.
+    #[cfg(feature = "json")]
+    pub fn write_skel_ext_candidates_json(&self, path: &Path) -> Result<(), Report> {
+        use serde_json::json;
+
+        if self.skel_ext_files.is_empty() {
+            // Still write an empty manifest so callers see the file exists.
+            let manifest = json!({
+                "schema_version": 1,
+                "ship": {
+                    "model_dir": self.info.model_dir,
+                    "display_name": self.info.display_name,
+                },
+                "stats": { "file_count": 0, "candidate_count": 0 },
+                "candidates": [],
+            });
+            let file = std::fs::File::create(path)
+                .context_with(|| format!("Failed to create skel_ext candidates at {}", path.display()))?;
+            serde_json::to_writer(std::io::BufWriter::new(file), &manifest)
+                .map_err(|e| rootcause::report!("Failed to serialize skel_ext candidates: {e}"))?;
+            return Ok(());
+        }
+
+        // Collect all placements across all segment files.
+        let mut global_placements: Vec<(String, crate::models::skel_ext::SkelExtPlacement)> =
+            Vec::new();
+        for skel_file in &self.skel_ext_files {
+            let placements = match crate::models::skel_ext::parse_skel_ext(&skel_file.bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not parse skel_ext '{}' (segment {}): {}",
+                        skel_file.vfs_path, skel_file.segment, e
+                    );
+                    continue;
+                }
+            };
+            for pl in placements {
+                global_placements.push((skel_file.segment.clone(), pl));
+            }
+        }
+
+        // Dedupe globally at 1 cm on native-coord position.
+        let mut seen_positions: HashSet<(i64, i64, i64)> = HashSet::new();
+        let mut candidates: Vec<serde_json::Value> = Vec::new();
+        for (segment, pl) in &global_placements {
+            let p = pl.position();
+            let key = (
+                (p[0] * 100.0).round() as i64,
+                (p[1] * 100.0).round() as i64,
+                (p[2] * 100.0).round() as i64,
+            );
+            if !seen_positions.insert(key) {
+                continue;
+            }
+            let metric = crate::models::skel_ext::to_metric_glft(pl.matrix);
+            let position = [metric[12], metric[13], metric[14]];
+            candidates.push(json!({
+                "segment":       segment,
+                "record_offset": format!("0x{:X}", pl.record_offset),
+                "record_type":   pl.record_type,
+                "record_count":  pl.record_count,
+                "matrix_index":  pl.matrix_index,
+                "p0_hash":       format!("0x{:08X}", pl.p0_hash),
+                "p1_hash":       format!("0x{:08X}", pl.p1_hash),
+                "transform": {
+                    "matrix":    metric.as_slice(),
+                    "position":  position.as_slice(),
+                },
+            }));
+        }
+
+        let now = format_rfc3339_utc(SystemTime::now());
+        let toolkit_version = env!("CARGO_PKG_VERSION");
+
+        let manifest = json!({
+            "schema_version": 1,
+            "ship": {
+                "model_dir":    self.info.model_dir,
+                "display_name": self.info.display_name,
+                "nation":       self.info.nation,
+                "species":      self.info.species,
+                "tier":         self.info.tier,
+            },
+            "pipeline": {
+                "toolkit_version": toolkit_version,
+                "generated_at":    now,
+            },
+            "stats": {
+                "file_count":         self.skel_ext_files.len(),
+                "raw_matrix_count":   global_placements.len(),
+                "candidate_count":    candidates.len(),
+                "position_tolerance_cm": 1,
+                "segments": self.skel_ext_files.iter().map(|f| f.segment.as_str()).collect::<Vec<_>>(),
+            },
+            "candidates": candidates,
+        });
+
+        let file = std::fs::File::create(path)
+            .context_with(|| format!("Failed to create skel_ext candidates at {}", path.display()))?;
+        // Compact serialization — no pretty-print — to keep file size manageable
+        // for ships with ~50k candidates.
+        serde_json::to_writer(std::io::BufWriter::new(file), &manifest)
+            .map_err(|e| rootcause::report!("Failed to serialize skel_ext candidates: {e}"))?;
         Ok(())
     }
 
@@ -1480,7 +1690,21 @@ impl ShipModelContext {
         }
 
         // Load textures.
-        let texture_set = if self.options.textures {
+        //
+        // Two trigger conditions:
+        //   - `options.textures`       — textures are wanted in the GLB itself
+        //     (either embedded in BIN chunk, or externalized as PNG URIs if
+        //      `textures_dir` is set).
+        //   - `options.raw_dds_dir`    — raw WG DDS files (every mip) are
+        //     dumped as a side effect of `build_texture_set` for Unity
+        //     streaming. Does NOT require `options.textures`.
+        //
+        // When only `raw_dds_dir` is set (common for Unity-authoritative
+        // pipelines that want DDS-only), we still run the full texture
+        // pipeline to populate the dumper, then discard the TextureSet so
+        // no textures land in the GLB.
+        let load_textures = self.options.textures || self.options.raw_dds_dir.is_some();
+        let texture_set = if load_textures {
             let mut all_mfm_infos = Vec::new();
             for sub in &sub_models {
                 all_mfm_infos.extend(collect_mfm_info(sub.visual, &db));
@@ -1571,6 +1795,15 @@ impl ShipModelContext {
             TextureSet::empty()
         };
 
+        // DDS dump is a side effect of `build_texture_set`. If the caller
+        // only asked for DDS (not glTF-embedded textures), discard the
+        // loaded TextureSet so nothing lands in the GLB.
+        let texture_set = if self.options.textures {
+            texture_set
+        } else {
+            TextureSet::empty()
+        };
+
         // Collect armor meshes from hull AND turret geometries with thickness data.
         let armor_map = self.armor_map.as_ref();
         let mut armor_meshes: Vec<gltf_export::ArmorSubModel> = Vec::new();
@@ -1644,6 +1877,20 @@ struct OwnedSubModel {
     geom_bytes: Vec<u8>,
     /// Raw `.splash` file bytes (only present for base hull models).
     splash_bytes: Option<Vec<u8>>,
+}
+
+/// One `.skel_ext` file owned by a ship (8 per ship: 4 base + 4 `_ep`).
+///
+/// Contains decorative-placement data that's referenced at runtime via
+/// `ModelPrototype.skel_ext_res_ids`. The file itself is a standalone VFS
+/// asset — see [`crate::models::skel_ext`] for the format.
+struct OwnedSkelExt {
+    /// Segment stem (e.g. "Bow", "Bow_ep", "MidFront", "MidFront_ep", ...).
+    segment: String,
+    /// Full VFS path the bytes came from (for diagnostics).
+    vfs_path: String,
+    /// Raw bytes of the file.
+    bytes: Vec<u8>,
 }
 
 /// Result of [`ShipAssets::load_mounts`].
