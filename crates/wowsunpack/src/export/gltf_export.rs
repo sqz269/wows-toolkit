@@ -281,6 +281,11 @@ pub struct MapModelInstance {
     pub mesh_range: std::ops::Range<usize>,
     /// Column-major 4×4 world transform (right-handed, Z negated).
     pub transform: [f32; 16],
+    /// Resolved prototype asset name (basename of the `.visual` file looked up
+    /// via the prototype's `visual_resource_id` in `assets.bin`). `None` for
+    /// map-local prototypes (vri == 0 or unresolvable). When set, downstream
+    /// GLB export uses it as the node name instead of the generic `Instance_N`.
+    pub asset_name: Option<String>,
 }
 
 /// Complete decoded map scene, format-agnostic.
@@ -377,6 +382,44 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
     // Build path_id → model index map for instance lookups.
     let path_to_model: HashMap<u64, usize> = merged.models.iter().enumerate().map(|(i, r)| (r.path_id, i)).collect();
 
+    // Resolve the asset name for each prototype once. The minority of records
+    // with `visual_resource_id != 0` reference shared content in `assets.bin`;
+    // we look up the path by selfId and extract the basename (e.g.
+    // `OBC008_BuildingPrototype` from
+    // `content/ports/building/city/OBC008/OBC008.visual`). Map-local
+    // prototypes (vri == 0 or unresolvable) get `None` and the GLB exporter
+    // falls back to `Instance_N` for those.
+    let asset_names: Vec<Option<String>> = merged
+        .models
+        .iter()
+        .map(|record| -> Option<String> {
+            let vri = record.model_proto.visual_resource_id;
+            if vri == 0 {
+                return None;
+            }
+            let idx = self_id_index.as_ref()?;
+            let db = db?;
+            let entry_idx = *idx.get(&vri)?;
+            let path = db.reconstruct_path(entry_idx, idx);
+            if path.is_empty() {
+                return None;
+            }
+            let basename = path.rsplit('/').next().unwrap_or(&path);
+            let stem = basename
+                .strip_suffix(".visual")
+                .or_else(|| basename.strip_suffix(".geometry"))
+                .or_else(|| basename.strip_suffix(".model"))
+                .unwrap_or(basename);
+            if stem.is_empty() { None } else { Some(stem.to_string()) }
+        })
+        .collect();
+    let resolved_count = asset_names.iter().filter(|n| n.is_some()).count();
+    println!(
+        "  Resolved names for {}/{} prototypes (rest are map-local with vri=0)",
+        resolved_count,
+        merged.models.len(),
+    );
+
     // Decode model meshes: one set of MapMesh entries per model prototype.
     // model_mesh_ranges[i] = range in model_meshes for model index i.
     let mut model_meshes: Vec<MapMesh> = Vec::new();
@@ -455,7 +498,11 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                 continue;
             }
 
-            model_instances.push(MapModelInstance { mesh_range: range.clone(), transform: inst.transform.0 });
+            model_instances.push(MapModelInstance {
+                mesh_range: range.clone(),
+                transform: inst.transform.0,
+                asset_name: asset_names[model_idx].clone(),
+            });
         }
     } else {
         // No space.bin: place each model at origin.
@@ -463,10 +510,10 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
             if range.is_empty() {
                 continue;
             }
-            let _ = model_idx;
             model_instances.push(MapModelInstance {
                 mesh_range: range.clone(),
                 transform: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                asset_name: asset_names[model_idx].clone(),
             });
         }
     }
@@ -893,10 +940,16 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
 
         // If the model has a single mesh, create one node with the transform.
         // If multiple, create a parent node with children.
+        // Naming: include the resolved prototype asset name when known; falls
+        // back to the generic Instance_N for map-local prototypes.
+        let inst_label = match &inst.asset_name {
+            Some(stem) => format!("{stem}_{i}"),
+            None => format!("Instance_{i}"),
+        };
         if instance_meshes.len() == 1 {
             let node = root.push(json::Node {
                 mesh: Some(instance_meshes[0]),
-                name: Some(format!("Instance_{i}")),
+                name: Some(inst_label),
                 matrix: Some(inst.transform),
                 ..Default::default()
             });
@@ -908,14 +961,14 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
                 .map(|(j, &mesh)| {
                     root.push(json::Node {
                         mesh: Some(mesh),
-                        name: Some(format!("Instance_{i}_part_{j}")),
+                        name: Some(format!("{inst_label}_part_{j}")),
                         ..Default::default()
                     })
                 })
                 .collect();
             let parent = root.push(json::Node {
                 children: Some(children),
-                name: Some(format!("Instance_{i}")),
+                name: Some(inst_label),
                 matrix: Some(inst.transform),
                 ..Default::default()
             });
@@ -1297,6 +1350,7 @@ pub fn export_merged_models_glb(
 
     // Build path_id → model index map for instance lookups.
     let path_to_model: HashMap<u64, usize> = merged.models.iter().enumerate().map(|(i, r)| (r.path_id, i)).collect();
+
 
     // Build one mesh per prototype, lazily (only when referenced by an instance).
     // Cache: model_index → glTF Mesh index.
