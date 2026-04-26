@@ -2756,13 +2756,44 @@ fn write_armor_materials_json(
     // thickness), max_thickness_mm, plate_count. ---
     let mut zones_out = serde_json::Map::new();
     for (zone, acc) in &zones {
-        // "default" thickness = thickness of the material with the most
-        // triangles in this zone. More representative than mean for damage
-        // zones where a thin outer plate wraps around a thick citadel.
-        let default_mat = acc.mat_counts.iter().max_by_key(|&(_, c)| *c).map(|(m, _)| *m);
-        let default_thickness_mm = default_mat
-            .and_then(|m| armor_map.and_then(|amap| amap.get(&m)))
-            .map(|layers| layers.values().sum::<f32>())
+        // "default" thickness = the thickness most common across the zone's
+        // triangles, with each triangle voting once for its material's total
+        // thickness. Several materials may share the same total thickness
+        // (e.g. Yamato's SteeringGear uses three different mats that all
+        // total 640 mm); their triangle counts add together so the dominant
+        // thickness wins regardless of how WG split the material slots.
+        //
+        // Tiebreak: when two thicknesses have the same triangle count, pick
+        // the heavier. The "default" value is most useful as a conservative
+        // damage-calc default — biasing toward heavier armor on a tie
+        // matches that intent and makes the result deterministic regardless
+        // of HashMap iteration order. (Pre-fix this site picked the
+        // most-triangle MATERIAL via `acc.mat_counts.iter().max_by_key(c)`,
+        // which depends on `HashMap` iteration order on ties — non-
+        // deterministic across runs of the same input.)
+        //
+        // Quantise thickness to micrometres for the map key so float equality
+        // is well-defined; thickness is always positive finite mm so this is
+        // safe and round-trip exact for the values we ever see.
+        let mut by_thickness: std::collections::HashMap<u32, (f32, usize)> =
+            std::collections::HashMap::new();
+        for (&mat_id, &count) in &acc.mat_counts {
+            let total = armor_map
+                .and_then(|m| m.get(&mat_id))
+                .map(|layers| layers.values().sum::<f32>())
+                .unwrap_or(0.0);
+            let key = (total * 1000.0).round() as u32;
+            let entry = by_thickness.entry(key).or_insert((total, 0));
+            entry.1 += count;
+        }
+        let default_thickness_mm = by_thickness
+            .values()
+            .max_by(|a, b| {
+                a.1.cmp(&b.1).then_with(|| {
+                    a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                })
+            })
+            .map(|(t, _)| *t)
             .unwrap_or(0.0);
 
         zones_out.insert(
