@@ -30,7 +30,6 @@ use crate::data::parser_utils::parse_u32_array;
 use crate::data::parser_utils::resolve_relptr;
 use crate::data::parser_utils::resolve_relptr_at;
 use crate::models::model::ModelPrototype;
-use crate::models::model::parse_model;
 use crate::models::visual::Lod;
 use crate::models::visual::RenderSet;
 use crate::models::visual::VisualNodes;
@@ -315,10 +314,23 @@ fn parse_model_record(data: &[u8], rec: usize) -> Result<MergedModelRecord, Repo
         .parse_next(input)
         .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("path_id: {e}"))))?;
 
-    // ModelProto at rec+0x08 (0x28 bytes)
+    // ModelProto inlined at rec+0x08 (0x28 bytes, same shape as assets.bin blob 3
+    // for the header — but the OOL arrays it points to use a DIFFERENT
+    // representation. In assets.bin, animations[] is a packed array of full
+    // ModelPrototype records (0x28 each, recursively). In models.bin's
+    // inlined form, animations[] is a packed array of u64 selfIds (8 bytes
+    // each) referencing animation entries elsewhere. Calling the regular
+    // `parse_model` here recurses through what it thinks are nested
+    // ModelPrototypes and reads garbage as skel_ext_count, blowing up
+    // (e.g. Dock model[14], 14_Atlantic model[81], any record with
+    // animations_count > 0).
+    //
+    // Workaround: parse the 0x28-byte header inline and leave skel_ext /
+    // animations / dyes empty. None of those fields are consumed downstream
+    // when rendering a map (only path_id, visual_proto, skeleton_proto_index,
+    // and the geometry mapping range matter), so dropping them is safe.
     let model_proto_base = rec + 0x08;
-    let model_proto = parse_model(&data[model_proto_base..])
-        .map_err(|e| MergedModelsError::ParseError(format!("ModelProto at 0x{model_proto_base:X}: {e}")))?;
+    let model_proto = parse_inline_model_proto_header(data, model_proto_base)?;
 
     // VisualProto at rec+0x30 (0x70 bytes)
     let vp_base = rec + 0x30;
@@ -343,6 +355,47 @@ fn parse_model_record(data: &[u8], rec: usize) -> Result<MergedModelRecord, Repo
         skeleton_proto_index,
         render_set_geometry_start_idx,
         render_set_geometry_count,
+    })
+}
+
+// Read the 0x28-byte inline ModelPrototype header without recursing into the
+// OOL arrays. See parse_model_record's call-site comment for why the regular
+// `parse_model` is unsafe here: animations in inline form are u64 selfIds,
+// not nested ModelPrototype records, so the recursive parser misinterprets
+// them. Map-rendering downstream doesn't read these fields, so leaving them
+// empty is safe.
+fn parse_inline_model_proto_header(
+    data: &[u8],
+    base: usize,
+) -> Result<ModelPrototype, Report<MergedModelsError>> {
+    const INLINE_MODEL_PROTO_SIZE: usize = 0x28;
+    if base + INLINE_MODEL_PROTO_SIZE > data.len() {
+        return Err(Report::new(MergedModelsError::DataTooShort {
+            offset: base,
+            need: INLINE_MODEL_PROTO_SIZE,
+            have: data.len(),
+        }));
+    }
+    let input = &mut &data[base..];
+    let visual_resource_id = le_u64.parse_next(input).map_err(|e: ErrMode<ContextError>| {
+        Report::new(MergedModelsError::ParseError(format!("inline_mp visual_resource_id: {e}")))
+    })?;
+    let _skel_ext_count = le_u8.parse_next(input).map_err(|e: ErrMode<ContextError>| {
+        Report::new(MergedModelsError::ParseError(format!("inline_mp skel_ext_count: {e}")))
+    })?;
+    let misc_type = le_u8.parse_next(input).map_err(|e: ErrMode<ContextError>| {
+        Report::new(MergedModelsError::ParseError(format!("inline_mp misc_type: {e}")))
+    })?;
+    // animations_count, dyes_count, padding(4), 3× i64 relptrs — read & discard
+    let _ = take(2usize + 4 + 24).parse_next(input).map_err(|e: ErrMode<ContextError>| {
+        Report::new(MergedModelsError::ParseError(format!("inline_mp tail: {e}")))
+    })?;
+    Ok(ModelPrototype {
+        visual_resource_id,
+        misc_type,
+        skel_ext_res_ids: Vec::new(),
+        animations: Vec::new(),
+        dyes: Vec::new(),
     })
 }
 
