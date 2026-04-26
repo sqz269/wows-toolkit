@@ -28,10 +28,17 @@ pub const COMP_RADARS: &str = "radars";
 pub const COMP_TORPEDOES: &str = "torpedoes";
 
 /// Typed representation of component type keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `Ord` derives in declaration order (Hull → Artillery → Atba → AirDefense →
+/// Directors → Finders → Radars → Torpedoes) so any `BTreeMap`
+/// keyed by `ComponentType` iterates ships' mount families in a
+/// fixed, semantically-grouped sequence — which gives placements-JSON
+/// emission a stable order across runs regardless of `HashMap`
+/// `RandomState`. See `mounts_by_type` in `types.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
-#[cfg_attr(feature = "rkyv", rkyv(derive(Hash, PartialEq, Eq)))]
+#[cfg_attr(feature = "rkyv", rkyv(derive(Hash, PartialEq, Eq, PartialOrd, Ord)))]
 pub enum ComponentType {
     #[cfg_attr(feature = "serde", serde(rename = "hull"))]
     Hull,

@@ -1096,8 +1096,13 @@ pub struct HullUpgradeConfig {
     #[cfg_attr(feature = "serde", serde(default))]
     pub dock_y_offset: Option<f32>,
     /// Mount points grouped by component type key (default selection).
+    /// Stored as `BTreeMap` (was `HashMap`) so iteration order is stable
+    /// across runs — `write_placements_json`'s outer loop iterates this
+    /// indirectly via `all_mount_points()`, and any HashMap iteration here
+    /// surfaced in the placements JSON as randomly-reordered `accessories[]`
+    /// entries.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub mounts_by_type: HashMap<super::keys::ComponentType, ComponentMounts>,
+    pub mounts_by_type: std::collections::BTreeMap<super::keys::ComponentType, ComponentMounts>,
     /// All component name alternatives per type key
     /// (e.g. "artillery" -> ["AB1_Artillery", "AB2_Artillery"]).
     /// Only populated for types that have more than one option.
