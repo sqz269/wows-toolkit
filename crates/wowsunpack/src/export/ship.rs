@@ -1420,13 +1420,29 @@ impl ShipModelContext {
             // Expected shape: content/gameplay/<scope>/<category>[/<subcategory>...]/<Asset>/<Asset>.model
             let (scope, category, subcategory) = parse_mount_path_taxonomy(&mount.model_path);
 
-            // Build the world-space transform. `mount.armor_transform` is the
-            // raw hardpoint transform (no yaw correction), exactly what the
-            // sidecar wants — a per-placement frame that downstream prefabs can
-            // orient around. The GLB export uses the same helper, so placements
-            // and mesh transforms land in the same metric space.
-            let raw = mount.armor_transform.unwrap_or(IDENTITY_4X4);
-            let matrix = super::gltf_export::negate_z_and_scale_to_metres(raw);
+            // Build the world-space transform.
+            //
+            // Use `mount.transform` (the yaw-corrected variant — see the
+            // bone-correction site at line ~1006), NOT `mount.armor_transform`
+            // (the raw hardpoint). Downstream consumers instantiate the
+            // accessory library GLB (visual mesh) at this placement, and the
+            // visual mesh is stored in asset-local frame — so it needs the
+            // `inverse(Rotate_Y_BlendBone)` correction applied to the
+            // placement matrix. Armor meshes use `armor_transform` because
+            // they're stored in hardpoint frame already (see comment at
+            // line ~1003), but accessory placements are not armor.
+            //
+            // For ~half the WoWS fleet's gun assets the bone is a Z-mirror
+            // (`diag(1,1,-1)`), so `mount.transform` carries a det=-1
+            // (improper) rotation. `ensure_proper_rotation` converts that to
+            // a proper `Ry(180°)` — visually identical for the bilaterally
+            // symmetric turrets where this comes up, and produces a clean
+            // PRS decomposition for consumers (no negative scale, no face-
+            // winding flip needed). See `tools/reference/forward_axis_flip_audit.md`
+            // for the full investigation.
+            let raw = mount.transform.unwrap_or(IDENTITY_4X4);
+            let proper = ensure_proper_rotation(raw);
+            let matrix = super::gltf_export::negate_z_and_scale_to_metres(proper);
             let position = [matrix[12], matrix[13], matrix[14]];
 
             let species_str: Option<&'static str> = mount.species.map(|s| match s {
@@ -2223,6 +2239,39 @@ fn mat4_rotation_inverse(m: &[f32; 16]) -> [f32; 16] {
         m[2], m[6], m[10], 0.0, // col 2 = original row 2
         0.0, 0.0, 0.0, 1.0, // no translation
     ]
+}
+
+/// Determinant of the upper-left 3x3 of a column-major 4x4. Used to detect
+/// improper rotations (reflections) that arise when a turret's
+/// `Rotate_Y_BlendBone` rest pose is a Z-mirror — common in WoWS main-battery
+/// + twin-secondary assets. Such bones produce a `mount.transform` with
+/// `det == -1`, which is geometrically correct but inconvenient for
+/// consumers (decomposition into PRS yields a negative scale axis, which
+/// flips face winding under default culling).
+fn mat3_determinant(m: &[f32; 16]) -> f32 {
+    m[0] * (m[5] * m[10] - m[6] * m[9])
+        - m[4] * (m[1] * m[10] - m[2] * m[9])
+        + m[8] * (m[1] * m[6] - m[2] * m[5])
+}
+
+/// Convert an improper rotation (`det < 0`) to a proper rotation by
+/// negating column 0 of the 3x3 part. For the WoWS-specific case where
+/// the impropriety comes from a Z-mirror baked into `Rotate_Y_BlendBone`
+/// (col 2's Z component being negative), this yields `Ry(180°)` —
+/// visually identical to the original Z-mirror for any bilaterally
+/// symmetric asset. Every gun mount in the WoWS fleet is bilaterally
+/// symmetric, so the substitution is safe.
+///
+/// Translation column is preserved verbatim. No-op for proper rotations.
+fn ensure_proper_rotation(m: [f32; 16]) -> [f32; 16] {
+    if mat3_determinant(&m) >= 0.0 {
+        return m;
+    }
+    let mut out = m;
+    out[0] = -out[0];
+    out[1] = -out[1];
+    out[2] = -out[2];
+    out
 }
 
 /// Identity 4x4 column-major matrix — translation (0,0,0), no rotation.
