@@ -1027,6 +1027,7 @@ impl ShipAssets {
                 species: mi.species(),
                 barrel_pitch,
                 model_path: mi.model_path().to_string(),
+                ammo_list: mi.ammo_list().to_vec(),
             });
         }
 
@@ -1457,7 +1458,12 @@ impl ShipModelContext {
                 MountSpecies::Decoration => "Decoration",
             });
 
-            let entry = json!({
+            // `ammo_ids` is the per-mount link into the per-ship ballistics
+            // file (see `wowsunpack ammo`). Emitted only when non-empty so
+            // accessory entries stay schema-minimal. Order is preserved
+            // from GameParams so consumers can map index → ammo type
+            // (e.g. ammo_ids[0] == AP, ammo_ids[1] == HE for many BBs).
+            let mut entry = json!({
                 "instance_id": instance_id,
                 "asset_id":    asset_id,
                 "hp_name":     mount.hp_name,
@@ -1470,6 +1476,11 @@ impl ShipModelContext {
                     "position": position.as_slice(),
                 },
             });
+            if !mount.ammo_list.is_empty()
+                && let Some(obj) = entry.as_object_mut()
+            {
+                obj.insert("ammo_ids".to_string(), json!(mount.ammo_list));
+            }
 
             match mount.species {
                 Some(MountSpecies::Main) => turrets.push(entry),
@@ -1932,6 +1943,12 @@ struct ResolvedMount {
     /// Preserved from the `MountPoint` so downstream placement-manifest emission
     /// can derive scope/category/subcategory/asset_id without a second lookup.
     model_path: String,
+    /// `Projectile` GameParam names this mount can fire, in declared order.
+    /// Empty for non-firing mounts (directors, finders, radars, etc.).
+    /// Surfaces in the placements JSON as `ammo_ids: [...]` per turret /
+    /// secondary / antiair / torpedo entry; downstream consumers resolve each
+    /// against the per-ship ballistics file produced by `wowsunpack ammo`.
+    ammo_list: Vec<String>,
 }
 
 /// Pre-resolved material-based camouflage scheme (owned data, no lifetimes).

@@ -452,6 +452,52 @@ enum Commands {
         #[arg(long)]
         json: Option<PathBuf>,
     },
+    /// Dump per-ship ballistic profiles (one entry per loadable shell /
+    /// torpedo) plus aggregate ranges. Walks every hull upgrade's mounts +
+    /// alternative loadouts, unions the `ammoList` references, and resolves
+    /// each to its `Projectile` GameParam — emitting muzzle velocity, mass,
+    /// air-drag coefficient, Krupp, fuze threshold/delay, ricochet angles,
+    /// alpha damage, HE/SAP penetration, fire chance, and torpedo max range.
+    ///
+    /// Output JSON shape:
+    /// ```text
+    /// {
+    ///   "schema_version": 1,
+    ///   "ship":     { model_dir, display_name, param_index, nation,
+    ///                 species, tier },
+    ///   "pipeline": { toolkit_version },
+    ///   "ranges":   { main_battery_m, secondary_battery_m, torpedo_max_m },
+    ///   "shells":   { "<ammo_id>": {
+    ///       ammo_type, caliber_mm, mass_kg, muzzle_velocity_mps,
+    ///       air_drag_coefficient, krupp, cap, cap_normalize_max_deg,
+    ///       fuze_arming_threshold_mm, fuze_delay_s,
+    ///       ricochet_min_deg, ricochet_always_deg,
+    ///       alpha_damage, alpha_piercing_he_mm, alpha_piercing_cs_mm,
+    ///       burn_probability, max_range_m
+    ///   }, ... }
+    /// }
+    /// ```
+    ///
+    /// Consumed by the Unity sidecar builder to populate `ballistics.shells`.
+    /// The per-shot trajectory simulator uses this with the ISA atmospheric
+    /// model from `docs/BALLISTICS.md`.
+    Ammo {
+        /// Ship name — either a model directory name (e.g. "JSB039_Yamato_1945")
+        /// or a translated display name (e.g. "Yamato") for fuzzy lookup
+        name: String,
+
+        /// Hull upgrade to use for `ranges` calculation (e.g. "A" for stock,
+        /// "B" for upgraded). Shells are always the union across all hulls
+        /// — the same shell on hull A and hull B is one entry — but the
+        /// detection / battery ranges in `ranges` are per-hull.
+        #[arg(long)]
+        hull: Option<String>,
+
+        /// Write the per-ship ballistics manifest to this path. Without
+        /// `--json`, prints a human-readable summary to stdout.
+        #[arg(long)]
+        json: Option<PathBuf>,
+    },
     /// Parse and inspect an assets.bin (PrototypeDatabase) file
     AssetsBin {
         /// Path to the assets.bin file (VFS path by default, disk path with --no-vfs)
@@ -1223,6 +1269,13 @@ fn run() -> Result<(), Report> {
             };
 
             run_armor(vfs, &name, &game_dir, game_version, hull.as_deref(), json.as_deref())?;
+        }
+        Commands::Ammo { name, hull, json } => {
+            let Some(vfs) = &vfs else {
+                bail!("VFS required for ammo inspection. Use --game-dir to specify a game install.");
+            };
+
+            run_ammo(vfs, &name, &game_dir, game_version, hull.as_deref(), json.as_deref())?;
         }
         Commands::DumpUvs { name, hull } => {
             let Some(vfs) = &vfs else {
@@ -2826,6 +2879,233 @@ fn write_armor_materials_json(
     serde_json::to_writer_pretty(&mut writer, &manifest)
         .map_err(|e| rootcause::report!("Failed to serialize armor JSON: {e}"))?;
     writer.write_all(b"\n").ok();
+    Ok(())
+}
+
+/// `wowsunpack ammo` — emit per-ship ballistic profiles (one entry per
+/// loadable shell / torpedo) plus aggregate ranges. See the `Commands::Ammo`
+/// docstring for the JSON shape.
+///
+/// Implementation: walks the `Vehicle.config_data.hull_upgrades` map; for each
+/// hull config, unions every mount's `ammo_list` (across `mounts_by_type` and
+/// `alternative_mounts`); also folds in the ship-level
+/// `main_battery_ammo` / `torpedo_ammo` aggregates that the GameParams
+/// provider already collects across `_Hull` and `_Artillery` upgrades.
+fn run_ammo(
+    vfs: &VfsPath,
+    name: &str,
+    game_dir: &Path,
+    game_version: Option<u64>,
+    hull_selection: Option<&str>,
+    json_path: Option<&Path>,
+) -> Result<(), Report> {
+    use std::collections::BTreeSet;
+    use wowsunpack::export::ship::ShipAssets;
+    use wowsunpack::game_params::types::GameParamProvider;
+    use wowsunpack::game_params::types::Vehicle;
+
+    let assets = ShipAssets::load(vfs)?;
+
+    if let Some(version) = game_version {
+        let mo_path = wowsunpack::game_data::translations_path(game_dir, version as u32);
+        if let Ok(data) = std::fs::read(&mo_path)
+            && let Ok(catalog) = gettext::Catalog::parse(&*data)
+        {
+            assets.set_translations(catalog);
+        }
+    }
+
+    let info = assets.find_ship(name)?;
+    let metadata = assets.metadata();
+
+    // Locate the Vehicle by model_dir (matches what `load_ship` does internally,
+    // but skips the hull-GLB load — we only need GameParams data).
+    let vehicle: &Vehicle = metadata
+        .params()
+        .iter()
+        .find_map(|p| {
+            p.vehicle().filter(|v| {
+                v.model_path().map(|mp| mp.contains(&info.model_dir)).unwrap_or(false)
+            })
+        })
+        .ok_or_else(|| rootcause::report!("No Vehicle found for ship '{}'.", info.model_dir))?;
+
+    let config_data = vehicle.config_data().ok_or_else(|| {
+        rootcause::report!(
+            "Ship '{}' has no parsed ShipConfigData (no _Hull upgrades?). Cannot emit ballistics.",
+            info.model_dir
+        )
+    })?;
+
+    // --- Collect every distinct ammo ID this ship can ever fire. ---
+    //
+    // BTreeSet: deterministic JSON output regardless of HashMap order.
+    let mut ammo_ids: BTreeSet<String> = BTreeSet::new();
+    for n in &config_data.main_battery_ammo {
+        ammo_ids.insert(n.clone());
+    }
+    for n in &config_data.torpedo_ammo {
+        ammo_ids.insert(n.clone());
+    }
+    for hull_config in config_data.hull_upgrades.values() {
+        for mp in hull_config.all_mount_points() {
+            for ammo in mp.ammo_list() {
+                ammo_ids.insert(ammo.clone());
+            }
+        }
+        for cm in hull_config.alternative_mounts.values() {
+            for mp in cm.mounts() {
+                for ammo in mp.ammo_list() {
+                    ammo_ids.insert(ammo.clone());
+                }
+            }
+        }
+    }
+
+    // --- Resolve each ammo ID → Projectile and build the shell entry. ---
+    let mut shells = serde_json::Map::new();
+    let mut torpedo_max_m: Option<f32> = None;
+
+    for ammo_id in &ammo_ids {
+        let Some(param) = metadata.game_param_by_name(ammo_id) else {
+            eprintln!("Warning: ammo '{ammo_id}' not found in GameParams; skipping.");
+            continue;
+        };
+        let Some(proj) = param.projectile() else {
+            eprintln!("Warning: '{ammo_id}' is not a Projectile; skipping.");
+            continue;
+        };
+
+        let caliber_mm = proj.bullet_diametr().map(|d| d * 1000.0);
+        let max_range_m = proj.max_dist().map(|d| d.to_meters().value());
+
+        // Track torpedo max range across all torp ammos for the ranges section.
+        if proj.ammo_type().eq_ignore_ascii_case("Torpedo")
+            && let Some(m) = max_range_m
+        {
+            torpedo_max_m = Some(torpedo_max_m.map_or(m, |prev| prev.max(m)));
+        }
+
+        let entry = serde_json::json!({
+            "ammo_type":                proj.ammo_type(),
+            "caliber_mm":               caliber_mm,
+            "mass_kg":                  proj.bullet_mass(),
+            "muzzle_velocity_mps":      proj.bullet_speed(),
+            "air_drag_coefficient":     proj.bullet_air_drag(),
+            "krupp":                    proj.bullet_krupp(),
+            "cap":                      proj.bullet_cap(),
+            "cap_normalize_max_deg":    proj.bullet_cap_normalize_max_angle(),
+            "fuze_arming_threshold_mm": proj.bullet_detonator_threshold(),
+            "fuze_delay_s":             proj.bullet_detonator(),
+            "ricochet_min_deg":         proj.bullet_ricochet_at(),
+            "ricochet_always_deg":      proj.bullet_always_ricochet_at(),
+            "alpha_damage":             proj.alpha_damage(),
+            "alpha_piercing_he_mm":     proj.alpha_piercing_he(),
+            "alpha_piercing_cs_mm":     proj.alpha_piercing_cs(),
+            "burn_probability":         proj.burn_prob(),
+            "max_range_m":              max_range_m,
+        });
+        shells.insert(ammo_id.clone(), entry);
+    }
+
+    // --- Per-hull ranges: pick the named hull upgrade or fall back to the first. ---
+    //
+    // Substring match on the upgrade name to mirror `select_hull_mount_points`'s
+    // tolerance (so `--hull B` finds `PJUH911_Yamato_1944` etc.).
+    let hull_config = if let Some(sel) = hull_selection {
+        let needle = sel.to_lowercase();
+        config_data
+            .hull_upgrades
+            .iter()
+            .find(|(k, _)| k.to_lowercase().contains(&needle))
+            .map(|(_, v)| v)
+            .or_else(|| config_data.hull_upgrades.values().next())
+    } else {
+        // Pick the first by sorted name for determinism (matches
+        // `select_hull_mount_points`'s sort).
+        let mut sorted: Vec<_> = config_data.hull_upgrades.iter().collect();
+        sorted.sort_by_key(|(k, _)| (*k).clone());
+        sorted.first().map(|(_, v)| *v)
+    };
+    let main_battery_m = config_data.main_battery_m.map(|m| m.value());
+    let secondary_battery_m = config_data.secondary_battery_m.map(|m| m.value());
+    let detection_km = hull_config.map(|hc| hc.detection_km.value());
+    let air_detection_km = hull_config.map(|hc| hc.air_detection_km.value());
+
+    let toolkit_version = env!("CARGO_PKG_VERSION");
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "ship": {
+            "model_dir":    info.model_dir,
+            "display_name": info.display_name,
+            "param_index":  info.param_index,
+            "nation":       info.nation,
+            "species":      info.species,
+            "tier":         info.tier,
+        },
+        "pipeline": {
+            "toolkit_version": toolkit_version,
+        },
+        "ranges": {
+            "main_battery_m":      main_battery_m,
+            "secondary_battery_m": secondary_battery_m,
+            "torpedo_max_m":       torpedo_max_m,
+            "detection_km":        detection_km,
+            "air_detection_km":    air_detection_km,
+        },
+        "shells": shells,
+    });
+
+    // Stdout summary regardless of --json (matches `armor` UX).
+    println!(
+        "Ship: {} ({})",
+        info.display_name.as_deref().unwrap_or("?"),
+        info.model_dir
+    );
+    println!("Shells: {}", manifest["shells"].as_object().map(|m| m.len()).unwrap_or(0));
+    if let Some(m) = main_battery_m {
+        println!("  Main battery range: {:.0} m", m);
+    }
+    if let Some(m) = secondary_battery_m {
+        println!("  Secondary battery range: {:.0} m", m);
+    }
+    if let Some(m) = torpedo_max_m {
+        println!("  Torpedo max range: {:.0} m", m);
+    }
+    if let Some(km) = detection_km {
+        println!("  Sea detection: {:.2} km", km);
+    }
+    for (ammo_id, entry) in manifest["shells"].as_object().unwrap_or(&serde_json::Map::new()) {
+        let ammo_type = entry.get("ammo_type").and_then(|v| v.as_str()).unwrap_or("?");
+        let caliber = entry
+            .get("caliber_mm")
+            .and_then(|v| v.as_f64())
+            .map(|c| format!("{:.0}mm", c))
+            .unwrap_or_else(|| "?".to_string());
+        let mass = entry
+            .get("mass_kg")
+            .and_then(|v| v.as_f64())
+            .map(|m| format!("{:.1}kg", m))
+            .unwrap_or_else(|| "?".to_string());
+        let speed = entry
+            .get("muzzle_velocity_mps")
+            .and_then(|v| v.as_f64())
+            .map(|s| format!("{:.0}m/s", s))
+            .unwrap_or_else(|| "?".to_string());
+        println!("  {ammo_id:30} {ammo_type:8} {caliber:8} {mass:10} {speed}");
+    }
+
+    if let Some(path) = json_path {
+        let file = std::fs::File::create(path)
+            .context_with(|| format!("Failed to create {}", path.display()))?;
+        let mut writer = std::io::BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, &manifest)
+            .map_err(|e| rootcause::report!("Failed to serialize ammo JSON: {e}"))?;
+        writer.write_all(b"\n").ok();
+        let sz = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        println!("\nBallistics manifest → {} ({} bytes)", path.display(), sz);
+    }
+
     Ok(())
 }
 

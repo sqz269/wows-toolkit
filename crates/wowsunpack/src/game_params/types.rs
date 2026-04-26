@@ -970,11 +970,25 @@ pub struct MountPoint {
     /// to `[pitch_min, pitch_max]`.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pitch_dead_zones: Vec<[f32; 4]>,
+    /// Names of `Projectile` GameParams loadable by this mount, in declared
+    /// order. Empty for non-firing accessories (directors, finders, etc.).
+    /// Resolve each name via [`super::GameParamProvider::game_param_by_name`]
+    /// to get the per-shell ballistic profile (caliber, mass, muzzle velocity,
+    /// drag, fuze, ricochet, alpha damage, ...) — see [`Projectile`].
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
+    ammo_list: Vec<String>,
 }
 
 impl MountPoint {
     pub fn new(hp_name: String, model_path: String) -> Self {
-        Self { hp_name, model_path, mount_armor: None, species: None, pitch_dead_zones: Vec::new() }
+        Self {
+            hp_name,
+            model_path,
+            mount_armor: None,
+            species: None,
+            pitch_dead_zones: Vec::new(),
+            ammo_list: Vec::new(),
+        }
     }
 
     pub fn with_armor(
@@ -983,8 +997,9 @@ impl MountPoint {
         mount_armor: Option<ArmorMap>,
         species: Option<MountSpecies>,
         pitch_dead_zones: Vec<[f32; 4]>,
+        ammo_list: Vec<String>,
     ) -> Self {
-        Self { hp_name, model_path, mount_armor, species, pitch_dead_zones }
+        Self { hp_name, model_path, mount_armor, species, pitch_dead_zones, ammo_list }
     }
 
     pub fn hp_name(&self) -> &str {
@@ -1005,6 +1020,12 @@ impl MountPoint {
 
     pub fn pitch_dead_zones(&self) -> &[[f32; 4]] {
         &self.pitch_dead_zones
+    }
+
+    /// Names of `Projectile` GameParams this mount can fire. Empty for
+    /// non-firing accessories.
+    pub fn ammo_list(&self) -> &[String] {
+        &self.ammo_list
     }
 
     /// Get the minimum barrel elevation (degrees) at a given yaw angle (degrees)

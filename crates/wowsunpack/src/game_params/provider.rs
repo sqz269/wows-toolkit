@@ -639,7 +639,35 @@ fn extract_mounts(ship_data: &BTreeMap<HashableValue, Value>, component_name: &s
             // Extract pitchDeadZones: list of [yaw_min, yaw_max, pitch_min, pitch_max].
             let pitch_dead_zones: Vec<[f32; 4]> = parse_pitch_dead_zones(&mount_inner);
 
-            Some(MountPoint::with_armor(key_str.clone(), model_path, mount_armor, species, pitch_dead_zones))
+            // Extract `ammoList`: declared order of Projectile GameParam names
+            // this mount can fire. Empty for non-firing mounts (directors,
+            // radars, finders, etc.). Tuple in pickled data; tolerate List too.
+            let ammo_list: Vec<String> = mount_inner
+                .get(&pk(keys::AMMO_LIST))
+                .map(|val| {
+                    let mut out = Vec::new();
+                    let push = |item: &Value, out: &mut Vec<String>| {
+                        if let Some(s) = item.string_ref() {
+                            out.push(s.inner().clone());
+                        }
+                    };
+                    match val {
+                        Value::Tuple(t) => t.inner().iter().for_each(|v| push(v, &mut out)),
+                        Value::List(l) => l.inner().iter().for_each(|v| push(v, &mut out)),
+                        _ => {}
+                    }
+                    out
+                })
+                .unwrap_or_default();
+
+            Some(MountPoint::with_armor(
+                key_str.clone(),
+                model_path,
+                mount_armor,
+                species,
+                pitch_dead_zones,
+                ammo_list,
+            ))
         })
         .collect()
 }
