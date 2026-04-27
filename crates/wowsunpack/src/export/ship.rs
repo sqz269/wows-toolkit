@@ -536,7 +536,7 @@ impl ShipAssets {
             .and_then(|v| self.select_hull_mount_points(v, options.hull.as_deref(), &options.module_overrides))
             .unwrap_or_default();
 
-        let loaded = self.load_mounts(&db, &self_id_index, &mount_points, &hull_parts)?;
+        let loaded = self.load_mounts(&db, &self_id_index, &mount_points, &hull_parts, &info.model_dir)?;
         let turret_models = loaded.turret_models;
         let mounts = loaded.mounts;
 
@@ -937,16 +937,26 @@ impl ShipAssets {
         self_id_index: &HashMap<u64, usize>,
         mount_points: &[MountPoint],
         hull_parts: &[OwnedSubModel],
+        model_dir: &str,
     ) -> Result<LoadedMounts, Report> {
-        // Collect hardpoint transforms from hull visuals.
+        // Collect hardpoint transforms from hull visuals. Track which hull
+        // sub-model each HP came from so downstream consumers (sidecar +
+        // Unity) can group placements by section for damage/sinking
+        // animations. The section is encoded in the sub-model's filename:
+        // `<model_dir>_<Section>` for the 4 split files (Bow / MidFront /
+        // MidBack / Stern), bare `<model_dir>` for the top-level visual.
+        let model_prefix = format!("{model_dir}_");
         let mut hp_transforms: HashMap<String, [f32; 16]> = HashMap::new();
+        let mut hp_section: HashMap<String, String> = HashMap::new();
         for smd in hull_parts {
+            let section = smd.name.strip_prefix(&model_prefix).unwrap_or("Full").to_string();
             for &name_id in &smd.visual.nodes.name_map_name_ids {
                 if let Some(name) = db.strings.get_string_by_id(name_id)
                     && name.starts_with("HP_")
                     && let Some(xform) = smd.visual.find_hardpoint_transform(name, &db.strings)
                 {
                     hp_transforms.insert(name.to_string(), xform);
+                    hp_section.insert(name.to_string(), section.clone());
                 }
             }
         }
@@ -972,24 +982,30 @@ impl ShipAssets {
             // Resolve transform: simple HP from hull directly, compound HP
             // by composing parent (hull) and child (turret visual) transforms.
             // A mount is compound iff its HP name is NOT in the hull node tree.
-            let (hull_transform, child_hp_transform) = if let Some(&xform) = hp_transforms.get(mi.hp_name()) {
-                (xform, None)
-            } else {
-                match resolve_compound_hp(
-                    mi.hp_name(),
-                    &hp_transforms,
-                    &hp_to_model_path,
-                    &turret_model_index,
-                    &turret_models,
-                    &db.strings,
-                ) {
-                    Some(result) => result,
-                    None => {
-                        eprintln!("Warning: could not resolve hardpoint '{}'", mi.hp_name());
-                        continue;
+            // `parent_section` is the hull section that owns the (parent) HP —
+            // for direct HPs that's the section the HP node lives in; for
+            // compound HPs we inherit it from the parent hull HP.
+            let (hull_transform, child_hp_transform, parent_section) =
+                if let Some(&xform) = hp_transforms.get(mi.hp_name()) {
+                    (xform, None, hp_section.get(mi.hp_name()).cloned())
+                } else {
+                    match resolve_compound_hp(
+                        mi.hp_name(),
+                        &hp_transforms,
+                        &hp_to_model_path,
+                        &turret_model_index,
+                        &turret_models,
+                        &db.strings,
+                    ) {
+                        Some((parent_hp, parent_xform, child)) => {
+                            (parent_xform, child, hp_section.get(parent_hp).cloned())
+                        }
+                        None => {
+                            eprintln!("Warning: could not resolve hardpoint '{}'", mi.hp_name());
+                            continue;
+                        }
                     }
-                }
-            };
+                };
             let hp_transform = match child_hp_transform {
                 None => hull_transform,
                 Some(child_xform) => mat4_mul_col_major(&hull_transform, &child_xform),
@@ -1020,6 +1036,7 @@ impl ShipAssets {
 
             mounts.push(ResolvedMount {
                 hp_name: mi.hp_name().to_string(),
+                parent_section,
                 turret_model_index: model_idx,
                 transform: visual_transform,
                 armor_transform,
@@ -1464,13 +1481,14 @@ impl ShipModelContext {
             // from GameParams so consumers can map index → ammo type
             // (e.g. ammo_ids[0] == AP, ammo_ids[1] == HE for many BBs).
             let mut entry = json!({
-                "instance_id": instance_id,
-                "asset_id":    asset_id,
-                "hp_name":     mount.hp_name,
-                "scope":       scope,
-                "category":    category,
-                "subcategory": subcategory,
-                "species":     species_str,
+                "instance_id":    instance_id,
+                "asset_id":       asset_id,
+                "hp_name":        mount.hp_name,
+                "parent_section": mount.parent_section,
+                "scope":          scope,
+                "category":       category,
+                "subcategory":    subcategory,
+                "species":        species_str,
                 "transform": {
                     "matrix":   matrix.as_slice(),
                     "position": position.as_slice(),
@@ -1927,6 +1945,15 @@ struct LoadedMounts {
 /// A mount instance with resolved transform.
 struct ResolvedMount {
     hp_name: String,
+    /// Hull section that owns this HP (`Bow` / `MidFront` / `MidBack` /
+    /// `Stern` / `Full` for the top-level visual; `None` if no hull
+    /// sub-model declares this HP — shouldn't happen for resolved
+    /// mounts, but kept optional defensively). For compound HPs (e.g.
+    /// `HP_AGM_3_HP_AGA_4`, an AA gun mounted on a main turret), this
+    /// is the section of the **outer parent** HP (`HP_AGM_3` →
+    /// `MidFront`/`Stern`/etc), since that's the hull part the whole
+    /// stack rides on for damage/sinking purposes.
+    parent_section: Option<String>,
     turret_model_index: usize,
     /// Visual transform with yaw correction.
     transform: Option<[f32; 16]>,
@@ -2118,14 +2145,17 @@ pub fn build_texture_set(
 /// the child HP in the parent turret's visual node tree.
 ///
 /// Returns `(parent_hull_transform, Some(child_turret_transform))` on success.
-fn resolve_compound_hp(
+/// Returns `(parent_hp_name, hull_transform, child_hp_transform)` so the
+/// caller can both compose the placement transform and look up the parent
+/// hull HP's section for the placements JSON.
+fn resolve_compound_hp<'a>(
     hp_name: &str,
-    hp_transforms: &HashMap<String, [f32; 16]>,
+    hp_transforms: &'a HashMap<String, [f32; 16]>,
     hp_to_model_path: &HashMap<&str, &str>,
     turret_model_index: &HashMap<String, usize>,
     turret_models: &[OwnedSubModel],
     strings: &assets_bin::StringsSection<'_>,
-) -> Option<([f32; 16], Option<[f32; 16]>)> {
+) -> Option<(&'a str, [f32; 16], Option<[f32; 16]>)> {
     // Find the longest hull HP name that is a proper prefix of hp_name with
     // a '_' separator. This avoids partial matches like HP_AG matching HP_AGM_3.
     let mut best_parent: Option<(&str, &[f32; 16])> = None;
@@ -2151,7 +2181,7 @@ fn resolve_compound_hp(
     // Look up the child HP transform in the parent turret's visual.
     let child_xform = parent_turret.visual.find_hardpoint_transform(child_hp, strings)?;
 
-    Some((*parent_xform, Some(child_xform)))
+    Some((parent_hp, *parent_xform, Some(child_xform)))
 }
 
 /// Build a [`BarrelPitch`] config for per-vertex barrel rotation.
