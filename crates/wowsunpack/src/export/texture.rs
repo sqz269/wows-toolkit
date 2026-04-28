@@ -247,21 +247,113 @@ impl RawDdsDumper {
 /// E.g. MFM `AGM034_16in50_Mk7_skinned.mfm` → texture `AGM034_16in50_Mk7_camo_01.dds`.
 const MFM_STRIP_SUFFIXES: &[&str] = &["_skinned", "_wire", "_dead", "_blaze", "_alpha"];
 
+/// Strip a `_<year>` token (4 ASCII digits surrounded by `_` boundaries)
+/// from a stem, preserving anything after.
+///
+/// Used by [`texture_base_names`] to handle WG's inconsistent year
+/// suffixing in camo file names. Returns `None` when no year token is
+/// present.
+///
+/// Examples:
+/// - `"ASC017_Baltimore_1944_Bow"` → `"ASC017_Baltimore_Bow"`
+/// - `"ASB017_Montana_1945"` → `"ASB017_Montana"` (year at end of string)
+/// - `"AGM034_16in50_Mk7"` → `None` (no 4-digit `_NNNN_` token)
+fn strip_year_token(stem: &str) -> Option<String> {
+    let bytes = stem.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    while i + 5 <= n {
+        if bytes[i] == b'_' && bytes[i + 1..i + 5].iter().all(|b| b.is_ascii_digit()) {
+            // Boundary check: at position i+5 must be EOF or another '_'.
+            if i + 5 == n || bytes[i + 5] == b'_' {
+                let mut out = String::with_capacity(n - 5);
+                out.push_str(&stem[..i]);
+                out.push_str(&stem[i + 5..]);
+                return Some(out);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Truncate a stem at the first `_<year>` token, returning the prefix.
+///
+/// Used by [`texture_base_names`] to handle WG ships that ship one
+/// camo file for the whole hull rather than per-part. Returns `None`
+/// when no year token is present, and an empty result is treated as
+/// no-match by callers.
+///
+/// Examples:
+/// - `"ASC017_Baltimore_1944_Bow"` → `"ASC017_Baltimore"`
+/// - `"ASB017_Montana_1945_Deckhouse"` → `"ASB017_Montana"`
+/// - `"JSB039_Yamato_1945"` → `"JSB039_Yamato"`
+fn truncate_at_year_token(stem: &str) -> Option<String> {
+    let bytes = stem.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    while i + 5 <= n {
+        if bytes[i] == b'_' && bytes[i + 1..i + 5].iter().all(|b| b.is_ascii_digit()) {
+            if i + 5 == n || bytes[i + 5] == b'_' {
+                return Some(stem[..i].to_string());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Derive texture base names from an MFM stem.
 ///
-/// Returns the original stem first, then the stem with known MFM-only suffixes
-/// stripped (e.g. `_skinned`). This allows matching both hull-style stems
-/// (where `JSB039_Yamato_1945_Hull` IS the texture name) and turret-style stems
-/// (where `AGM034_16in50_Mk7_skinned` maps to `AGM034_16in50_Mk7`).
+/// Returns the original stem first, then the stem with various WG
+/// authoring inconsistencies normalised:
+///
+/// 1. **`MFM_STRIP_SUFFIXES`** — strips `_skinned`/`_wire`/`_dead`/...
+///    so turret-style stems like `AGM034_16in50_Mk7_skinned` resolve
+///    via the texture name `AGM034_16in50_Mk7`.
+/// 2. **Year-token stripped** — drops a `_<year>` token (4 ASCII
+///    digits surrounded by `_` boundaries) anywhere in the stem.
+///    Handles ships like Baltimore where WG names camo files
+///    `ASC017_Baltimore_camo_01.dd0` even though the MFM stems carry
+///    `_1944` (e.g. `ASC017_Baltimore_1944_Bow`).
+/// 3. **Truncated at year-token** — produces the prefix before any
+///    year token. Handles ships that ship one camo file for the whole
+///    hull rather than per-part.
+///
+/// All variants are tried by the consumers ([`load_texture_bytes`],
+/// [`discover_texture_schemes`]); the first to produce a hit wins.
 pub fn texture_base_names(mfm_stem: &str) -> Vec<String> {
     let mut names = vec![mfm_stem.to_string()];
+
+    // Add MFM-suffix-stripped variants (operate on the ORIGINAL stem, not
+    // on the year-stripped variants, so we don't combinatorially explode).
     for suffix in MFM_STRIP_SUFFIXES {
         if let Some(stripped) = mfm_stem.strip_suffix(suffix)
-            && !names.contains(&stripped.to_string())
+            && !names.iter().any(|n| n == stripped)
         {
             names.push(stripped.to_string());
         }
     }
+
+    // Year-stripped variant: `ASC017_Baltimore_1944_Bow` →
+    // `ASC017_Baltimore_Bow`. Catches WG camos that omit the year.
+    if let Some(without_year) = strip_year_token(mfm_stem)
+        && !without_year.is_empty()
+        && !names.iter().any(|n| n == &without_year)
+    {
+        names.push(without_year);
+    }
+
+    // Truncated-at-year variant: `ASC017_Baltimore_1944_Bow` →
+    // `ASC017_Baltimore`. Catches WG camos that ship one file per hull
+    // (not per part) under the index-only name.
+    if let Some(at_year) = truncate_at_year_token(mfm_stem)
+        && !at_year.is_empty()
+        && !names.iter().any(|n| n == &at_year)
+    {
+        names.push(at_year);
+    }
+
     names
 }
 
@@ -845,4 +937,124 @@ pub fn load_or_bake_albedo(
     let mut png = dds_to_png_resized(&dds_bytes, max_size).ok()?;
     force_png_opaque(&mut png);
     Some(png)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_year_token_middle() {
+        // Baltimore: year sits between ship + part.
+        assert_eq!(
+            strip_year_token("ASC017_Baltimore_1944_Bow").as_deref(),
+            Some("ASC017_Baltimore_Bow"),
+        );
+        // Yamato: year between ship + part.
+        assert_eq!(
+            strip_year_token("JSB039_Yamato_1945_Hull").as_deref(),
+            Some("JSB039_Yamato_Hull"),
+        );
+    }
+
+    #[test]
+    fn strip_year_token_trailing() {
+        // Year at the end of the stem (no part suffix).
+        assert_eq!(
+            strip_year_token("ASB017_Montana_1945").as_deref(),
+            Some("ASB017_Montana"),
+        );
+    }
+
+    #[test]
+    fn strip_year_token_no_year() {
+        // No 4-digit token in stem.
+        assert_eq!(strip_year_token("ASB017_Montana_Deckhouse"), None);
+        // 2- and 3-digit numbers must not match (calibers, model codes).
+        assert_eq!(strip_year_token("AGM034_16in50_Mk7_skinned"), None);
+        assert_eq!(strip_year_token("AGS010_5in38_Mk32_Mod12"), None);
+        assert_eq!(strip_year_token("AGM019_8in55_CA68"), None);
+    }
+
+    #[test]
+    fn strip_year_token_5digit_not_year() {
+        // 5-digit number is not a year, must not match.
+        assert_eq!(strip_year_token("AB12345_Test"), None);
+    }
+
+    #[test]
+    fn truncate_at_year_token_basic() {
+        assert_eq!(
+            truncate_at_year_token("ASC017_Baltimore_1944_Bow").as_deref(),
+            Some("ASC017_Baltimore"),
+        );
+        assert_eq!(
+            truncate_at_year_token("JSB039_Yamato_1945_Hull").as_deref(),
+            Some("JSB039_Yamato"),
+        );
+        // Year at end: still produces the prefix.
+        assert_eq!(
+            truncate_at_year_token("JSB039_Yamato_1945").as_deref(),
+            Some("JSB039_Yamato"),
+        );
+    }
+
+    #[test]
+    fn truncate_at_year_token_no_year() {
+        assert_eq!(truncate_at_year_token("ASB017_Montana_Deckhouse"), None);
+    }
+
+    #[test]
+    fn texture_base_names_baltimore_camo_pattern() {
+        // The motivating case: WG ships Baltimore's camo as
+        // `ASC017_Baltimore_camo_01.dd0` even though the MFM stems
+        // carry `_1944`. The candidate list must include the bare
+        // index prefix `ASC017_Baltimore` so the camo file is found.
+        let names = texture_base_names("ASC017_Baltimore_1944_Bow");
+        assert!(
+            names.contains(&"ASC017_Baltimore".to_string()),
+            "expected ASC017_Baltimore in candidate list, got {names:?}",
+        );
+        assert!(
+            names.contains(&"ASC017_Baltimore_Bow".to_string()),
+            "expected ASC017_Baltimore_Bow in candidate list, got {names:?}",
+        );
+        // Original is always first.
+        assert_eq!(names.first().map(String::as_str), Some("ASC017_Baltimore_1944_Bow"));
+    }
+
+    #[test]
+    fn texture_base_names_montana_passthrough() {
+        // Montana has no `_1945` in its texture stems, so the
+        // year-strippers don't fire. Original stem stays as the only
+        // candidate.
+        let names = texture_base_names("ASB017_Montana_Deckhouse");
+        assert_eq!(names, vec!["ASB017_Montana_Deckhouse".to_string()]);
+    }
+
+    #[test]
+    fn texture_base_names_yamato_full() {
+        // Yamato's hull MFM carries `_1945`. Year-strip should produce
+        // both `JSB039_Yamato_Hull` and `JSB039_Yamato` so any of WG's
+        // naming variants resolve.
+        let names = texture_base_names("JSB039_Yamato_1945_Hull");
+        assert!(names.contains(&"JSB039_Yamato_1945_Hull".to_string()));
+        assert!(names.contains(&"JSB039_Yamato_Hull".to_string()));
+        assert!(names.contains(&"JSB039_Yamato".to_string()));
+    }
+
+    #[test]
+    fn texture_base_names_skinned_turret() {
+        // Existing _skinned strip still fires for accessory MFMs.
+        let names = texture_base_names("AGM034_16in50_Mk7_skinned");
+        assert_eq!(names.first().map(String::as_str), Some("AGM034_16in50_Mk7_skinned"));
+        assert!(names.contains(&"AGM034_16in50_Mk7".to_string()));
+    }
+
+    #[test]
+    fn texture_base_names_no_dup_when_year_strip_matches_original() {
+        // Pathological: stem with no year shouldn't grow the list.
+        let names = texture_base_names("ASC017_Baltimore");
+        assert_eq!(names, vec!["ASC017_Baltimore".to_string()]);
+    }
 }
