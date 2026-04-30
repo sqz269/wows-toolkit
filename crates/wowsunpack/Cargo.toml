@@ -46,7 +46,7 @@ meshopt-rs = { version = "0.1.2", optional = true }
 gltf-json = { version = "1", optional = true, features = ["KHR_materials_variants", "KHR_texture_transform", "extras"] }
 gltf = { version = "1", optional = true, features = ["KHR_materials_variants"] }
 half = { version = "2", optional = true }
-image_dds = { workspace = true, optional = true, features = ["ddsfile", "image"] }
+image_dds = { workspace = true, optional = true, features = ["ddsfile", "image", "encode"] }
 image = { workspace = true, optional = true, features = ["png"] }
 unidecode = { version = "0.3", optional = true }
 vfs = { version = "0.13", optional = true }

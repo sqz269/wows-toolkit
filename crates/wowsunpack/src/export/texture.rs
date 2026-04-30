@@ -16,6 +16,8 @@ pub enum TextureError {
     DdsDecode(String),
     #[error("failed to encode PNG: {0}")]
     PngEncode(String),
+    #[error("failed to encode DDS: {0}")]
+    DdsEncode(String),
 }
 
 /// Force all alpha values to 255 in an RGBA8 PNG buffer.
@@ -236,7 +238,88 @@ impl RawDdsDumper {
                 if let Err(e) = std::fs::write(&out, &bytes) {
                     eprintln!("  Warning: failed to write raw DDS {}: {e}", out.display());
                 }
-                self.written.insert(filename);
+                self.written.insert(filename.clone());
+
+                // Emit glTF-conformant siblings derived from this mip. WG packs
+                // `_n` with B = categorical camo gate (not Z) and `_mg` with
+                // non-glTF channel order; the siblings let stock Unity / Three.js
+                // / Blender / glTF viewers consume the textures without per-
+                // consumer decode logic. See `tools/reference/shared/
+                // texture_conventions.md` §Decision.
+                self.write_conformant_siblings(&filename, &bytes, suffix);
+            }
+        }
+    }
+
+    /// Write conformant siblings for a just-dumped WG file. Quietly noops
+    /// for filenames that don't match the `_n` / `_mg` patterns and for
+    /// any per-sibling encode failure (warns to stderr; doesn't abort the
+    /// dump — non-conformant siblings are independent of the original
+    /// dump succeeding).
+    fn write_conformant_siblings(&mut self, filename: &str, bytes: &[u8], mip_suffix: &str) {
+        let stem_no_mip = match filename.strip_suffix(mip_suffix) {
+            Some(s) => s,
+            None => return,
+        };
+
+        if let Some(stem) = stem_no_mip.strip_suffix("_n") {
+            // Normal map: split into _normal + _nbmask siblings.
+            let normal_name = format!("{stem}_normal{mip_suffix}");
+            let mask_name = format!("{stem}_nbmask{mip_suffix}");
+
+            let need_normal = !self.written.contains(&normal_name);
+            let need_mask = !self.written.contains(&mask_name);
+            if !need_normal && !need_mask {
+                return;
+            }
+
+            match split_wg_normal_dds(bytes) {
+                Ok((normal_dds, mask_dds)) => {
+                    if need_normal {
+                        let out = self.dir.join(&normal_name);
+                        if let Err(e) = std::fs::write(&out, &normal_dds) {
+                            eprintln!("  Warning: failed to write {}: {e}", out.display());
+                        } else {
+                            self.written.insert(normal_name);
+                        }
+                    }
+                    if need_mask {
+                        let out = self.dir.join(&mask_name);
+                        if let Err(e) = std::fs::write(&out, &mask_dds) {
+                            eprintln!("  Warning: failed to write {}: {e}", out.display());
+                        } else {
+                            self.written.insert(mask_name);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  Warning: failed to split WG normal {filename}: {e:?} \
+                         (consumer must fall back to raw _n.dd?)"
+                    );
+                }
+            }
+        } else if let Some(stem) = stem_no_mip.strip_suffix("_mg") {
+            // Metallic-gloss map: emit swizzled _mr sibling.
+            let mr_name = format!("{stem}_mr{mip_suffix}");
+            if self.written.contains(&mr_name) {
+                return;
+            }
+            match swizzle_wg_mg_dds_to_mr(bytes) {
+                Ok(mr_dds) => {
+                    let out = self.dir.join(&mr_name);
+                    if let Err(e) = std::fs::write(&out, &mr_dds) {
+                        eprintln!("  Warning: failed to write {}: {e}", out.display());
+                    } else {
+                        self.written.insert(mr_name);
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  Warning: failed to swizzle WG MG {filename}: {e:?} \
+                         (consumer must swizzle on bind from raw _mg.dd?)"
+                    );
+                }
             }
         }
     }
@@ -838,7 +921,14 @@ pub fn load_pbr_channels(
         dds_to_png(&dds).ok()
     };
 
-    let normal = load_raw("normalMap");
+    // Normal map: WG packs (R,G) = tangent X,Y but the B channel is a
+    // categorical no-camo region marker (not Z). Rewrite B as
+    // sqrt(1 - X² - Y²) so the embedded PNG is a glTF-conformant normal
+    // map — the original B is preserved on disk via the
+    // `_nbmask.dd?` siblings emitted by `RawDdsDumper` (see
+    // `tools/reference/shared/texture_conventions.md` §Decision).
+    let normal = load_raw("normalMap")
+        .and_then(|png| replace_normal_b_with_reconstructed_z_png(&png).ok());
     let occlusion = load_raw("ambientOcclusionMap");
     let metallic_roughness = load_raw("metallicGlossMap")
         .and_then(|png| repack_wg_mg_to_gltf_mr(&png).ok());
@@ -896,6 +986,154 @@ pub fn repack_wg_mg_to_gltf_mr(png_bytes: &[u8]) -> Result<Vec<u8>, Report<Textu
         .write_image(rgba.as_raw(), rgba.width(), rgba.height(), ExtendedColorType::Rgba8)
         .map_err(|e| Report::new(TextureError::PngEncode(e.to_string())))?;
     Ok(out)
+}
+
+/// Replace WG's categorical-mask `B` channel in a normal map PNG with the
+/// reconstructed Z (`sqrt(1 - X² - Y²)`), so the result is a glTF-conformant
+/// tangent-space normal map.
+///
+/// Why: WG packs (R,G) = (X,Y) in the standard way, but the `B` channel
+/// carries a per-pixel "no-camo region" categorical marker (119 = apply
+/// camo, 153 = deck-skip, 34 = detail-skip), NOT Z. Standard glTF / Unity
+/// `UnpackNormal` paths expect B = Z; if they read WG's B as Z the
+/// resulting normals are visually wrong.
+///
+/// The original B is preserved by the disk-dump path as a sibling
+/// `_nbmask.dds` (see [`split_wg_normal_dds`]) so the camo gate has its
+/// own input texture independent of the normal map.
+///
+/// See `tools/reference/shared/texture_conventions.md` §Normal in the
+/// pipeline repo for the full convention writeup.
+pub fn replace_normal_b_with_reconstructed_z_png(
+    png_bytes: &[u8],
+) -> Result<Vec<u8>, Report<TextureError>> {
+    use image_dds::image::ImageReader;
+
+    let reader = ImageReader::new(Cursor::new(png_bytes))
+        .with_guessed_format()
+        .map_err(|e| Report::new(TextureError::DdsDecode(e.to_string())))?;
+    let img = reader
+        .decode()
+        .map_err(|e| Report::new(TextureError::DdsDecode(e.to_string())))?;
+    let mut rgba = img.into_rgba8();
+
+    for pixel in rgba.pixels_mut() {
+        // Decode tangent-space (X, Y) from R, G in [-1, 1].
+        let x = (pixel.0[0] as f32 / 255.0) * 2.0 - 1.0;
+        let y = (pixel.0[1] as f32 / 255.0) * 2.0 - 1.0;
+        // Z = sqrt(1 - X² - Y²); clamp for numeric safety.
+        let z = (1.0 - x * x - y * y).max(0.0).sqrt();
+        // Re-encode Z to [0, 255].
+        let bz = (((z + 1.0) * 0.5 * 255.0).round() as i32).clamp(0, 255) as u8;
+        pixel.0[2] = bz;
+        pixel.0[3] = 255;
+    }
+
+    let mut out = Vec::new();
+    PngEncoder::new(&mut out)
+        .write_image(
+            rgba.as_raw(),
+            rgba.width(),
+            rgba.height(),
+            ExtendedColorType::Rgba8,
+        )
+        .map_err(|e| Report::new(TextureError::PngEncode(e.to_string())))?;
+    Ok(out)
+}
+
+/// Decode a single-mip DDS to RGBA8 (image_dds wrapper).
+fn decode_single_mip_dds(
+    dds_bytes: &[u8],
+) -> Result<image_dds::image::RgbaImage, Report<TextureError>> {
+    let dds = image_dds::ddsfile::Dds::read(&mut Cursor::new(dds_bytes))
+        .map_err(|e| Report::new(TextureError::DdsParse(e.to_string())))?;
+    image_dds::image_from_dds(&dds, 0)
+        .map_err(|e| Report::new(TextureError::DdsDecode(e.to_string())))
+}
+
+/// Encode an RGBA8 image as a single-mip DDS in the given format.
+fn encode_single_mip_dds(
+    rgba: &image_dds::image::RgbaImage,
+    format: image_dds::ImageFormat,
+) -> Result<Vec<u8>, Report<TextureError>> {
+    let surface = image_dds::SurfaceRgba8::from_image(rgba);
+    let dds = surface
+        .encode_dds(format, image_dds::Quality::Fast, image_dds::Mipmaps::Disabled)
+        .map_err(|e| Report::new(TextureError::DdsEncode(e.to_string())))?;
+    let mut buf = Vec::new();
+    dds.write(&mut buf)
+        .map_err(|e| Report::new(TextureError::DdsEncode(e.to_string())))?;
+    Ok(buf)
+}
+
+/// Swizzle a single-mip WG `_mg` DDS into a glTF-conformant `_mr` DDS.
+///
+/// The pixel-level swizzle is identical to [`repack_wg_mg_to_gltf_mr`]
+/// (R cavity pass-through, G = 255 - B (gloss → roughness), B = G
+/// (metallic), A = 255). Output format is `BC1RgbaUnorm` to match the
+/// WG MG packing (BC1 no-alpha is canonical for `_mg` files; A is
+/// always unused).
+///
+/// Single mip — WG splits the mip pyramid across `.dd0` / `.dd1` /
+/// `.dd2` / `.dds` files, each carrying one mip level. Callers iterate
+/// per-file.
+pub fn swizzle_wg_mg_dds_to_mr(dds_bytes: &[u8]) -> Result<Vec<u8>, Report<TextureError>> {
+    let mut rgba = decode_single_mip_dds(dds_bytes)?;
+    for pixel in rgba.pixels_mut() {
+        let [r, g, b, _a] = pixel.0;
+        pixel.0 = [r, 255u8.saturating_sub(b), g, 255];
+    }
+    encode_single_mip_dds(&rgba, image_dds::ImageFormat::BC1RgbaUnorm)
+}
+
+/// Split a single-mip WG `_n` DDS into two glTF-conformant siblings:
+///
+/// 1. `_normal.dds` — BC7 with `B := sqrt(1 - X² - Y²)` (reconstructed
+///    Z baked in). Standard tangent-space normal map.
+/// 2. `_nbmask.dds` — BC4 single-channel, original B preserved (the
+///    categorical no-camo region marker that drives the camo gate).
+///
+/// The split is the disk-side counterpart to
+/// [`replace_normal_b_with_reconstructed_z_png`] (which fixes the
+/// GLB-embed path). Callers in `RawDdsDumper` invoke this once per
+/// mip-level file so the conformant siblings mirror WG's per-mip-file
+/// convention.
+///
+/// See `tools/reference/shared/texture_conventions.md` §Decision in the
+/// pipeline repo for the architectural rationale.
+pub fn split_wg_normal_dds(
+    dds_bytes: &[u8],
+) -> Result<(Vec<u8> /* normal */, Vec<u8> /* mask */), Report<TextureError>> {
+    let rgba = decode_single_mip_dds(dds_bytes)?;
+    let (w, h) = (rgba.width(), rgba.height());
+
+    let mut normal_buf: Vec<u8> = Vec::with_capacity((w * h * 4) as usize);
+    let mut mask_buf: Vec<u8> = Vec::with_capacity((w * h * 4) as usize);
+
+    for pixel in rgba.pixels() {
+        let [r, g, b, _a] = pixel.0;
+
+        // Reconstructed-Z normal: keep R, G; replace B with z; force A=255.
+        let x = (r as f32 / 255.0) * 2.0 - 1.0;
+        let y = (g as f32 / 255.0) * 2.0 - 1.0;
+        let z = (1.0 - x * x - y * y).max(0.0).sqrt();
+        let bz = (((z + 1.0) * 0.5 * 255.0).round() as i32).clamp(0, 255) as u8;
+        normal_buf.extend_from_slice(&[r, g, bz, 255]);
+
+        // BC4 mask: encoder reads R only; pad G/B/A to keep the RGBA8
+        // surface shape consistent (encoder ignores G/B/A for BC4R).
+        mask_buf.extend_from_slice(&[b, 0, 0, 255]);
+    }
+
+    let normal_img = image_dds::image::RgbaImage::from_raw(w, h, normal_buf)
+        .ok_or_else(|| Report::new(TextureError::DdsEncode("normal buf size mismatch".into())))?;
+    let mask_img = image_dds::image::RgbaImage::from_raw(w, h, mask_buf)
+        .ok_or_else(|| Report::new(TextureError::DdsEncode("mask buf size mismatch".into())))?;
+
+    let normal_dds = encode_single_mip_dds(&normal_img, image_dds::ImageFormat::BC7RgbaUnorm)?;
+    let mask_dds = encode_single_mip_dds(&mask_img, image_dds::ImageFormat::BC4RUnorm)?;
+
+    Ok((normal_dds, mask_dds))
 }
 
 /// Try to load a texture for a model mesh, with TILEDLAND baking support.
