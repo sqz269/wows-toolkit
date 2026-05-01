@@ -374,6 +374,25 @@ enum Commands {
         #[arg(long)]
         raw_dds_dir: Option<PathBuf>,
 
+        /// Optional sidecar-ready material → texture-stem mappings.
+        /// When set, writes a JSON file alongside the GLB enumerating
+        /// every hull material's bound texture references, resolved
+        /// authoritatively from the `.mfm` material descriptors.
+        ///
+        /// Lets downstream pipelines (Unity sidecar bind, skin-pack
+        /// ingestion) match material identifiers (e.g. "SHIPMAT_PBS_Bulge")
+        /// to DDS stems deterministically — no filename heuristics, no
+        /// per-ship hand-curated alias tables.
+        ///
+        /// Entry shape:
+        ///   { material_identifier, sub_model, mfm_stem, mfm_path,
+        ///     shader_id, render_set, skinned,
+        ///     textures: { <slot>: { stem, channel, vfs_path, hash }, ... } }
+        ///
+        /// Emitted regardless of --accessories / --textures.
+        #[arg(long)]
+        material_mappings_json: Option<PathBuf>,
+
         /// List available camouflage texture schemes, then exit
         #[arg(long)]
         list_textures: bool,
@@ -1240,7 +1259,7 @@ fn run() -> Result<(), Report> {
             };
             run_batch_export_model(&manifest, keep_going, vfs)?;
         }
-        Commands::ExportShip { name, output, lod, list_upgrades, hull, no_textures, damaged, all_render_sets, accessories, placements_json, skel_ext_candidates_json, textures_dir, textures_uri_prefix, raw_dds_dir, list_textures, debug } => {
+        Commands::ExportShip { name, output, lod, list_upgrades, hull, no_textures, damaged, all_render_sets, accessories, placements_json, skel_ext_candidates_json, textures_dir, textures_uri_prefix, raw_dds_dir, material_mappings_json, list_textures, debug } => {
             let Some(vfs) = &vfs else {
                 bail!("VFS required for export-ship. Use --game-dir to specify a game install.");
             };
@@ -1263,6 +1282,7 @@ fn run() -> Result<(), Report> {
                 textures_dir.as_deref(),
                 textures_uri_prefix.as_deref(),
                 raw_dds_dir.as_deref(),
+                material_mappings_json.as_deref(),
                 list_textures,
                 debug,
             )?;
@@ -2362,6 +2382,7 @@ fn run_export_ship(
     textures_dir: Option<&Path>,
     textures_uri_prefix: Option<&str>,
     raw_dds_dir: Option<&Path>,
+    material_mappings_json: Option<&Path>,
     list_textures: bool,
     debug: bool,
 ) -> Result<(), Report> {
@@ -2426,6 +2447,7 @@ fn run_export_ship(
             .map(|s| s.to_string())
             .unwrap_or_else(|| "textures/".to_string()),
         raw_dds_dir: raw_dds_dir.map(|p| p.to_path_buf()),
+        material_mappings_json_path: material_mappings_json.map(|p| p.to_path_buf()),
         ..Default::default()
     };
     let ctx = assets.load_ship(name, &options)?;
@@ -2460,6 +2482,16 @@ fn run_export_ship(
         ctx.write_skel_ext_candidates_json(path)?;
         let json_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         println!("Skel-ext candidates → {} ({} bytes)", path.display(), json_size);
+    }
+
+    // Optional material → texture-stem mappings. Walks each hull-part
+    // visual's render sets and resolves the bound texture VFS paths via
+    // the .mfm material descriptors. Replaces sidecar-side filename
+    // heuristics with deterministic data.
+    if let Some(path) = material_mappings_json {
+        ctx.write_material_mappings_json(path)?;
+        let json_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        println!("Material mappings → {} ({} bytes)", path.display(), json_size);
     }
 
     if has_armor {

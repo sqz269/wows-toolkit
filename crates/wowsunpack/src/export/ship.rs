@@ -148,6 +148,16 @@ pub struct ShipExportOptions {
     /// mip chain in BC-compressed form. Independent of `textures_dir`
     /// (PNG export for glTF): both can be set simultaneously.
     pub raw_dds_dir: Option<PathBuf>,
+    /// If set, write a JSON manifest of every material → texture stem
+    /// mapping to this path. Walks each hull-part `.visual`'s render sets,
+    /// resolves the `.mfm` for each, and resolves every texture-typed
+    /// MFM property to a VFS path. Lets downstream pipelines bind
+    /// materials to DDS stems deterministically rather than via
+    /// filename heuristics. Emits regardless of [`accessory_mode`] /
+    /// [`textures`].
+    ///
+    /// Field contract: see `ShipModelContext::write_material_mappings_json`.
+    pub material_mappings_json_path: Option<PathBuf>,
 }
 
 impl Default for ShipExportOptions {
@@ -164,6 +174,7 @@ impl Default for ShipExportOptions {
             textures_dir: None,
             textures_uri_prefix: "textures/".to_string(),
             raw_dds_dir: None,
+            material_mappings_json_path: None,
         }
     }
 }
@@ -1677,6 +1688,190 @@ impl ShipModelContext {
         Ok(())
     }
 
+    /// Write a JSON manifest of every hull material → texture stem mapping.
+    ///
+    /// For each hull sub-model, walks the `VisualPrototype` render sets,
+    /// resolves the `.mfm` for each, parses it, and resolves every
+    /// texture-typed property to a VFS path. The output lets downstream
+    /// pipelines bind materials to DDS stems deterministically rather
+    /// than via filename heuristics (e.g. avoiding cases like Myoko's
+    /// `SHIPMAT_PBS_Bulge` → `_bools_a` mapping that needs a hand-curated
+    /// alias today).
+    ///
+    /// One entry per `(sub_model, render_set)` tuple. Same material
+    /// identifier (e.g. `SHIPMAT_PBS_Hull`) on multiple sub-models
+    /// produces multiple entries, since each sub-model points to its
+    /// own `.mfm` (e.g. Bow.mfm vs MidFront.mfm) and may bind different
+    /// texture stems.
+    ///
+    /// Output shape (schema_version 1):
+    /// ```json
+    /// {
+    ///   "schema_version": 1,
+    ///   "ship": { "model_dir": "...", "param_index": "...", ... },
+    ///   "pipeline": { "toolkit_version": "...", "generated_at": "..." },
+    ///   "materials": [
+    ///     {
+    ///       "material_identifier": "SHIPMAT_PBS_Bulge",
+    ///       "sub_model": "JSC008_Myoko_1945_Bow",
+    ///       "mfm_stem": "JSC008_Myoko_1945_Bow",
+    ///       "mfm_path": "content/.../JSC008_Myoko_1945_Bow.mfm",
+    ///       "shader_id": "0x...",
+    ///       "render_set": "Bow",
+    ///       "skinned": false,
+    ///       "textures": {
+    ///         "diffuseMap": {
+    ///           "stem": "JSC008_Myoko_1945_Bow",
+    ///           "channel": "_a",
+    ///           "vfs_path": "content/.../JSC008_Myoko_1945_Bow_a.dds",
+    ///           "hash": "0x..."
+    ///         },
+    ///         "normalMap": { ... },
+    ///         "metallicGlossMap": { ... },
+    ///         "ambientOcclusionMap": { ... }
+    ///       }
+    ///     }
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// Texture properties whose hash doesn't resolve (rare; would
+    /// indicate a stale assets.bin index) are silently skipped.
+    /// Properties named only by hash (i.e. not in the toolkit's
+    /// 174-entry property name dictionary) surface with a hex slot
+    /// name like `0xa1b2c3d4` so consumers don't lose data.
+    #[cfg(feature = "json")]
+    pub fn write_material_mappings_json(&self, path: &Path) -> Result<(), Report> {
+        use crate::models::material::PropertyType;
+        use crate::models::material::PropertyValue;
+        use serde_json::json;
+
+        let db = assets_bin::parse_assets_bin(&self.assets_bin_bytes)
+            .context("Failed to re-parse assets.bin for material mappings")?;
+        let self_id_index = db.build_self_id_index();
+
+        let mut material_entries: Vec<serde_json::Value> = Vec::new();
+
+        for sub in &self.hull_parts {
+            let sub_name = sub.name.clone();
+            for rs in &sub.visual.render_sets {
+                if rs.material_mfm_path_id == 0 {
+                    continue;
+                }
+
+                let material_identifier = db
+                    .strings
+                    .get_string_by_id(rs.material_name_id)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("material_0x{:08X}", rs.material_name_id));
+
+                let render_set_name = db
+                    .strings
+                    .get_string_by_id(rs.name_id)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("rs_0x{:08X}", rs.name_id));
+
+                // Resolve MFM path + stem.
+                let Some(&mfm_path_idx) = self_id_index.get(&rs.material_mfm_path_id) else {
+                    continue;
+                };
+                let mfm_full_path = db.reconstruct_path(mfm_path_idx, &self_id_index);
+                let mfm_leaf = &db.paths_storage[mfm_path_idx].name;
+                let mfm_stem = mfm_leaf.strip_suffix(".mfm").unwrap_or(mfm_leaf).to_string();
+
+                // Parse the MFM and walk every texture-typed property.
+                let mat = match texture::parse_mfm_from_db(&db, rs.material_mfm_path_id) {
+                    Some(m) => m,
+                    None => {
+                        // MFM didn't parse (corrupt or non-MFM blob index).
+                        // Emit the entry with empty textures so consumers
+                        // can still see the material exists.
+                        material_entries.push(json!({
+                            "material_identifier": material_identifier,
+                            "sub_model":           sub_name,
+                            "mfm_stem":            mfm_stem,
+                            "mfm_path":            mfm_full_path,
+                            "shader_id":           serde_json::Value::Null,
+                            "render_set":          render_set_name,
+                            "skinned":             rs.skinned,
+                            "textures":            serde_json::Map::new(),
+                            "parse_error":        true,
+                        }));
+                        continue;
+                    }
+                };
+
+                let mut textures_obj = serde_json::Map::new();
+                for prop in &mat.properties {
+                    if prop.property_type != PropertyType::Texture {
+                        continue;
+                    }
+                    let hash = match &prop.value {
+                        Some(PropertyValue::Texture(h)) if *h != 0 => *h,
+                        _ => continue,
+                    };
+                    let Some(&tex_idx) = self_id_index.get(&hash) else {
+                        continue;
+                    };
+                    let vfs_path = db.reconstruct_path(tex_idx, &self_id_index);
+                    let (stem, channel) = derive_texture_stem_and_channel(&vfs_path);
+
+                    let slot_name = match prop.name {
+                        Some(n) => n.to_string(),
+                        None => format!("0x{:08x}", prop.name_hash),
+                    };
+
+                    textures_obj.insert(
+                        slot_name,
+                        json!({
+                            "stem":     stem,
+                            "channel":  channel,
+                            "vfs_path": vfs_path,
+                            "hash":     format!("0x{:016x}", hash),
+                        }),
+                    );
+                }
+
+                material_entries.push(json!({
+                    "material_identifier": material_identifier,
+                    "sub_model":           sub_name,
+                    "mfm_stem":            mfm_stem,
+                    "mfm_path":            mfm_full_path,
+                    "shader_id":           format!("0x{:08x}", mat.shader_id),
+                    "render_set":          render_set_name,
+                    "skinned":             rs.skinned,
+                    "textures":            textures_obj,
+                }));
+            }
+        }
+
+        let now = format_rfc3339_utc(SystemTime::now());
+        let toolkit_version = env!("CARGO_PKG_VERSION");
+
+        let manifest = json!({
+            "schema_version": 1,
+            "ship": {
+                "model_dir":    self.info.model_dir,
+                "display_name": self.info.display_name,
+                "param_index":  self.info.param_index,
+                "nation":       self.info.nation,
+                "species":      self.info.species,
+                "tier":         self.info.tier,
+            },
+            "pipeline": {
+                "toolkit_version": toolkit_version,
+                "generated_at":    now,
+            },
+            "materials": material_entries,
+        });
+
+        let file = std::fs::File::create(path)
+            .context_with(|| format!("Failed to create material mappings JSON at {}", path.display()))?;
+        serde_json::to_writer_pretty(std::io::BufWriter::new(file), &manifest)
+            .map_err(|e| rootcause::report!("Failed to serialize material mappings JSON: {e}"))?;
+        Ok(())
+    }
+
     /// Export the loaded ship model to GLB format.
     pub fn export_glb(&self, writer: &mut impl Write) -> Result<(), Report> {
         let db = assets_bin::parse_assets_bin(&self.assets_bin_bytes).context("Failed to re-parse assets.bin")?;
@@ -1990,6 +2185,60 @@ struct MatCamoScheme {
     color_scheme_colors: Option<[[f32; 4]; 4]>,
     /// Per-part UV transforms for tiled camos. Key = part category (lowercase).
     uv_transforms: HashMap<String, camouflage::UvTransform>,
+}
+
+// ---------------------------------------------------------------------------
+// Texture-path stem/channel extraction (used by `write_material_mappings_json`)
+// ---------------------------------------------------------------------------
+
+/// Mip-level suffixes WG appends to texture filenames. `.dd0` is the
+/// highest-resolution mip; `.dds` carries the bundled mip tail.
+const TEXTURE_MIP_SUFFIXES: &[&str] = &[".dd0", ".dd1", ".dd2", ".dds"];
+
+/// Channel suffixes WG appends to texture filenames immediately after the
+/// material stem. Order matters: longer / more-specific suffixes must come
+/// first so e.g. `_normal` is matched before `_n`, `_emissive` before `_e`,
+/// `_nbmask` (4 chars) before its components. Each entry must be a leading
+/// `_` plus letters so we can detect it at the end of a filename stem.
+const TEXTURE_CHANNEL_SUFFIXES: &[&str] = &[
+    "_normal",   // conformant glTF normal map (toolkit-emitted Phase B sibling)
+    "_nbmask",   // normal-B-channel mask (toolkit-emitted Phase B sibling)
+    "_emissive", // synthesized emissive (Python pipeline-emitted)
+    "_mr",       // conformant glTF metallic-roughness (toolkit-emitted Phase B sibling)
+    "_mg",       // raw WG metallic-gloss
+    "_ao",       // ambient occlusion
+    "_od",       // overlay diffuse (TILEDLAND)
+    "_n",        // raw WG normal (B = camo gate, not Z)
+    "_a",        // albedo
+    "_e",        // emissive (legacy short form)
+];
+
+/// Decompose a VFS texture path into `(stem, channel)`.
+///
+/// Strips the mip suffix (`.dd0` / `.dds` / etc.) and the trailing
+/// channel suffix (`_a` / `_n` / `_normal` / ...) from the filename leaf.
+/// Returns the bare stem and the detected channel separately so consumers
+/// can match against either form.
+///
+/// Examples:
+/// - `content/.../JSC008_Myoko_1945_Bow_a.dds` → (`JSC008_Myoko_1945_Bow`, `_a`)
+/// - `content/.../JSC008_Myoko_1945_Bow_normal.dd0` → (`JSC008_Myoko_1945_Bow`, `_normal`)
+/// - `content/.../no_channel.dds` → (`no_channel`, "") if no channel suffix matches
+pub fn derive_texture_stem_and_channel(vfs_path: &str) -> (String, String) {
+    let leaf = vfs_path.rsplit_once('/').map(|(_, n)| n).unwrap_or(vfs_path);
+    let mut filename_stem = leaf.to_string();
+    for sfx in TEXTURE_MIP_SUFFIXES {
+        if let Some(s) = filename_stem.strip_suffix(sfx) {
+            filename_stem = s.to_string();
+            break;
+        }
+    }
+    for sfx in TEXTURE_CHANNEL_SUFFIXES {
+        if let Some(s) = filename_stem.strip_suffix(sfx) {
+            return (s.to_string(), (*sfx).to_string());
+        }
+    }
+    (filename_stem, String::new())
 }
 
 // ---------------------------------------------------------------------------
