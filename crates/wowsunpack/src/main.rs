@@ -536,6 +536,38 @@ enum Commands {
         #[arg(long)]
         hull: Option<String>,
     },
+
+    /// Walk a directory of WG-pack DDS files and emit glTF-conformant
+    /// siblings alongside non-conformant files:
+    ///
+    ///   `<stem>_n.dd?`  → `<stem>_normal.dd?` + `<stem>_nbmask.dd?`
+    ///   `<stem>_mg.dd?` → `<stem>_mr.dd?`
+    ///
+    /// Use case: player-authored content-SDK skin packs ship raw WG-pack
+    /// `_n` / `_mg` channel layouts that don't go through the toolkit's
+    /// VFS-extract pipeline (and therefore miss the implicit Phase B
+    /// swizzle that `--raw-dds-dir` runs on `export-ship` /
+    /// `export-model`). This subcommand exposes the same swizzle pass
+    /// for arbitrary directories.
+    ///
+    /// Idempotent: existing siblings are skipped. Other DDS files
+    /// (`_a`, `_ao`, decorative atlases) are untouched.
+    SwizzleDir {
+        /// Input directory containing WG-pack DDS files.
+        #[arg(long)]
+        input: PathBuf,
+
+        /// Output directory for the conformant siblings. Defaults to
+        /// `<input>` (in-place; siblings land beside the originals).
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+
+        /// Walk subdirectories. Without this only the top-level dir is
+        /// scanned. Recursive output mirrors the input tree under
+        /// `--out-dir` when provided.
+        #[arg(long)]
+        recursive: bool,
+    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, ValueEnum)]
@@ -1294,6 +1326,33 @@ fn run() -> Result<(), Report> {
                 parse_visual.as_deref(),
                 parse_material.as_deref(),
             )?;
+        }
+        Commands::SwizzleDir { input, out_dir, recursive } => {
+            // No VFS required — this is a pure on-disk transformation.
+            if !input.is_dir() {
+                bail!("input path is not a directory: {}", input.display());
+            }
+            let result = if recursive {
+                wowsunpack::export::texture::swizzle_dir_recursive(
+                    &input, out_dir.as_deref(),
+                )
+            } else {
+                wowsunpack::export::texture::swizzle_dir(
+                    &input, out_dir.as_deref(),
+                )
+            };
+            match result {
+                Ok((processed, written)) => {
+                    println!(
+                        "swizzle-dir: processed {processed} WG-pack source file(s), \
+                         wrote {written} conformant sibling(s){}",
+                        if let Some(o) = &out_dir {
+                            format!(" → {}", o.display())
+                        } else { String::new() }
+                    );
+                }
+                Err(e) => bail!("swizzle-dir failed: {e:?}"),
+            }
         }
     }
 

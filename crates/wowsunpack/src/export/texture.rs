@@ -18,6 +18,8 @@ pub enum TextureError {
     PngEncode(String),
     #[error("failed to encode DDS: {0}")]
     DdsEncode(String),
+    #[error("io error: {0}")]
+    IoError(String),
 }
 
 /// Force all alpha values to 255 in an RGBA8 PNG buffer.
@@ -1138,6 +1140,157 @@ pub fn split_wg_normal_dds(
 
 /// Try to load a texture for a model mesh, with TILEDLAND baking support.
 ///
+/// Walk an arbitrary directory of WG-pack DDS files (player-authored
+/// loose-mod skin packs are the canonical case) and emit glTF-conformant
+/// siblings alongside each non-conformant file:
+///
+///   `<stem>_n.dd?`  → `<stem>_normal.dd?` + `<stem>_nbmask.dd?`
+///   `<stem>_mg.dd?` → `<stem>_mr.dd?`
+///
+/// Other DDS files (`_a`, `_ao`, decorative atlases, etc.) are skipped.
+/// The directory walk is non-recursive — callers that need recursion
+/// pass each subdirectory separately or use `swizzle_dir_recursive`.
+///
+/// `output_dir` defaults to `input_dir` (in-place). Returns
+/// `(processed, written)`: how many `_n` / `_mg` source files were
+/// recognised, and how many sibling files were actually written
+/// (existing siblings are skipped — idempotent).
+///
+/// This is the bulk-disk counterpart to [`RawDdsDumper`]'s
+/// per-VFS-extract emit. The toolkit's `--raw-dds-dir` path on
+/// `export-ship` / `export-model` already runs the equivalent emit
+/// implicitly; the standalone `swizzle-dir` CLI subcommand exposes it
+/// for arbitrary directories of pre-extracted DDS bundles (e.g.
+/// content-SDK mod folders that bypass the VFS pipeline). See
+/// `tools/toolkit_integration/skins_and_camos.md` §4 in the pipeline
+/// repo for the loose-mod ingest context.
+pub fn swizzle_dir(
+    input_dir: &std::path::Path,
+    output_dir: Option<&std::path::Path>,
+) -> Result<(usize, usize), Report<TextureError>> {
+    let output_dir = output_dir.unwrap_or(input_dir);
+    let _ = std::fs::create_dir_all(output_dir);
+
+    let mut processed: usize = 0;
+    let mut written:   usize = 0;
+
+    let entries = std::fs::read_dir(input_dir)
+        .map_err(|e| {
+            Report::new(TextureError::IoError(format!(
+                "read_dir {} failed: {e}", input_dir.display()
+            )))
+        })?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() { continue; }
+
+        let filename = match path.file_name().and_then(|n| n.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // Identify the mip-level suffix (`.dd0` / `.dd1` / `.dd2` / `.dds`).
+        let mip_suffix = match DDS_MIP_SUFFIXES
+            .iter()
+            .find(|s| filename.to_lowercase().ends_with(*s))
+        {
+            Some(s) => *s,
+            None => continue,
+        };
+        let stem_no_mip = &filename[..filename.len() - mip_suffix.len()];
+
+        // Read source bytes.
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("  Warning: failed to read {}: {e}", path.display());
+                continue;
+            }
+        };
+
+        if let Some(stem) = stem_no_mip.strip_suffix("_n") {
+            processed += 1;
+            let normal_name = format!("{stem}_normal{mip_suffix}");
+            let mask_name   = format!("{stem}_nbmask{mip_suffix}");
+            let normal_out  = output_dir.join(&normal_name);
+            let mask_out    = output_dir.join(&mask_name);
+            let need_normal = !normal_out.exists();
+            let need_mask   = !mask_out.exists();
+            if !need_normal && !need_mask { continue; }
+            match split_wg_normal_dds(&bytes) {
+                Ok((normal_dds, mask_dds)) => {
+                    if need_normal {
+                        if let Err(e) = std::fs::write(&normal_out, &normal_dds) {
+                            eprintln!("  Warning: failed to write {}: {e}", normal_out.display());
+                        } else { written += 1; }
+                    }
+                    if need_mask {
+                        if let Err(e) = std::fs::write(&mask_out, &mask_dds) {
+                            eprintln!("  Warning: failed to write {}: {e}", mask_out.display());
+                        } else { written += 1; }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  Warning: failed to split WG normal {filename}: {e:?}"
+                    );
+                }
+            }
+        } else if let Some(stem) = stem_no_mip.strip_suffix("_mg") {
+            processed += 1;
+            let mr_name = format!("{stem}_mr{mip_suffix}");
+            let mr_out  = output_dir.join(&mr_name);
+            if mr_out.exists() { continue; }
+            match swizzle_wg_mg_dds_to_mr(&bytes) {
+                Ok(mr_dds) => {
+                    if let Err(e) = std::fs::write(&mr_out, &mr_dds) {
+                        eprintln!("  Warning: failed to write {}: {e}", mr_out.display());
+                    } else { written += 1; }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  Warning: failed to swizzle WG MG {filename}: {e:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok((processed, written))
+}
+
+/// Recursive variant of [`swizzle_dir`]. Walks `input_dir` and every
+/// subdirectory. When `output_dir` is provided the relative tree is
+/// preserved under it; when `None` siblings land in-place beside their
+/// originals.
+pub fn swizzle_dir_recursive(
+    input_dir: &std::path::Path,
+    output_dir: Option<&std::path::Path>,
+) -> Result<(usize, usize), Report<TextureError>> {
+    let mut total_processed: usize = 0;
+    let mut total_written:   usize = 0;
+
+    // Stack-based walk, deterministic per filesystem order.
+    let mut stack = vec![input_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let out_for_dir = output_dir.map(|root| {
+            let rel = dir.strip_prefix(input_dir).unwrap_or(std::path::Path::new(""));
+            root.join(rel)
+        });
+        let (p, w) = swizzle_dir(&dir, out_for_dir.as_deref())?;
+        total_processed += p;
+        total_written += w;
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() { stack.push(path); }
+            }
+        }
+    }
+    Ok((total_processed, total_written))
+}
+
 /// If assets.bin is available, first parses the MFM to check if it's a TILEDLAND
 /// terrain material. If so, bakes a composite albedo from the tile atlas + blend
 /// map (the correct rendering). Otherwise falls back to simple filename-based
