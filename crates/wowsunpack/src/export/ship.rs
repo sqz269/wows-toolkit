@@ -1623,17 +1623,27 @@ impl ShipModelContext {
             }
         }
 
-        // Dedupe globally at 1 cm on native-coord position.
-        let mut seen_positions: HashSet<(i64, i64, i64)> = HashSet::new();
+        // Dedupe globally at 1 cm on (p0_hash, native-coord position).
+        //
+        // Key includes `p0_hash` so distinct assets that happen to share
+        // a placement position within 1 cm don't collide — for example,
+        // ARP Takao Blue authors placements for `JM501_Searchlight_Arpeggio`,
+        // `JM502_Gun_Deck_2_Arpeggio`, etc. that the WG content pipeline
+        // co-locates within the dedupe quantum; a position-only key dropped
+        // every JM502/503/504/505 in favour of JM501. LOD duplicates of the
+        // SAME asset still collapse because they share both p0_hash and
+        // position.
+        let mut seen: HashSet<(u32, i64, i64, i64)> = HashSet::new();
         let mut candidates: Vec<serde_json::Value> = Vec::new();
         for (segment, pl) in &global_placements {
             let p = pl.position();
             let key = (
+                pl.p0_hash,
                 (p[0] * 100.0).round() as i64,
                 (p[1] * 100.0).round() as i64,
                 (p[2] * 100.0).round() as i64,
             );
-            if !seen_positions.insert(key) {
+            if !seen.insert(key) {
                 continue;
             }
             let metric = crate::models::skel_ext::to_metric_glft(pl.matrix);
