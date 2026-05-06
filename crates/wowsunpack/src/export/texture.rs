@@ -330,7 +330,16 @@ impl RawDdsDumper {
 /// MFM name suffixes that don't appear in texture filenames.
 ///
 /// E.g. MFM `AGM034_16in50_Mk7_skinned.mfm` → texture `AGM034_16in50_Mk7_camo_01.dds`.
-const MFM_STRIP_SUFFIXES: &[&str] = &["_skinned", "_wire", "_dead", "_blaze", "_alpha"];
+// `_emissive` covers MFMs whose .mfm name carries the emissive variant
+// suffix but whose `diffuseMap` references the base `..._a.dds` (no
+// emissive infix). Observed on ARP / Azur Lane / HSF crossover skins —
+// e.g. ARP Takao Red's `JSC508_..._Deck_house_emissive.mfm` references
+// `JSC508_..._Deck_house_a.dds` for the diffuse. Without stripping
+// `_emissive`, `load_base_albedo_bytes` searched for
+// `..._Deck_house_emissive_a.dds` (doesn't exist) or year-stripped
+// variants (don't help) and silently returned `None`, so the variant's
+// per-skin Deck_house diffuse never got dumped to disk.
+const MFM_STRIP_SUFFIXES: &[&str] = &["_skinned", "_wire", "_dead", "_blaze", "_alpha", "_emissive"];
 
 /// Strip a `_<year>` token (4 ASCII digits surrounded by `_` boundaries)
 /// from a stem, preserving anything after.
