@@ -123,9 +123,26 @@ pub struct SkelExtPlacement {
     pub record_count: u16,
     /// Index within the record's matrix array: 0..(count-1).
     pub matrix_index: u32,
-    /// Opaque per-placement identifier. Likely a hash of a content-pipeline
-    /// bone name; not yet reversed to asset IDs. Useful as a stable key for
-    /// cross-ship fingerprinting once a hash→asset_id database exists.
+    /// Per-placement identifier hash.
+    ///
+    /// Reversed 2026-05-06:
+    /// `p0_hash = Murmur3_x86_32(seed=0, "MP_<asset_id>[_INDEX_<n>]")`
+    /// where `MP_` is the WG content-pipeline "Mesh Placement" prefix and
+    /// `_INDEX_<n>` (1-based) disambiguates multiple instances of the same
+    /// asset on a hull section. Some Maya/Blender duplicates use `.001` /
+    /// `.002` suffixes instead.
+    ///
+    /// Verified end-to-end on ARP TAKAO BLUE/RED:
+    /// `MP_JM743_Searchlight_Red_Arpeggio` → `0xCA841EE4` (in RED skel_ext);
+    /// `MP_JM501_Searchlight_Arpeggio`     → `0x8F5530CF` (in BLUE skel_ext).
+    ///
+    /// Resolves the asset_id from a placement without needing a legacy
+    /// gmconvert scan: hash `MP_<asset_id>[_INDEX_<n>]` for every asset_id
+    /// in the VFS misc / gun / director / finder / radar / catapult corpus
+    /// and intersect with the observed p0 set.
+    ///
+    /// See `variant_ship_accessory_swap.md` in the pipeline repo for the
+    /// crack + empirical proof.
     pub p0_hash: u32,
     /// Parent skeleton node hash. Murmur3_32(seed=0) of the hull-skeleton
     /// bone name. E.g. [`SCENE_ROOT_HASH`] for "Scene Root".
