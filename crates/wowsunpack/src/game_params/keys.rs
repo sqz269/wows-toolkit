@@ -22,6 +22,7 @@ pub const COMP_HULL: &str = "hull";
 pub const COMP_ARTILLERY: &str = "artillery";
 pub const COMP_ATBA: &str = "atba";
 pub const COMP_AIR_DEFENSE: &str = "airDefense";
+pub const COMP_AIR_ARMAMENT: &str = "airArmament";
 pub const COMP_DIRECTORS: &str = "directors";
 pub const COMP_FINDERS: &str = "finders";
 pub const COMP_RADARS: &str = "radars";
@@ -48,6 +49,17 @@ pub enum ComponentType {
     Atba,
     #[cfg_attr(feature = "serde", serde(rename = "airDefense"))]
     AirDefense,
+    /// Aircraft armament: catapult mounts (HP_JC_*, HP_AC_*) carrying
+    /// `Vehicle.<Hull>_AirArmament.HP_*.model = .../<asset>.model`. The
+    /// catapult itself has GameParams `typeinfo.species: None,
+    /// type: 'Catapult'`, so it falls through to the placements-JSON
+    /// `accessories[]` section just like decorative mounts. Without
+    /// this enumeration entry the toolkit's mount walker skips
+    /// `*_AirArmament` entirely and the catapult HP transforms — which
+    /// already exist in the parent ship's `.visual` node tree — never
+    /// reach `placements.json`.
+    #[cfg_attr(feature = "serde", serde(rename = "airArmament"))]
+    AirArmament,
     #[cfg_attr(feature = "serde", serde(rename = "directors"))]
     Directors,
     #[cfg_attr(feature = "serde", serde(rename = "finders"))]
@@ -65,6 +77,7 @@ impl ComponentType {
         Self::Artillery,
         Self::Atba,
         Self::AirDefense,
+        Self::AirArmament,
         Self::Directors,
         Self::Finders,
         Self::Radars,
@@ -78,6 +91,7 @@ impl ComponentType {
             Self::Artillery => "artillery",
             Self::Atba => "atba",
             Self::AirDefense => "airDefense",
+            Self::AirArmament => "airArmament",
             Self::Directors => "directors",
             Self::Finders => "finders",
             Self::Radars => "radars",
@@ -93,6 +107,7 @@ impl std::fmt::Display for ComponentType {
             Self::Artillery => write!(f, "Main Battery"),
             Self::Atba => write!(f, "Secondaries"),
             Self::AirDefense => write!(f, "AA"),
+            Self::AirArmament => write!(f, "Air Armament"),
             Self::Directors => write!(f, "Directors"),
             Self::Finders => write!(f, "Finders"),
             Self::Radars => write!(f, "Radars"),
@@ -107,6 +122,7 @@ pub const ALL_COMPONENT_TYPES: &[&str] = &[
     COMP_ARTILLERY,
     COMP_ATBA,
     COMP_AIR_DEFENSE,
+    COMP_AIR_ARMAMENT,
     COMP_DIRECTORS,
     COMP_FINDERS,
     COMP_RADARS,
@@ -119,6 +135,7 @@ pub const MODEL_COMPONENT_TYPES: &[&str] = &[
     COMP_ARTILLERY,
     COMP_ATBA,
     COMP_AIR_DEFENSE,
+    COMP_AIR_ARMAMENT,
     COMP_DIRECTORS,
     COMP_FINDERS,
     COMP_RADARS,

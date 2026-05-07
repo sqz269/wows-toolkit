@@ -225,6 +225,16 @@ enum Commands {
         #[arg(long)]
         raw_dds_dir: Option<PathBuf>,
 
+        /// If set, write a per-material → per-slot texture-stem mapping
+        /// JSON alongside the GLB. Mirrors the `--material-mappings-json`
+        /// flag on `export-ship` but for a single sub-model. Lets
+        /// downstream consumers (accessory library builder) bind the
+        /// right texture per material on multi-mesh accessories
+        /// (directors / rangefinders / radar) where one dir contains
+        /// textures for several stems.
+        #[arg(long)]
+        material_mappings_json: Option<PathBuf>,
+
         /// List available camouflage texture schemes, then exit
         #[arg(long)]
         list_textures: bool,
@@ -1237,7 +1247,7 @@ fn run() -> Result<(), Report> {
             let file_data = read_file_data(&file, no_vfs, vfs.as_ref())?;
             run_geometry(&file_data, &file.to_string_lossy(), decode)?;
         }
-        Commands::ExportModel { file, output, lod, no_textures, damaged, all_render_sets, textures_dir, textures_uri_prefix, raw_dds_dir, list_textures, no_vfs } => {
+        Commands::ExportModel { file, output, lod, no_textures, damaged, all_render_sets, textures_dir, textures_uri_prefix, raw_dds_dir, material_mappings_json, list_textures, no_vfs } => {
             run_export_model(&ExportModelParams {
                 file: &file,
                 output: &output,
@@ -1248,6 +1258,7 @@ fn run() -> Result<(), Report> {
                 textures_dir: textures_dir.as_deref(),
                 textures_uri_prefix: textures_uri_prefix.as_deref(),
                 raw_dds_dir: raw_dds_dir.as_deref(),
+                material_mappings_json: material_mappings_json.as_deref(),
                 list_textures,
                 no_vfs,
                 vfs: vfs.as_ref(),
@@ -1721,6 +1732,7 @@ struct ExportModelParams<'a> {
     textures_dir: Option<&'a Path>,
     textures_uri_prefix: Option<&'a str>,
     raw_dds_dir: Option<&'a Path>,
+    material_mappings_json: Option<&'a Path>,
     list_textures: bool,
     no_vfs: bool,
     vfs: Option<&'a VfsPath>,
@@ -1729,7 +1741,8 @@ struct ExportModelParams<'a> {
 fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
     let ExportModelParams {
         file, output, lod, no_textures, damaged, all_render_sets,
-        textures_dir, textures_uri_prefix, raw_dds_dir, list_textures, no_vfs, vfs,
+        textures_dir, textures_uri_prefix, raw_dds_dir, material_mappings_json,
+        list_textures, no_vfs, vfs,
     } = *params;
     use wowsunpack::models::assets_bin;
 
@@ -1744,7 +1757,8 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
 
     export_one_model(
         file, output, lod, no_textures, damaged, all_render_sets,
-        textures_dir, textures_uri_prefix, raw_dds_dir, list_textures,
+        textures_dir, textures_uri_prefix, raw_dds_dir, material_mappings_json,
+        list_textures,
         no_vfs, vfs, db.as_ref(),
         /* verbose: */ true,
     )
@@ -1776,6 +1790,7 @@ fn export_one_model(
     textures_dir: Option<&Path>,
     textures_uri_prefix: Option<&str>,
     raw_dds_dir: Option<&Path>,
+    material_mappings_json: Option<&Path>,
     list_textures: bool,
     no_vfs: bool,
     vfs: Option<&VfsPath>,
@@ -1883,6 +1898,26 @@ fn export_one_model(
         let mut out_file = std::fs::File::create(output).context("Failed to create output file")?;
         gltf_export::export_glb(vp, &geom, db, lod, &texture_set, damaged, all_render_sets, &mut tex_out, &mut out_file)
             .context("Failed to export GLB")?;
+
+        // Material mappings JSON — per-material → per-slot stem table.
+        // Sub-model name defaults to the geometry stem (which equals the
+        // .model dir name in WG content layout).
+        if let Some(mm_path) = material_mappings_json {
+            let geom_stem = file
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let visual_path_str = visual_suffix.as_deref().unwrap_or("");
+            if let Some(parent) = mm_path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            wowsunpack::export::ship::write_model_material_mappings_json(
+                vp, db, &file_str, visual_path_str, &geom_stem, mm_path,
+            )?;
+            if verbose {
+                println!("  material mappings: {}", mm_path.display());
+            }
+        }
     } else {
         // 4. Fallback: raw geometry export (no visual available).
         if list_textures {
@@ -1932,6 +1967,8 @@ struct BatchItem {
     textures_dir: Option<PathBuf>,
     #[serde(default)]
     raw_dds_dir: Option<PathBuf>,
+    #[serde(default)]
+    material_mappings_json: Option<PathBuf>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1997,6 +2034,7 @@ fn run_batch_export_model(manifest_path: &Path, keep_going: bool, vfs: &VfsPath)
             item.textures_dir.as_deref(),
             tex_prefix,
             item.raw_dds_dir.as_deref(),
+            item.material_mappings_json.as_deref(),
             /* list_textures: */ false,
             /* no_vfs: */ false,
             Some(vfs),

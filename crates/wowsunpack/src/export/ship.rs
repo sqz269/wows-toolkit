@@ -1752,8 +1752,6 @@ impl ShipModelContext {
     /// name like `0xa1b2c3d4` so consumers don't lose data.
     #[cfg(feature = "json")]
     pub fn write_material_mappings_json(&self, path: &Path) -> Result<(), Report> {
-        use crate::models::material::PropertyType;
-        use crate::models::material::PropertyValue;
         use serde_json::json;
 
         let db = assets_bin::parse_assets_bin(&self.assets_bin_bytes)
@@ -1761,98 +1759,11 @@ impl ShipModelContext {
         let self_id_index = db.build_self_id_index();
 
         let mut material_entries: Vec<serde_json::Value> = Vec::new();
-
         for sub in &self.hull_parts {
-            let sub_name = sub.name.clone();
-            for rs in &sub.visual.render_sets {
-                if rs.material_mfm_path_id == 0 {
-                    continue;
-                }
-
-                let material_identifier = db
-                    .strings
-                    .get_string_by_id(rs.material_name_id)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("material_0x{:08X}", rs.material_name_id));
-
-                let render_set_name = db
-                    .strings
-                    .get_string_by_id(rs.name_id)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("rs_0x{:08X}", rs.name_id));
-
-                // Resolve MFM path + stem.
-                let Some(&mfm_path_idx) = self_id_index.get(&rs.material_mfm_path_id) else {
-                    continue;
-                };
-                let mfm_full_path = db.reconstruct_path(mfm_path_idx, &self_id_index);
-                let mfm_leaf = &db.paths_storage[mfm_path_idx].name;
-                let mfm_stem = mfm_leaf.strip_suffix(".mfm").unwrap_or(mfm_leaf).to_string();
-
-                // Parse the MFM and walk every texture-typed property.
-                let mat = match texture::parse_mfm_from_db(&db, rs.material_mfm_path_id) {
-                    Some(m) => m,
-                    None => {
-                        // MFM didn't parse (corrupt or non-MFM blob index).
-                        // Emit the entry with empty textures so consumers
-                        // can still see the material exists.
-                        material_entries.push(json!({
-                            "material_identifier": material_identifier,
-                            "sub_model":           sub_name,
-                            "mfm_stem":            mfm_stem,
-                            "mfm_path":            mfm_full_path,
-                            "shader_id":           serde_json::Value::Null,
-                            "render_set":          render_set_name,
-                            "skinned":             rs.skinned,
-                            "textures":            serde_json::Map::new(),
-                            "parse_error":        true,
-                        }));
-                        continue;
-                    }
-                };
-
-                let mut textures_obj = serde_json::Map::new();
-                for prop in &mat.properties {
-                    if prop.property_type != PropertyType::Texture {
-                        continue;
-                    }
-                    let hash = match &prop.value {
-                        Some(PropertyValue::Texture(h)) if *h != 0 => *h,
-                        _ => continue,
-                    };
-                    let Some(&tex_idx) = self_id_index.get(&hash) else {
-                        continue;
-                    };
-                    let vfs_path = db.reconstruct_path(tex_idx, &self_id_index);
-                    let (stem, channel) = derive_texture_stem_and_channel(&vfs_path);
-
-                    let slot_name = match prop.name {
-                        Some(n) => n.to_string(),
-                        None => format!("0x{:08x}", prop.name_hash),
-                    };
-
-                    textures_obj.insert(
-                        slot_name,
-                        json!({
-                            "stem":     stem,
-                            "channel":  channel,
-                            "vfs_path": vfs_path,
-                            "hash":     format!("0x{:016x}", hash),
-                        }),
-                    );
-                }
-
-                material_entries.push(json!({
-                    "material_identifier": material_identifier,
-                    "sub_model":           sub_name,
-                    "mfm_stem":            mfm_stem,
-                    "mfm_path":            mfm_full_path,
-                    "shader_id":           format!("0x{:08x}", mat.shader_id),
-                    "render_set":          render_set_name,
-                    "skinned":             rs.skinned,
-                    "textures":            textures_obj,
-                }));
-            }
+            let entries = build_material_entries_for_visual(
+                &sub.visual, &db, &self_id_index, &sub.name,
+            );
+            material_entries.extend(entries);
         }
 
         let now = format_rfc3339_utc(SystemTime::now());
@@ -2254,6 +2165,168 @@ pub fn derive_texture_stem_and_channel(vfs_path: &str) -> (String, String) {
 // ---------------------------------------------------------------------------
 // Shared helpers (pub so main.rs export-model can use them too)
 // ---------------------------------------------------------------------------
+
+/// Build the per-render-set material entries that ship the material
+/// mappings JSON, for one visual + one ``sub_model`` label. Used by both
+/// the per-ship writer (looping over `hull_parts`) and the per-model
+/// writer in `export-model` (single visual).
+///
+/// Walks each render set whose `material_mfm_path_id != 0`, parses the
+/// referenced MFM, and emits a `{material_identifier, sub_model,
+/// mfm_stem, mfm_path, shader_id, render_set, skinned, textures}`
+/// entry. The `textures` map keys are MFM property names (e.g.
+/// `diffuseMap`, `normalMap`, `metallicGlossMap`); values carry the
+/// resolved `stem`, `channel`, `vfs_path`, and `hash` so consumers can
+/// bind textures per-material instead of falling back to a flat
+/// directory walk.
+#[cfg(feature = "json")]
+pub fn build_material_entries_for_visual(
+    vp: &VisualPrototype,
+    db: &PrototypeDatabase<'_>,
+    self_id_index: &HashMap<u64, usize>,
+    sub_model: &str,
+) -> Vec<serde_json::Value> {
+    use crate::models::material::PropertyType;
+    use crate::models::material::PropertyValue;
+    use serde_json::json;
+
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+
+    for rs in &vp.render_sets {
+        if rs.material_mfm_path_id == 0 {
+            continue;
+        }
+
+        let material_identifier = db
+            .strings
+            .get_string_by_id(rs.material_name_id)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("material_0x{:08X}", rs.material_name_id));
+
+        let render_set_name = db
+            .strings
+            .get_string_by_id(rs.name_id)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("rs_0x{:08X}", rs.name_id));
+
+        let Some(&mfm_path_idx) = self_id_index.get(&rs.material_mfm_path_id) else {
+            continue;
+        };
+        let mfm_full_path = db.reconstruct_path(mfm_path_idx, self_id_index);
+        let mfm_leaf = &db.paths_storage[mfm_path_idx].name;
+        let mfm_stem = mfm_leaf.strip_suffix(".mfm").unwrap_or(mfm_leaf).to_string();
+
+        let mat = match texture::parse_mfm_from_db(db, rs.material_mfm_path_id) {
+            Some(m) => m,
+            None => {
+                entries.push(json!({
+                    "material_identifier": material_identifier,
+                    "sub_model":           sub_model,
+                    "mfm_stem":            mfm_stem,
+                    "mfm_path":            mfm_full_path,
+                    "shader_id":           serde_json::Value::Null,
+                    "render_set":          render_set_name,
+                    "skinned":             rs.skinned,
+                    "textures":            serde_json::Map::new(),
+                    "parse_error":         true,
+                }));
+                continue;
+            }
+        };
+
+        let mut textures_obj = serde_json::Map::new();
+        for prop in &mat.properties {
+            if prop.property_type != PropertyType::Texture {
+                continue;
+            }
+            let hash = match &prop.value {
+                Some(PropertyValue::Texture(h)) if *h != 0 => *h,
+                _ => continue,
+            };
+            let Some(&tex_idx) = self_id_index.get(&hash) else {
+                continue;
+            };
+            let vfs_path = db.reconstruct_path(tex_idx, self_id_index);
+            let (stem, channel) = derive_texture_stem_and_channel(&vfs_path);
+
+            let slot_name = match prop.name {
+                Some(n) => n.to_string(),
+                None => format!("0x{:08x}", prop.name_hash),
+            };
+
+            textures_obj.insert(
+                slot_name,
+                json!({
+                    "stem":     stem,
+                    "channel":  channel,
+                    "vfs_path": vfs_path,
+                    "hash":     format!("0x{:016x}", hash),
+                }),
+            );
+        }
+
+        entries.push(json!({
+            "material_identifier": material_identifier,
+            "sub_model":           sub_model,
+            "mfm_stem":            mfm_stem,
+            "mfm_path":            mfm_full_path,
+            "shader_id":           format!("0x{:08x}", mat.shader_id),
+            "render_set":          render_set_name,
+            "skinned":             rs.skinned,
+            "textures":            textures_obj,
+        }));
+    }
+
+    entries
+}
+
+/// Write a single-model material mappings JSON for `export-model`.
+/// Same `materials[]` shape as `write_material_mappings_json` (per-ship)
+/// but with a `model { geometry_path, visual_path }` header instead of
+/// the `ship { … }` block. `sub_model` is typically the model dir name
+/// (e.g. ``JD570_Director_Type_94_1_Arpeggio``); accessory-library
+/// consumers key off it for asset_id correlation.
+#[cfg(feature = "json")]
+pub fn write_model_material_mappings_json(
+    vp: &VisualPrototype,
+    db: &PrototypeDatabase<'_>,
+    geometry_vfs_path: &str,
+    visual_vfs_path: &str,
+    sub_model: &str,
+    out_path: &Path,
+) -> Result<(), Report> {
+    use serde_json::json;
+
+    let self_id_index = db.build_self_id_index();
+    let entries = build_material_entries_for_visual(vp, db, &self_id_index, sub_model);
+
+    let now = format_rfc3339_utc(SystemTime::now());
+    let toolkit_version = env!("CARGO_PKG_VERSION");
+
+    let manifest = json!({
+        "schema_version": 1,
+        "model": {
+            "geometry_path": geometry_vfs_path,
+            "visual_path":   visual_vfs_path,
+            "sub_model":     sub_model,
+        },
+        "pipeline": {
+            "toolkit_version": toolkit_version,
+            "generated_at":    now,
+        },
+        "materials": entries,
+    });
+
+    let file = std::fs::File::create(out_path).context_with(|| {
+        format!(
+            "Failed to create model material mappings JSON at {}",
+            out_path.display()
+        )
+    })?;
+    serde_json::to_writer_pretty(std::io::BufWriter::new(file), &manifest)
+        .map_err(|e| rootcause::report!("Failed to serialize model material mappings JSON: {e}"))?;
+    Ok(())
+}
 
 /// Resolved MFM info: stem (leaf name without `.mfm`) and full VFS path.
 ///
