@@ -1023,19 +1023,48 @@ impl ShipAssets {
             };
 
             // The turret model's Rotate_Y_BlendBone encodes its rest-pose
-            // facing direction. To place the model correctly at the hardpoint
-            // we undo this rest-pose rotation so the hardpoint's own orientation
-            // takes over: visual_transform = hp_transform * inverse(bone_rotation).
-            // Armor geometry is already aligned with the hardpoint, so it uses
-            // the raw transform without rotation correction.
+            // facing direction. WG bakes a Z-mirror (`diag(1,1,-1)`,
+            // det = -1) into gun bones — a Maya/Blender export quirk
+            // that we MUST undo so the gun's local +Z aligns with the
+            // hardpoint's forward; otherwise the muzzle ends up facing
+            // backwards. We post-multiply by `inverse(bone_local)` to
+            // strip it out:
+            //     visual_transform = hp_transform * inverse(bone_rotation).
+            // Armor geometry is already aligned with the hardpoint, so
+            // it uses the raw transform without any correction.
+            //
+            // Catapults (HP_JC_* / HP_AC_*, GameParams `typeinfo.type ==
+            // "Catapult"`, no MountSpecies value) need a different rule:
+            // their parent-ship `.visual` HPs carry a Ry(±90°) baked in,
+            // and the catapult model's `Rotate_Y_BlendBone` has the
+            // same `diag(1,1,-1)` as guns (det = -1). Following the
+            // gun rule produces a Ry(±90°) net rotation — catapult
+            // rails perpendicular to ship-forward — but the rendered
+            // game places them ALONG ship-forward (legacy gmconvert
+            // harvest captures identity). Empirically, catapults render
+            // correctly when we keep ONLY the translation from the
+            // composed HP transform and discard its rotation. Per-HP
+            // rotation that's actually meaningful (catapult yaw for
+            // launch) is animated at runtime; the rest pose is identity
+            // ship-forward.
             let armor_transform = Some(hp_transform);
             let turret_visual = &turret_models[model_idx].visual;
-            let yaw_correction = turret_visual
-                .find_node_local_matrix("Rotate_Y_BlendBone", &db.strings)
-                .map(|bone_local| mat4_rotation_inverse(&bone_local));
-            let base_transform = match yaw_correction {
-                Some(inv) => mat4_mul_col_major(&hp_transform, &inv),
-                None => hp_transform,
+            let is_catapult = mi.model_path().contains("/catapult/");
+            let base_transform = if is_catapult {
+                // Translation-only — strip rotation/scale, keep position.
+                let mut t = IDENTITY_4X4;
+                t[12] = hp_transform[12];
+                t[13] = hp_transform[13];
+                t[14] = hp_transform[14];
+                t
+            } else {
+                let yaw_correction = turret_visual
+                    .find_node_local_matrix("Rotate_Y_BlendBone", &db.strings)
+                    .map(|bone_local| mat4_rotation_inverse(&bone_local));
+                match yaw_correction {
+                    Some(inv) => mat4_mul_col_major(&hp_transform, &inv),
+                    None => hp_transform,
+                }
             };
 
             let visual_transform = Some(base_transform);

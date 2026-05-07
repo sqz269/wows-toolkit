@@ -17,7 +17,23 @@ pub const UC_TYPE_HULL: &str = "_Hull";
 pub const UC_TYPE_ARTILLERY: &str = "_Artillery";
 pub const UC_TYPE_TORPEDOES: &str = "_Torpedoes";
 
-// Component type keys (inside "components" dict)
+// Component type keys (inside "components" dict).
+//
+// All known sub-keys WG uses across the corpus: 28 of them. The 13
+// listed here are the ones that carry actual `HP_<id>.{model,armor,…}`
+// hardpoints in any production / event ship. The other 15
+// (`abilities` for non-mount ones, `engine`, `airSupport`,
+// `flightControl`, `fighter`, `diveBomber`, `torpedoBomber`,
+// `skipBomber`, `pinger`, `wcs`, `specials`, `innateSkills`,
+// `axisLaser`, `chargeLasers`, `waves`) are gameplay-only —
+// modifiers, plane definitions, weapon-control trees, water effects,
+// etc. — and were verified to never expose `HP_*` subkeys in any
+// Vehicle's component dict, so adding them here would be no-ops.
+//
+// `abilities` IS in this list because event ships (Amagi H2020,
+// raider consumable variants) use `A_Abilities.HP_XGS_*` to anchor
+// special-ability launchers. They have model paths and route to
+// `accessories[]` via species=None.
 pub const COMP_HULL: &str = "hull";
 pub const COMP_ARTILLERY: &str = "artillery";
 pub const COMP_ATBA: &str = "atba";
@@ -27,6 +43,10 @@ pub const COMP_DIRECTORS: &str = "directors";
 pub const COMP_FINDERS: &str = "finders";
 pub const COMP_RADARS: &str = "radars";
 pub const COMP_TORPEDOES: &str = "torpedoes";
+pub const COMP_DEPTH_CHARGES: &str = "depthCharges";
+pub const COMP_MISSILES: &str = "missiles";
+pub const COMP_PHASER_LASERS: &str = "phaserLasers";
+pub const COMP_ABILITIES: &str = "abilities";
 
 /// Typed representation of component type keys.
 ///
@@ -53,11 +73,7 @@ pub enum ComponentType {
     /// `Vehicle.<Hull>_AirArmament.HP_*.model = .../<asset>.model`. The
     /// catapult itself has GameParams `typeinfo.species: None,
     /// type: 'Catapult'`, so it falls through to the placements-JSON
-    /// `accessories[]` section just like decorative mounts. Without
-    /// this enumeration entry the toolkit's mount walker skips
-    /// `*_AirArmament` entirely and the catapult HP transforms — which
-    /// already exist in the parent ship's `.visual` node tree — never
-    /// reach `placements.json`.
+    /// `accessories[]` section just like decorative mounts.
     #[cfg_attr(feature = "serde", serde(rename = "airArmament"))]
     AirArmament,
     #[cfg_attr(feature = "serde", serde(rename = "directors"))]
@@ -68,6 +84,30 @@ pub enum ComponentType {
     Radars,
     #[cfg_attr(feature = "serde", serde(rename = "torpedoes"))]
     Torpedoes,
+    /// Depth charge throwers + roller racks
+    /// (`Vehicle.<Hull>_DepthChargeGuns.HP_AGB_*`,
+    /// `HP_AGT_*`, `HP_BGT_*`, etc.). DDs and CLs use these on the
+    /// fantail. `typeinfo.species == "DCharge"` routes them to
+    /// placements-JSON `accessories[]` (no dedicated typed section yet).
+    #[cfg_attr(feature = "serde", serde(rename = "depthCharges"))]
+    DepthCharges,
+    /// Modern missile launchers (Mk 141 Harpoon canisters, etc.)
+    /// — `Vehicle.<Hull>_Missiles.HP_AGR_*`. Carries
+    /// `typeinfo.species == "MissileGun"`. Modern / sci-fi event ships
+    /// (Aegir, USN guided-missile destroyers).
+    #[cfg_attr(feature = "serde", serde(rename = "missiles"))]
+    Missiles,
+    /// Star Trek event ships (`PXSB017_France_Borg_V2.A1_Lasers`):
+    /// phaser laser turrets that re-skin standard `HP_FGM_*` mounts
+    /// with `typeinfo.species == "Main"` so they show up as turrets.
+    #[cfg_attr(feature = "serde", serde(rename = "phaserLasers"))]
+    PhaserLasers,
+    /// Event-ship special-ability HPs (`A_Abilities.HP_XGS_*` on the
+    /// Amagi H2020 raider variant). Model is set but typeinfo carries
+    /// `type=None / species=None`, so they land in `accessories[]`.
+    /// Harmless to enumerate on production ships (no `HP_*` keys).
+    #[cfg_attr(feature = "serde", serde(rename = "abilities"))]
+    Abilities,
 }
 
 impl ComponentType {
@@ -82,6 +122,10 @@ impl ComponentType {
         Self::Finders,
         Self::Radars,
         Self::Torpedoes,
+        Self::DepthCharges,
+        Self::Missiles,
+        Self::PhaserLasers,
+        Self::Abilities,
     ];
 
     /// The raw string key used in GameParams dictionaries.
@@ -96,6 +140,10 @@ impl ComponentType {
             Self::Finders => "finders",
             Self::Radars => "radars",
             Self::Torpedoes => "torpedoes",
+            Self::DepthCharges => "depthCharges",
+            Self::Missiles => "missiles",
+            Self::PhaserLasers => "phaserLasers",
+            Self::Abilities => "abilities",
         }
     }
 }
@@ -112,6 +160,10 @@ impl std::fmt::Display for ComponentType {
             Self::Finders => write!(f, "Finders"),
             Self::Radars => write!(f, "Radars"),
             Self::Torpedoes => write!(f, "Torpedoes"),
+            Self::DepthCharges => write!(f, "Depth Charges"),
+            Self::Missiles => write!(f, "Missiles"),
+            Self::PhaserLasers => write!(f, "Phaser Lasers"),
+            Self::Abilities => write!(f, "Abilities"),
         }
     }
 }
@@ -127,6 +179,10 @@ pub const ALL_COMPONENT_TYPES: &[&str] = &[
     COMP_FINDERS,
     COMP_RADARS,
     COMP_TORPEDOES,
+    COMP_DEPTH_CHARGES,
+    COMP_MISSILES,
+    COMP_PHASER_LASERS,
+    COMP_ABILITIES,
 ];
 
 /// Component types that have 3D models (mounted on hull hardpoints).
@@ -140,6 +196,10 @@ pub const MODEL_COMPONENT_TYPES: &[&str] = &[
     COMP_FINDERS,
     COMP_RADARS,
     COMP_TORPEDOES,
+    COMP_DEPTH_CHARGES,
+    COMP_MISSILES,
+    COMP_PHASER_LASERS,
+    COMP_ABILITIES,
 ];
 
 // Data field keys
