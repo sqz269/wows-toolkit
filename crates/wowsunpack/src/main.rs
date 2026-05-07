@@ -235,6 +235,17 @@ enum Commands {
         #[arg(long)]
         material_mappings_json: Option<PathBuf>,
 
+        /// If set, write the per-asset `.skel_ext` placement candidates
+        /// JSON alongside the GLB. Mirrors the
+        /// `--skel-ext-candidates-json` flag on `export-ship` but for a
+        /// single accessory. Picks up the sibling `<stem>.skel_ext` next
+        /// to the input `.geometry` (no-op if absent). Used by the
+        /// pipeline to discover accessory-attached miscs (rangefinders,
+        /// periscopes, ammo boxes, …) bundled into turrets / secondaries
+        /// / directors / catapults / radars at runtime by the WG engine.
+        #[arg(long)]
+        skel_ext_candidates_json: Option<PathBuf>,
+
         /// List available camouflage texture schemes, then exit
         #[arg(long)]
         list_textures: bool,
@@ -1247,7 +1258,7 @@ fn run() -> Result<(), Report> {
             let file_data = read_file_data(&file, no_vfs, vfs.as_ref())?;
             run_geometry(&file_data, &file.to_string_lossy(), decode)?;
         }
-        Commands::ExportModel { file, output, lod, no_textures, damaged, all_render_sets, textures_dir, textures_uri_prefix, raw_dds_dir, material_mappings_json, list_textures, no_vfs } => {
+        Commands::ExportModel { file, output, lod, no_textures, damaged, all_render_sets, textures_dir, textures_uri_prefix, raw_dds_dir, material_mappings_json, skel_ext_candidates_json, list_textures, no_vfs } => {
             run_export_model(&ExportModelParams {
                 file: &file,
                 output: &output,
@@ -1259,6 +1270,7 @@ fn run() -> Result<(), Report> {
                 textures_uri_prefix: textures_uri_prefix.as_deref(),
                 raw_dds_dir: raw_dds_dir.as_deref(),
                 material_mappings_json: material_mappings_json.as_deref(),
+                skel_ext_candidates_json: skel_ext_candidates_json.as_deref(),
                 list_textures,
                 no_vfs,
                 vfs: vfs.as_ref(),
@@ -1733,6 +1745,7 @@ struct ExportModelParams<'a> {
     textures_uri_prefix: Option<&'a str>,
     raw_dds_dir: Option<&'a Path>,
     material_mappings_json: Option<&'a Path>,
+    skel_ext_candidates_json: Option<&'a Path>,
     list_textures: bool,
     no_vfs: bool,
     vfs: Option<&'a VfsPath>,
@@ -1742,6 +1755,7 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
     let ExportModelParams {
         file, output, lod, no_textures, damaged, all_render_sets,
         textures_dir, textures_uri_prefix, raw_dds_dir, material_mappings_json,
+        skel_ext_candidates_json,
         list_textures, no_vfs, vfs,
     } = *params;
     use wowsunpack::models::assets_bin;
@@ -1758,6 +1772,7 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
     export_one_model(
         file, output, lod, no_textures, damaged, all_render_sets,
         textures_dir, textures_uri_prefix, raw_dds_dir, material_mappings_json,
+        skel_ext_candidates_json,
         list_textures,
         no_vfs, vfs, db.as_ref(),
         /* verbose: */ true,
@@ -1791,6 +1806,7 @@ fn export_one_model(
     textures_uri_prefix: Option<&str>,
     raw_dds_dir: Option<&Path>,
     material_mappings_json: Option<&Path>,
+    skel_ext_candidates_json: Option<&Path>,
     list_textures: bool,
     no_vfs: bool,
     vfs: Option<&VfsPath>,
@@ -1918,6 +1934,52 @@ fn export_one_model(
                 println!("  material mappings: {}", mm_path.display());
             }
         }
+
+        // Skel_ext candidates JSON — accessory-attached misc placements.
+        //
+        // For an accessory at `<dir>/<stem>.geometry`, the sibling
+        // `<stem>.skel_ext` carries Mesh-Placement records describing
+        // miscs that the WG runtime composes onto this asset (rangefinder
+        // on a turret roof, periscope on a director housing, ammunition
+        // boxes around a gun, etc.). Most decorative accessories don't
+        // carry one — silent no-op when absent.
+        //
+        // The model_dir for the toolkit's `find_skel_ext_paths` is the
+        // accessory stem itself (e.g. "AGM034_16in50_Mk7"). The needle
+        // form `/AGM034_16in50_Mk7/` matches the sibling skel_ext under
+        // `content/gameplay/usa/gun/main/AGM034_16in50_Mk7/...`.
+        if let Some(sx_path) = skel_ext_candidates_json {
+            let geom_stem = file
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let self_id_index = db.build_self_id_index();
+            let paths = wowsunpack::export::ship::find_skel_ext_paths(
+                db, &self_id_index, &geom_stem,
+            );
+            let files = wowsunpack::export::ship::load_skel_ext_files(vfs, &paths)?;
+            if let Some(parent) = sx_path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            wowsunpack::export::ship::write_skel_ext_candidates_json(
+                &files,
+                &wowsunpack::export::ship::SkelExtSubject::Model {
+                    stem: &geom_stem,
+                    display_name: None,
+                },
+                sx_path,
+            )?;
+            if verbose {
+                if files.is_empty() {
+                    println!("  skel_ext candidates: {} (empty — no sibling .skel_ext)", sx_path.display());
+                } else {
+                    println!("  skel_ext candidates: {} ({} segment file{})",
+                        sx_path.display(),
+                        files.len(),
+                        if files.len() == 1 { "" } else { "s" });
+                }
+            }
+        }
     } else {
         // 4. Fallback: raw geometry export (no visual available).
         if list_textures {
@@ -1969,6 +2031,8 @@ struct BatchItem {
     raw_dds_dir: Option<PathBuf>,
     #[serde(default)]
     material_mappings_json: Option<PathBuf>,
+    #[serde(default)]
+    skel_ext_candidates_json: Option<PathBuf>,
 }
 
 #[derive(serde::Deserialize)]
@@ -2035,6 +2099,7 @@ fn run_batch_export_model(manifest_path: &Path, keep_going: bool, vfs: &VfsPath)
             tex_prefix,
             item.raw_dds_dir.as_deref(),
             item.material_mappings_json.as_deref(),
+            item.skel_ext_candidates_json.as_deref(),
             /* list_textures: */ false,
             /* no_vfs: */ false,
             Some(vfs),
