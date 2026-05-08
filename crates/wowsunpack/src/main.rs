@@ -608,6 +608,28 @@ enum Commands {
         #[arg(long)]
         recursive: bool,
     },
+    /// DIAGNOSTIC: dump local + composed-world transforms for a list of
+    /// bone names from a `.visual` prototype. Used to verify the
+    /// rest-pose offsets that skel_ext consumers must compose.
+    ///
+    /// Resolves the .visual sibling of the supplied .geometry path
+    /// (replacing the trailing `.geometry` extension).
+    DumpBones {
+        /// Path to a `.geometry` file in the VFS (the .visual sibling
+        /// is auto-derived). Example:
+        /// `content/gameplay/usa/gun/main/AGM034_16in50_Mk7/AGM034_16in50_Mk7.geometry`
+        file: PathBuf,
+
+        /// Bone names to dump. Defaults to a curated list:
+        /// "Scene Root", "Root", "Rotate_Y", "Rotate_Y_BlendBone",
+        /// "Rotate_X". Multiple --bone flags accepted.
+        #[arg(long)]
+        bone: Vec<String>,
+
+        /// Print every node in the visual instead of just --bone matches.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, ValueEnum)]
@@ -1370,6 +1392,12 @@ fn run() -> Result<(), Report> {
                 parse_material.as_deref(),
             )?;
         }
+        Commands::DumpBones { file, bone, all } => {
+            let Some(vfs) = &vfs else {
+                bail!("VFS required for dump-bones. Use --game-dir to specify a game install.");
+            };
+            run_dump_bones(vfs, &file, &bone, all)?;
+        }
         Commands::SwizzleDir { input, out_dir, recursive } => {
             // No VFS required — this is a pure on-disk transformation.
             if !input.is_dir() {
@@ -1961,6 +1989,14 @@ fn export_one_model(
             if let Some(parent) = sx_path.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
+            // Pass the asset's visual + strings so the writer can
+            // compose each placement's parent-bone rest pose into the
+            // emitted matrix (schema_version=2). Without this, the
+            // writer falls back to legacy (schema_version=1) emit
+            // and consumers must reconstruct bone composition + the
+            // post-multiplied Ry(180°) themselves. See
+            // `tools/reference/investigations/skel_ext_transform_deepdive_handoff.md`
+            // for the full derivation.
             wowsunpack::export::ship::write_skel_ext_candidates_json(
                 &files,
                 &wowsunpack::export::ship::SkelExtSubject::Model {
@@ -1968,6 +2004,7 @@ fn export_one_model(
                     display_name: None,
                 },
                 sx_path,
+                Some((vp, &db.strings)),
             )?;
             if verbose {
                 if files.is_empty() {
@@ -3309,6 +3346,95 @@ fn main() -> Result<(), Report> {
     run()?;
 
     println!("Finished in {} seconds", (Instant::now() - timestamp).as_secs_f32());
+
+    Ok(())
+}
+
+/// DIAGNOSTIC: dump local + composed-world matrices for a list of bone
+/// names (or every node) from a `.visual`. Used to verify rest-pose
+/// offsets that skel_ext consumers must compose.
+fn run_dump_bones(vfs: &VfsPath, file: &Path, bones: &[String], all: bool) -> Result<(), Report> {
+    use wowsunpack::models::assets_bin;
+    use wowsunpack::models::visual;
+
+    // Load assets.bin out of the VFS (owns the buffer; db borrows from it).
+    let assets_bin_data = load_assets_bin(vfs)?;
+    let db = assets_bin::parse_assets_bin(&assets_bin_data)?;
+
+    // Derive .visual sibling path.
+    let file_str = file.to_string_lossy().to_string();
+    let visual_suffix = match file_str.strip_suffix(".geometry") {
+        Some(stem) => format!("{stem}.visual"),
+        None => bail!("Path must end with .geometry: {}", file_str),
+    };
+
+    let self_id_index = db.build_self_id_index();
+    let (vis_location, vis_full_path) = db.resolve_path(&visual_suffix, &self_id_index)?;
+    if vis_location.blob_index != 1 {
+        bail!(
+            "Path {} resolved to blob {} (not VisualPrototype blob 1)",
+            visual_suffix,
+            vis_location.blob_index
+        );
+    }
+    let vis_data = db
+        .get_prototype_data(vis_location, visual::VISUAL_ITEM_SIZE)
+        .context("Failed to get visual prototype data")?;
+    let vp = visual::parse_visual(vis_data).context("Failed to parse VisualPrototype")?;
+
+    println!("=== VisualPrototype: {vis_full_path} ===");
+    println!("  Nodes: {}", vp.nodes.name_ids.len());
+
+    let strings = &db.strings;
+
+    // Resolve names of every node up-front so we can print bone trees.
+    let names: Vec<String> = vp.nodes.name_ids.iter().map(|&id|
+        strings.get_string_by_id(id).unwrap_or("<unknown>").to_string()
+    ).collect();
+
+    let print_node = |i: usize, name: &str| {
+        let parent = vp.nodes.parent_ids[i];
+        let local = vp.nodes.matrices[i].0;
+        let world = vp.find_hardpoint_transform(name, strings).unwrap_or(local);
+        let parent_name = if parent == 0xFFFF || (parent as usize) >= names.len() {
+            "(none)".to_string()
+        } else {
+            names[parent as usize].clone()
+        };
+        println!("  --- node[{}] \"{}\" (parent: {}) ---", i, name, parent_name);
+        println!("  local (column-major, last col = translation):");
+        for col in 0..4 {
+            let row: Vec<String> = (0..4).map(|r| format!("{:>10.5}", local[col*4 + r])).collect();
+            println!("    [col {}] {}", col, row.join("  "));
+        }
+        println!("  composed-to-root translation: ({:.5}, {:.5}, {:.5})", world[12], world[13], world[14]);
+    };
+
+    if all {
+        for (i, name) in names.iter().enumerate() {
+            print_node(i, name);
+        }
+        return Ok(());
+    }
+
+    let target_bones: Vec<String> = if bones.is_empty() {
+        vec![
+            "Scene Root".into(),
+            "Root".into(),
+            "Rotate_Y".into(),
+            "Rotate_Y_BlendBone".into(),
+            "Rotate_X".into(),
+        ]
+    } else {
+        bones.to_vec()
+    };
+
+    for b in &target_bones {
+        match vp.find_node_index_by_name(b, strings) {
+            Some(idx) => print_node(idx as usize, b),
+            None => println!("  --- bone \"{}\": NOT FOUND ---", b),
+        }
+    }
 
     Ok(())
 }

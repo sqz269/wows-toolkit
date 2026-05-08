@@ -443,6 +443,53 @@ impl VisualPrototype {
         }
         None
     }
+
+    /// Find the node index whose Murmur3_32(seed=0) name hash matches.
+    ///
+    /// `.skel_ext` placement records carry a `p1_hash` that's the
+    /// Murmur3_32(seed=0) hash of the parent bone's name. This helper
+    /// resolves that hash to a node index without requiring callers to
+    /// know the source name string (they may not — only the hash is
+    /// stored in the binary).
+    pub fn find_node_index_by_hash(
+        &self,
+        hash: u32,
+        strings: &StringsSection<'_>,
+    ) -> Option<u16> {
+        use crate::models::material::murmur3_32;
+        for (i, &name_id) in self.nodes.name_map_name_ids.iter().enumerate() {
+            if let Some(resolved) = strings.get_string_by_id(name_id)
+                && murmur3_32(resolved.as_bytes(), 0) == hash
+            {
+                return Some(self.nodes.name_map_node_ids[i]);
+            }
+        }
+        None
+    }
+
+    /// Compose the bone rest-pose chain from root to a given node, by
+    /// hash. Returns the node's world-relative-to-root local rest-pose
+    /// transform (column-major affine).
+    ///
+    /// Returns `None` if no node matches the hash.
+    pub fn find_composed_matrix_by_hash(
+        &self,
+        hash: u32,
+        strings: &StringsSection<'_>,
+    ) -> Option<[f32; 16]> {
+        let node_idx = self.find_node_index_by_hash(hash, strings)?;
+        let mut result = self.nodes.matrices[node_idx as usize].0;
+        let mut current = node_idx;
+        loop {
+            let parent = self.nodes.parent_ids[current as usize];
+            if parent == 0xFFFF || parent as usize >= self.nodes.matrices.len() {
+                break;
+            }
+            result = mat4_mul(&self.nodes.matrices[parent as usize].0, &result);
+            current = parent;
+        }
+        Some(result)
+    }
 }
 
 /// Multiply two 4x4 matrices (column-major order, as stored in BigWorld).

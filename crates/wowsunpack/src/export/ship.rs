@@ -288,11 +288,21 @@ pub fn load_skel_ext_files(
 /// produces the same per-record dedupe + manifest header, with the
 /// subject-specific metadata block driven by `subject` (ship-style
 /// nation/species/tier or model-style stem).
+///
+/// `bone_visual` is optional context used to compose each placement's
+/// parent-bone rest pose into the emitted matrix (schema_version=2,
+/// principled emit). When provided, each placement's `p1_hash` is
+/// resolved against the visual's node tree and the matched bone's
+/// composed-to-root rest pose is composed onto the placement matrix
+/// before basis conversion. When `None`, falls back to the legacy
+/// emit (schema_version=1) which left bone-rest composition to the
+/// consumer. New consumers should require `schema_version >= 2`.
 #[cfg(feature = "json")]
 pub fn write_skel_ext_candidates_json(
     skel_ext_files: &[OwnedSkelExt],
     subject: &SkelExtSubject<'_>,
     path: &Path,
+    bone_visual: Option<(&VisualPrototype, &crate::models::assets_bin::StringsSection<'_>)>,
 ) -> Result<(), Report> {
     use serde_json::json;
 
@@ -314,9 +324,11 @@ pub fn write_skel_ext_candidates_json(
         SkelExtSubject::Model { .. } => "model",
     };
 
+    let schema_version = if bone_visual.is_some() { 2 } else { 1 };
+
     if skel_ext_files.is_empty() {
         let manifest = json!({
-            "schema_version": 1,
+            "schema_version": schema_version,
             subject_key: subject_block,
             "stats": { "file_count": 0, "candidate_count": 0 },
             "candidates": [],
@@ -349,6 +361,14 @@ pub fn write_skel_ext_candidates_json(
     // `ShipModelContext::write_skel_ext_candidates_json` for rationale.
     let mut seen: HashSet<(u32, i64, i64, i64)> = HashSet::new();
     let mut candidates: Vec<serde_json::Value> = Vec::new();
+
+    // schema_version=2 emit cache: per-bone composed rest poses (avoids
+    // re-walking the parent chain for every placement that shares a
+    // bone — typical .skel_ext has 99% of placements rooted on the
+    // same `Rotate_Y`).
+    let mut bone_rest_cache: HashMap<u32, Option<[f32; 16]>> = HashMap::new();
+    let mut unresolved_p1: HashMap<u32, u32> = HashMap::new();
+
     for (segment, pl) in &global_placements {
         let p = pl.position();
         let key = (
@@ -360,8 +380,69 @@ pub fn write_skel_ext_candidates_json(
         if !seen.insert(key) {
             continue;
         }
-        let metric = crate::models::skel_ext::to_metric_glft(pl.matrix);
-        let position = [metric[12], metric[13], metric[14]];
+
+        let emit_matrix = if let Some((vp, strings)) = bone_visual {
+            // schema_version=2: compose parent-bone rest pose into the
+            // placement, post-multiply by Ry(180°), scale translation
+            // ×15. This produces a matrix the consumer can decompose
+            // verbatim — no further Z-mirror, Ry(180°) flip, or Y
+            // bone-rest offset needed at the consumer side.
+            //
+            // Why these three steps fold into one toolkit-side emit:
+            //   - bone composition: WG runtime parents the placement
+            //     under the parent bone (typically `Rotate_Y` for guns,
+            //     the asset's own root node for directors). Without
+            //     composing the bone rest, the placement lands at the
+            //     bone's position rather than at the asset root.
+            //   - Ry(180°) post-multiply: WG asset GLBs author their
+            //     "natural front" pointing opposite to where the
+            //     `negate_z` basis conversion alone would face them.
+            //     Folding the 180° rotation into emit means consumers
+            //     don't need per-asset facing logic.
+            //   - Skip negate_z entirely: the previous schema_version=1
+            //     emit applied `S·M·S` which the consumer then had to
+            //     undo with another `S·M·S` (composing to identity).
+            //     Eliminating both halves of the cancellation lets us
+            //     incorporate the `Ry(180°)` cleanly without the
+            //     consumer needing handedness-conversion math.
+            let bone_rest = bone_rest_cache
+                .entry(pl.p1_hash)
+                .or_insert_with(|| vp.find_composed_matrix_by_hash(pl.p1_hash, strings));
+            match bone_rest {
+                Some(rest) => {
+                    // composed_native = bone_rest @ pl.matrix
+                    let composed = mat4_mul_col_major(rest, &pl.matrix);
+                    // composed @ Ry(180°)  (post-multiply)
+                    let with_ry180 = mat4_mul_col_major(&composed, &RY_180_4X4);
+                    // Scale translation × 15 (native → metres). No
+                    // basis conversion: the matrix is in WG-native LH
+                    // coordinates, but the asset's GLB vertices were
+                    // also negate_z'd, so the LH placement matches
+                    // the negate_z'd GLB after Ry(180°) flips the
+                    // asset's authored-forward to glTF-forward.
+                    let mut m = with_ry180;
+                    m[12] *= crate::models::skel_ext::NATIVE_TO_METRES;
+                    m[13] *= crate::models::skel_ext::NATIVE_TO_METRES;
+                    m[14] *= crate::models::skel_ext::NATIVE_TO_METRES;
+                    m
+                }
+                None => {
+                    // Unresolved p1_hash — bone not in this visual.
+                    // Track for diagnostics; fall back to the legacy
+                    // basis conversion so the placement at least lands
+                    // at the right position for assets where the
+                    // unknown bone happens to be at identity rest.
+                    *unresolved_p1.entry(pl.p1_hash).or_insert(0) += 1;
+                    crate::models::skel_ext::to_metric_glft(pl.matrix)
+                }
+            }
+        } else {
+            // schema_version=1 legacy emit: just basis-convert the raw
+            // placement matrix. Consumers must compose bone rests
+            // themselves (or apply the historical 3-correction stack).
+            crate::models::skel_ext::to_metric_glft(pl.matrix)
+        };
+        let position = [emit_matrix[12], emit_matrix[13], emit_matrix[14]];
         candidates.push(json!({
             "segment":       segment,
             "record_offset": format!("0x{:X}", pl.record_offset),
@@ -371,7 +452,7 @@ pub fn write_skel_ext_candidates_json(
             "p0_hash":       format!("0x{:08X}", pl.p0_hash),
             "p1_hash":       format!("0x{:08X}", pl.p1_hash),
             "transform": {
-                "matrix":    metric.as_slice(),
+                "matrix":    emit_matrix.as_slice(),
                 "position":  position.as_slice(),
             },
         }));
@@ -380,12 +461,32 @@ pub fn write_skel_ext_candidates_json(
     let now = format_rfc3339_utc(SystemTime::now());
     let toolkit_version = env!("CARGO_PKG_VERSION");
 
+    // Sort unresolved p1 hashes by count (desc) for diagnostics. Most
+    // commonly the unresolved set is empty (every bone the placements
+    // reference exists in the visual) or a small number of legacy/
+    // unused hashes.
+    let mut unresolved_vec: Vec<(u32, u32)> = unresolved_p1.into_iter().collect();
+    unresolved_vec.sort_by(|a, b| b.1.cmp(&a.1));
+    let unresolved_json: Vec<serde_json::Value> = unresolved_vec
+        .iter()
+        .take(16)
+        .map(|(hash, count)| json!({
+            "p1_hash": format!("0x{:08X}", hash),
+            "count":   count,
+        }))
+        .collect();
+
     let manifest = json!({
-        "schema_version": 1,
+        "schema_version": schema_version,
         subject_key: subject_block,
         "pipeline": {
             "toolkit_version": toolkit_version,
             "generated_at":    now,
+            "skel_ext_emit": if schema_version == 2 {
+                "bone_composed + Ry(180°) + ×15 (post-2026-05-08)"
+            } else {
+                "to_metric_glft (legacy: S·M·S + ×15)"
+            },
         },
         "stats": {
             "file_count":         skel_ext_files.len(),
@@ -393,6 +494,7 @@ pub fn write_skel_ext_candidates_json(
             "candidate_count":    candidates.len(),
             "position_tolerance_cm": 1,
             "segments": skel_ext_files.iter().map(|f| f.segment.as_str()).collect::<Vec<_>>(),
+            "unresolved_p1_top": unresolved_json,
         },
         "candidates": candidates,
     });
@@ -1777,10 +1879,18 @@ impl ShipModelContext {
     /// same writer with a [`SkelExtSubject::Model`].
     #[cfg(feature = "json")]
     pub fn write_skel_ext_candidates_json(&self, path: &Path) -> Result<(), Report> {
+        // Ship-side skel_ext placements are parented under the hull's
+        // bones (typically `Scene Root` / `Root` at identity rest);
+        // bone-rest composition is a no-op so we don't need it. Stay
+        // on schema_version=1 emit to keep downstream consumers
+        // (skel_ext_resolve.py for ship-side, hull decoratives) on
+        // the same path. Asset-side placements (export-model) take
+        // the schema_version=2 path with the asset's own visual.
         write_skel_ext_candidates_json(
             &self.skel_ext_files,
             &SkelExtSubject::Ship(&self.info),
             path,
+            None,
         )
     }
 
@@ -2770,6 +2880,18 @@ fn ensure_proper_rotation(m: [f32; 16]) -> [f32; 16] {
 /// resolved (the mount is still emitted so downstream logic sees the asset_id).
 const IDENTITY_4X4: [f32; 16] =
     [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+
+/// 180° rotation around the Y axis, column-major. Equivalent to
+/// `diag(-1, 1, -1, 1)` in 4x4 form. Post-multiplied onto skel_ext
+/// placements (schema_version=2 emit) so consumers don't need a
+/// per-asset facing flip — see `write_skel_ext_candidates_json` for
+/// the motivation.
+const RY_180_4X4: [f32; 16] = [
+    -1.0, 0.0, 0.0, 0.0,
+     0.0, 1.0, 0.0, 0.0,
+     0.0, 0.0,-1.0, 0.0,
+     0.0, 0.0, 0.0, 1.0,
+];
 
 /// Extract `(scope, category, subcategory)` from a mount's GameParams model path.
 ///

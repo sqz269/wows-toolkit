@@ -341,7 +341,7 @@ pub fn property_name_hash(name: &str) -> u32 {
     murmur3_32(name.as_bytes(), 0)
 }
 
-fn murmur3_32(key: &[u8], seed: u32) -> u32 {
+pub fn murmur3_32(key: &[u8], seed: u32) -> u32 {
     let len = key.len();
     let nblocks = len / 4;
     let mut h1 = seed;
