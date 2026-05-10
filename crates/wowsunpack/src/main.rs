@@ -629,6 +629,14 @@ enum Commands {
         /// Print every node in the visual instead of just --bone matches.
         #[arg(long)]
         all: bool,
+
+        /// Write a structured JSON dump of every node to this path
+        /// (implies --all). Schema `wows_visual_bones/v1` — consumed
+        /// by the pipeline's turret_autorig replacement (no legacy
+        /// gamemodels3d.com GLB needed). Suppresses the human-readable
+        /// stdout printout when set.
+        #[arg(long)]
+        json: Option<PathBuf>,
     },
 }
 
@@ -1392,11 +1400,11 @@ fn run() -> Result<(), Report> {
                 parse_material.as_deref(),
             )?;
         }
-        Commands::DumpBones { file, bone, all } => {
+        Commands::DumpBones { file, bone, all, json } => {
             let Some(vfs) = &vfs else {
                 bail!("VFS required for dump-bones. Use --game-dir to specify a game install.");
             };
-            run_dump_bones(vfs, &file, &bone, all)?;
+            run_dump_bones(vfs, &file, &bone, all, json.as_deref())?;
         }
         Commands::SwizzleDir { input, out_dir, recursive } => {
             // No VFS required — this is a pure on-disk transformation.
@@ -3353,7 +3361,7 @@ fn main() -> Result<(), Report> {
 /// DIAGNOSTIC: dump local + composed-world matrices for a list of bone
 /// names (or every node) from a `.visual`. Used to verify rest-pose
 /// offsets that skel_ext consumers must compose.
-fn run_dump_bones(vfs: &VfsPath, file: &Path, bones: &[String], all: bool) -> Result<(), Report> {
+fn run_dump_bones(vfs: &VfsPath, file: &Path, bones: &[String], all: bool, json_out: Option<&Path>) -> Result<(), Report> {
     use wowsunpack::models::assets_bin;
     use wowsunpack::models::visual;
 
@@ -3382,15 +3390,66 @@ fn run_dump_bones(vfs: &VfsPath, file: &Path, bones: &[String], all: bool) -> Re
         .context("Failed to get visual prototype data")?;
     let vp = visual::parse_visual(vis_data).context("Failed to parse VisualPrototype")?;
 
-    println!("=== VisualPrototype: {vis_full_path} ===");
-    println!("  Nodes: {}", vp.nodes.name_ids.len());
-
     let strings = &db.strings;
 
     // Resolve names of every node up-front so we can print bone trees.
     let names: Vec<String> = vp.nodes.name_ids.iter().map(|&id|
         strings.get_string_by_id(id).unwrap_or("<unknown>").to_string()
     ).collect();
+
+    // JSON output path: structured, machine-consumable. Used by
+    // tools/ship/turret_autorig.py (replaces the legacy
+    // gamemodels3d.com hardpoint-tree walker). Suppresses the
+    // human-readable stdout to keep capture simple.
+    if let Some(json_path) = json_out {
+        let asset_id = vis_full_path
+            .rsplit('/').next()
+            .and_then(|f| f.strip_suffix(".visual"))
+            .unwrap_or("");
+        let mut nodes_json = Vec::with_capacity(names.len());
+        for (i, name) in names.iter().enumerate() {
+            let parent = vp.nodes.parent_ids[i];
+            let local = vp.nodes.matrices[i].0;
+            let world = vp.find_hardpoint_transform(name, strings).unwrap_or(local);
+            let (parent_idx, parent_name): (serde_json::Value, serde_json::Value) =
+                if parent == 0xFFFF || (parent as usize) >= names.len() {
+                    (serde_json::Value::Null, serde_json::Value::Null)
+                } else {
+                    (
+                        serde_json::Value::from(parent as u64),
+                        serde_json::Value::from(names[parent as usize].clone()),
+                    )
+                };
+            nodes_json.push(serde_json::json!({
+                "idx": i,
+                "name": name,
+                "parent_idx": parent_idx,
+                "parent_name": parent_name,
+                "local_matrix": local.to_vec(),
+                "world_translation": [world[12], world[13], world[14]],
+            }));
+        }
+        let doc = serde_json::json!({
+            "schema": "wows_visual_bones/v1",
+            "asset_id": asset_id,
+            "source_visual": vis_full_path,
+            "node_count": names.len(),
+            "nodes": nodes_json,
+        });
+        if let Some(parent) = json_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .context("creating parent dir for --json output")?;
+            }
+        }
+        std::fs::write(json_path, serde_json::to_string_pretty(&doc)?)
+            .context("writing --json output")?;
+        println!("dump-bones: wrote {} ({} nodes)", json_path.display(), names.len());
+        return Ok(());
+    }
+
+    println!("=== VisualPrototype: {vis_full_path} ===");
+    println!("  Nodes: {}", vp.nodes.name_ids.len());
 
     let print_node = |i: usize, name: &str| {
         let parent = vp.nodes.parent_ids[i];
