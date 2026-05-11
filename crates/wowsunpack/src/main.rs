@@ -33,6 +33,8 @@ use wowsunpack::game_params::convert::game_params_to_pickle;
 use clap::Parser;
 use clap::Subcommand;
 use clap::ValueEnum;
+
+mod capabilities;
 use indicatif::ParallelProgressIterator;
 use indicatif::ProgressBar;
 use rayon::prelude::*;
@@ -638,6 +640,21 @@ enum Commands {
         #[arg(long)]
         json: Option<PathBuf>,
     },
+    /// Print a machine-readable description of this `wowsunpack` build:
+    /// package version, release tag, git commit, supported contract
+    /// versions, feature flags, and JSON schema IDs.
+    ///
+    /// Downstream pipeline tooling uses this to fail closed when a
+    /// required feature is missing. Output is always JSON; the `--json`
+    /// flag is accepted for parity with other subcommands and as a
+    /// forward-compatible toggle for a future plain-text mode.
+    ///
+    /// Does not require a game directory or VFS.
+    Capabilities {
+        /// Emit JSON (the only currently supported output mode).
+        #[clap(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, ValueEnum)]
@@ -741,9 +758,7 @@ fn add_vfs_entries_to_file_tree(
     assets_bin_paths
 }
 
-fn run() -> Result<(), Report> {
-    let mut args = Args::parse();
-
+fn run_with_args(mut args: Args) -> Result<(), Report> {
     let mut game_dir = PathBuf::from(std::env::args().next().expect("failed to get first arg"))
         .parent()
         .expect("failed to get executable parent dir")
@@ -1432,6 +1447,13 @@ fn run() -> Result<(), Report> {
                 }
                 Err(e) => bail!("swizzle-dir failed: {e:?}"),
             }
+        }
+        Commands::Capabilities { .. } => {
+            // Dispatched directly from `main()` before `run_with_args` is
+            // called, so this branch is normally unreachable. Handle it
+            // defensively anyway (e.g. if a future caller invokes
+            // `run_with_args` with a pre-parsed Capabilities request).
+            handle_capabilities()?;
         }
     }
 
@@ -3349,12 +3371,32 @@ fn run_ammo(
 }
 
 fn main() -> Result<(), Report> {
+    // Pre-parse so the metadata-only `capabilities` subcommand can
+    // short-circuit before the game-data setup and the "Finished in"
+    // timing line in `run()`. That keeps stdout pure JSON so consumers
+    // can pipe the output straight into a parser.
+    let args = Args::parse();
+    if let Commands::Capabilities { json: _ } = &args.command {
+        return handle_capabilities();
+    }
+
     let timestamp = Instant::now();
 
-    run()?;
+    run_with_args(args)?;
 
     println!("Finished in {} seconds", (Instant::now() - timestamp).as_secs_f32());
 
+    Ok(())
+}
+
+/// Print the capability descriptor as pretty-printed JSON. Always emits
+/// JSON regardless of `--json` — the flag is reserved for a future
+/// plain-text mode and exists today for parity with sibling commands.
+fn handle_capabilities() -> Result<(), Report> {
+    let caps = capabilities::build();
+    let rendered = serde_json::to_string_pretty(&caps)
+        .map_err(|e| rootcause::report!("Failed to serialize capabilities: {e}"))?;
+    println!("{rendered}");
     Ok(())
 }
 

@@ -15,6 +15,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 
 #[derive(Deserialize, Default)]
 struct Registry {
@@ -103,6 +104,88 @@ fn discover_builds(workspace_root: &Path) -> Vec<u32> {
     builds
 }
 
+/// Resolve a build-time metadata value from (1) the named CI env override,
+/// or (2) a best-effort git command, or (3) a fallback string. Never panics
+/// and never fails the build.
+fn resolve_meta(env_var: &str, git_args: &[&str], git_cwd: &Path, fallback: &str) -> String {
+    if let Ok(v) = std::env::var(env_var)
+        && !v.trim().is_empty()
+    {
+        return v.trim().to_string();
+    }
+    match Command::new("git").current_dir(git_cwd).args(git_args).output() {
+        Ok(out) if out.status.success() => {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if s.is_empty() { fallback.to_string() } else { s }
+        }
+        _ => fallback.to_string(),
+    }
+}
+
+/// Emit build-time env vars for the capabilities subcommand. All values are
+/// best-effort: missing git / missing env vars resolve to "unknown" rather
+/// than failing the build.
+fn emit_capabilities_metadata(workspace_root: Option<&Path>) {
+    // Re-run on any of the overrides changing.
+    println!("cargo:rerun-if-env-changed=WOWS_TOOLKIT_RELEASE_TAG");
+    println!("cargo:rerun-if-env-changed=WOWS_TOOLKIT_GIT_COMMIT");
+    println!("cargo:rerun-if-env-changed=WOWS_TOOLKIT_GIT_DIRTY");
+
+    // Use workspace root as git CWD if we found one; otherwise fall back to
+    // the manifest dir. Either is inside the repo so `git -C <dir>` works.
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let git_cwd: PathBuf =
+        workspace_root.map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(&manifest_dir));
+
+    // Release tag: env override or "unknown" (we don't try to derive from
+    // git tags here — a fork may have many irrelevant tags upstream).
+    let release_tag = std::env::var("WOWS_TOOLKIT_RELEASE_TAG")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let git_commit = resolve_meta(
+        "WOWS_TOOLKIT_GIT_COMMIT",
+        &["rev-parse", "HEAD"],
+        &git_cwd,
+        "unknown",
+    );
+
+    // Dirty: env override wins; else look at porcelain status. Empty
+    // porcelain = clean; any output = dirty; failure = "unknown".
+    let git_dirty = if let Ok(v) = std::env::var("WOWS_TOOLKIT_GIT_DIRTY")
+        && !v.trim().is_empty()
+    {
+        v.trim().to_string()
+    } else {
+        match Command::new("git")
+            .current_dir(&git_cwd)
+            .args(["status", "--porcelain"])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                if out.stdout.iter().all(|&b| b == b' ' || b == b'\n' || b == b'\r' || b == b'\t') {
+                    "false".to_string()
+                } else {
+                    "true".to_string()
+                }
+            }
+            _ => "unknown".to_string(),
+        }
+    };
+
+    // TARGET / PROFILE are always provided by Cargo when running build scripts.
+    let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
+    let build_profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string());
+
+    println!("cargo:rustc-env=WOWS_TOOLKIT_RELEASE_TAG={release_tag}");
+    println!("cargo:rustc-env=WOWS_TOOLKIT_GIT_COMMIT={git_commit}");
+    println!("cargo:rustc-env=WOWS_TOOLKIT_GIT_DIRTY={git_dirty}");
+    println!("cargo:rustc-env=WOWS_TOOLKIT_TARGET={target}");
+    println!("cargo:rustc-env=WOWS_TOOLKIT_BUILD_PROFILE={build_profile}");
+}
+
 /// Build numbers referenced by tests that may not be locally available.
 /// Declared here so check-cfg doesn't warn about unknown cfgs.
 const KNOWN_TEST_BUILDS: &[u32] = &[
@@ -120,7 +203,14 @@ fn main() {
         println!("cargo:rustc-check-cfg=cfg(has_build_{build})");
     }
 
-    let Some(workspace_root) = find_workspace_root() else {
+    let workspace_root_opt = find_workspace_root();
+
+    // Always emit capabilities metadata env vars — even if workspace
+    // discovery failed (e.g. publish-style builds). Falls back to
+    // "unknown" if git is unavailable.
+    emit_capabilities_metadata(workspace_root_opt.as_deref());
+
+    let Some(workspace_root) = workspace_root_opt else {
         return;
     };
 
