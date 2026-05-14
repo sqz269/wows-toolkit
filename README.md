@@ -1,5 +1,7 @@
 # WoWs Toolkit
 
+> **Fork notice:** This is a downstream fork of [landaire/wows-toolkit](https://github.com/landaire/wows-toolkit) maintained for an asset-export pipeline. It adds `export-ship` / `export-model` JSON sidecar outputs (placements, material mappings, skel_ext candidates, armor materials table, ballistic profiles), a `swizzle-dir` subcommand, a `capabilities` self-describing manifest, glTF-conformant DDS sibling emission, plus a handful of correctness fixes (triangle winding after Z-negation, armor zone handedness, `models.bin` parser, deterministic JSON ordering). Pre-built binaries and the replay-focused GUI features come from upstream — see the upstream repo for releases and Discord. Bug fixes from this fork are periodically PR'd back upstream.
+
 A monorepo of tools for interacting with World of Warships game data, replays, and assets.
 
 <p>
