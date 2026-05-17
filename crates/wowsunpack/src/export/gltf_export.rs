@@ -74,6 +74,18 @@ struct DecodedPrimitive {
     mfm_full_path: Option<String>,
     /// Raw selfId for the .mfm file in assets.bin (used for TILEDLAND MFM parsing).
     mfm_path_id: u64,
+    /// Per-vertex palette indices (3 active + 1 padding) when the source
+    /// vertex format is `iiiww` *and* the owning render set declares
+    /// itself skinned. `None` for static meshes — those export with no
+    /// JOINTS_0/WEIGHTS_0 attributes.
+    bones: Option<Vec<[u8; 4]>>,
+    /// Per-vertex bone weights normalized to sum=1.0. Paired with `bones`
+    /// (both present or both absent).
+    weights: Option<Vec<[f32; 4]>>,
+    /// The owning render set's bone palette — a list of visual node
+    /// `name_id`s. Vertex bone indices index into this list. `None` for
+    /// static primitives.
+    bone_palette: Option<Vec<u32>>,
 }
 
 /// Export a visual + geometry pair to a GLB binary and write it.
@@ -109,6 +121,10 @@ pub fn export_glb(
     let mut mat_cache = MaterialCache::new();
     let mut scene_nodes: Vec<json::Index<json::Node>> = Vec::new();
 
+    // Mesh-nodes that need a skin attached after the bone tree is built.
+    // `(node_idx, palette, debug_name)` — populated during primitive
+    // emission, drained after the bone tree is created.
+    let mut skinned_mesh_nodes: Vec<(json::Index<json::Node>, Vec<u32>, String)> = Vec::new();
     if all_render_sets {
         // Bundle every render set as its own named mesh (all LODs + both damage
         // states). See `collect_all_render_set_primitives` for the full rationale.
@@ -134,6 +150,9 @@ pub fn export_glb(
                 ..Default::default()
             });
             scene_nodes.push(node);
+            if let Some(palette) = &prim.bone_palette {
+                skinned_mesh_nodes.push((node, palette.clone(), rs_name.clone()));
+            }
         }
     } else {
         if visual.lods.is_empty() {
@@ -167,6 +186,49 @@ pub fn export_glb(
         });
         let root_node = root.push(json::Node { mesh: Some(mesh), ..Default::default() });
         scene_nodes.push(root_node);
+        // Collapsed-mesh path: every primitive shares one parent Node so
+        // they must share a Skin. Pick the first non-empty palette and
+        // verify the rest match — divergent palettes can't be served by
+        // a single Skin without remapping JOINTS_0 (deferred).
+        let palettes: Vec<&Vec<u32>> = primitives.iter().filter_map(|p| p.bone_palette.as_ref()).collect();
+        if let Some(first) = palettes.first() {
+            if palettes.iter().all(|p| p == first) {
+                skinned_mesh_nodes.push((root_node, (*first).clone(), "lod_mesh".to_string()));
+            } else {
+                eprintln!(
+                    "Warning: collapsed-mesh export saw {} divergent bone palettes — skipping skin emit",
+                    palettes.len()
+                );
+            }
+        }
+    }
+
+    // Bone tree + skins. Only emitted when at least one render set carries
+    // skin attributes; static visuals (most non-gun accessories) export
+    // exactly as before.
+    if !skinned_mesh_nodes.is_empty() {
+        let skin_tree = emit_bone_node_tree(&mut root, visual, db);
+        // Add root bones (parent == 0xFFFF) to the scene so consumers see
+        // the skeleton even with the mesh hidden. The skin still binds
+        // correctly without this but Blender / Three.js render the
+        // skeleton overlay from the scene tree.
+        for (vidx, &parent) in visual.nodes.parent_ids.iter().enumerate() {
+            if parent == 0xFFFF || parent as usize >= visual.nodes.parent_ids.len() {
+                scene_nodes.push(skin_tree.bone_node_idx[vidx]);
+            }
+        }
+        for (mesh_node, palette, debug_name) in skinned_mesh_nodes.drain(..) {
+            let skin = emit_skin_for_palette(
+                &mut root,
+                &mut bin_data,
+                &skin_tree,
+                visual,
+                &palette,
+                Some(format!("{debug_name}_skin")),
+            );
+            let value = mesh_node.value();
+            root.nodes[value].skin = Some(skin);
+        }
     }
 
     // Pad binary data to 4-byte alignment.
@@ -1635,6 +1697,7 @@ pub fn export_geometry_raw(geometry: &MergedGeometry, writer: &mut impl Write) -
         );
 
         // Build a DecodedPrimitive for reuse with add_primitive_to_root.
+        // Diagnostic dump path — never carries skin data.
         let prim = DecodedPrimitive {
             positions: verts.positions,
             normals: verts.normals,
@@ -1645,6 +1708,9 @@ pub fn export_geometry_raw(geometry: &MergedGeometry, writer: &mut impl Write) -
             mfm_stem: None,
             mfm_full_path: None,
             mfm_path_id: 0,
+            bones: None,
+            weights: None,
+            bone_palette: None,
         };
 
         let empty_textures = TextureSet::empty();
@@ -1907,6 +1973,18 @@ fn decode_render_set_primitive(
         &verts.uvs,
         &indices,
     );
+    // Skin data is only meaningful when the render set declares itself
+    // skinned. iiiww data on a static render set is treated as noise.
+    // When `barrel_pitch` is set the export bakes the rotation into the
+    // vertex positions above — emitting skin alongside that would let a
+    // skinning consumer rotate the barrels a second time, so we drop the
+    // skin attributes whenever a pitch was baked.
+    let baked_barrel_pitch = barrel_pitch.is_some();
+    let (bones, weights, bone_palette) = if rs.skinned && !baked_barrel_pitch {
+        (verts.bones, verts.weights, Some(rs.node_name_ids.clone()))
+    } else {
+        (None, None, None)
+    };
     Ok(Some(DecodedPrimitive {
         positions: verts.positions,
         normals: verts.normals,
@@ -1917,6 +1995,9 @@ fn decode_render_set_primitive(
         mfm_stem,
         mfm_full_path,
         mfm_path_id: rs.material_mfm_path_id,
+        bones,
+        weights,
+        bone_palette,
     }))
 }
 
@@ -2092,6 +2173,16 @@ fn collect_primitives(
             &verts.uvs,
             &indices,
         );
+        // The LOD-filtered path bakes barrel pitch into vertex positions
+        // before this point (see `apply_barrel_pitch` above). Treat the
+        // mesh as static — emitting skin data alongside baked positions
+        // would double-rotate the barrels on the consumer side.
+        let baked_barrel_pitch = barrel_pitch.is_some();
+        let (bones, weights, bone_palette) = if rs.skinned && !baked_barrel_pitch {
+            (verts.bones, verts.weights, Some(rs.node_name_ids.clone()))
+        } else {
+            (None, None, None)
+        };
         result.push(DecodedPrimitive {
             positions: verts.positions,
             normals: verts.normals,
@@ -2102,6 +2193,9 @@ fn collect_primitives(
             mfm_stem,
             mfm_full_path,
             mfm_path_id: rs.material_mfm_path_id,
+            bones,
+            weights,
+            bone_palette,
         });
     }
 
@@ -2112,9 +2206,17 @@ struct UnpackedVertices {
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     uvs: Vec<[f32; 2]>,
+    /// Per-vertex palette indices (3 effective + 1 padding slot zeroed).
+    /// `None` when the source vertex format lacks `iiiww`.
+    bones: Option<Vec<[u8; 4]>>,
+    /// Per-vertex bone weights normalized so they sum to 1.0. Slot order
+    /// matches `bones`. `None` together with `bones` (both present or
+    /// both absent).
+    weights: Option<Vec<[f32; 4]>>,
 }
 
-/// Unpack vertex data into separate position, normal, and UV arrays.
+/// Unpack vertex data into separate position, normal, UV, and (when present)
+/// skin (bone-index + weight) arrays.
 fn unpack_vertices(data: &[u8], stride: usize, format: &VertexFormat) -> UnpackedVertices {
     let count = data.len() / stride;
     let mut positions = Vec::with_capacity(count);
@@ -2125,6 +2227,11 @@ fn unpack_vertices(data: &[u8], stride: usize, format: &VertexFormat) -> Unpacke
     let pos_attr = format.attributes.iter().find(|a| a.semantic == AttributeSemantic::Position);
     let norm_attr = format.attributes.iter().find(|a| a.semantic == AttributeSemantic::Normal);
     let uv_attr = format.attributes.iter().find(|a| a.semantic == AttributeSemantic::TexCoord0);
+    let bone_attr = format.attributes.iter().find(|a| a.semantic == AttributeSemantic::BoneIndices);
+    let weight_attr = format.attributes.iter().find(|a| a.semantic == AttributeSemantic::BoneWeights);
+    let want_skin = bone_attr.is_some() && weight_attr.is_some();
+    let mut bones = if want_skin { Some(Vec::with_capacity(count)) } else { None };
+    let mut weights = if want_skin { Some(Vec::with_capacity(count)) } else { None };
 
     for i in 0..count {
         let base = i * stride;
@@ -2157,9 +2264,53 @@ fn unpack_vertices(data: &[u8], stride: usize, format: &VertexFormat) -> Unpacke
             let packed = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
             uvs.push(vertex_format::unpack_uv(packed));
         }
+
+        // Skin: 3 u8 palette indices + 1 padding byte, then 4 u8 weight
+        // bytes. WG/BigWorld stores each bone byte as `palette_idx * 3`
+        // — the engine indexed into a flat array of 3-row pose matrices
+        // (3 vec4 columns per bone, 48 bytes apiece) and the byte was a
+        // direct stride offset. Dividing by 3 recovers the palette
+        // index that the glTF JOINTS_0 attribute expects. (We assert
+        // divisibility in debug builds; production keeps the integer
+        // division to avoid a panic on the off-chance a non-conformant
+        // visual slips through.)
+        //
+        // The format declares 3 effective bones; we forward the 3
+        // active slots into the glTF Vec4-shaped JOINTS_0/WEIGHTS_0
+        // attributes with the 4th slot zeroed (joint 0, weight 0).
+        // Weights are normalized so each vertex's contributions sum to
+        // 1.0.
+        if let (Some(bi), Some(bw)) = (bone_attr, weight_attr) {
+            let bi_off = base + bi.offset;
+            let bw_off = base + bw.offset;
+            let rb0 = data[bi_off];
+            let rb1 = data[bi_off + 1];
+            let rb2 = data[bi_off + 2];
+            debug_assert!(
+                rb0 % 3 == 0 && rb1 % 3 == 0 && rb2 % 3 == 0,
+                "iiiww bone byte not divisible by 3: {rb0} {rb1} {rb2} — palette convention may differ"
+            );
+            let b0 = rb0 / 3;
+            let b1 = rb1 / 3;
+            let b2 = rb2 / 3;
+            let w0 = data[bw_off] as f32;
+            let w1 = data[bw_off + 1] as f32;
+            let w2 = data[bw_off + 2] as f32;
+            // The 4th weight byte is ignored: with only 3 effective palette
+            // slots there is no 4th bone to weight against.
+            let sum = w0 + w1 + w2;
+            let (nw0, nw1, nw2) = if sum > 0.0 {
+                (w0 / sum, w1 / sum, w2 / sum)
+            } else {
+                // Degenerate row — pin to the dominant bone with full weight.
+                (1.0, 0.0, 0.0)
+            };
+            bones.as_mut().unwrap().push([b0, b1, b2, 0]);
+            weights.as_mut().unwrap().push([nw0, nw1, nw2, 0.0]);
+        }
     }
 
-    UnpackedVertices { positions, normals, uvs }
+    UnpackedVertices { positions, normals, uvs, bones, weights }
 }
 
 /// Reverse triangle winding in place. Each 3-index group `[a, b, c]` becomes
@@ -2233,6 +2384,283 @@ pub(super) fn negate_z_and_scale_to_metres(m: [f32; 16]) -> [f32; 16] {
     let mut out = negate_z_transform(m);
     scale_translation_to_metres(&mut out);
     out
+}
+
+/// Column-major 4x4 multiply: `out = a * b` where vectors are applied as
+/// `v' = M * v`. Local copy because the existing helper lives in
+/// `visual.rs` and isn't pub-re-exported.
+fn mat4_mul_col(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
+    let mut out = [0.0f32; 16];
+    for col in 0..4 {
+        for row in 0..4 {
+            let mut sum = 0.0;
+            for k in 0..4 {
+                sum += a[k * 4 + row] * b[col * 4 + k];
+            }
+            out[col * 4 + row] = sum;
+        }
+    }
+    out
+}
+
+/// General 4x4 matrix inverse via cofactor expansion. Used to build the
+/// inverse-bind-matrix accessor for skinned primitives. Returns identity
+/// when the matrix is singular (rare for affine bind poses; logs nothing
+/// because skinning silently degrades to a no-op which is the right
+/// failure mode for callers).
+fn invert_mat4_col(m: &[f32; 16]) -> [f32; 16] {
+    let mut inv = [0.0f32; 16];
+    inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15]
+        + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15]
+        - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15]
+        + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14]
+        - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15]
+        - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15]
+        + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15]
+        - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14]
+        + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15]
+        + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15]
+        - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15]
+        + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14]
+        - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+    inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11]
+        - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11]
+        + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11]
+        - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10]
+        + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+
+    let det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if det.abs() < 1e-12 {
+        // Singular — fall back to identity so the IBM at least makes the
+        // mesh appear at rest pose (skinning collapses to no-op).
+        return [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0, //
+        ];
+    }
+    let inv_det = 1.0 / det;
+    let mut out = [0.0f32; 16];
+    for i in 0..16 {
+        out[i] = inv[i] * inv_det;
+    }
+    out
+}
+
+/// Per-export bone tree state: glTF node indices and matrices indexed by
+/// the source visual node index. Built once per export and reused across
+/// every skinned render set in the same visual.
+struct SkinTree {
+    /// `bone_node_idx[v]` is the glTF Node index that represents visual
+    /// node `v`. Indexing parallels `visual.nodes.parent_ids`.
+    bone_node_idx: Vec<json::Index<json::Node>>,
+    /// Per-visual-node local matrix already converted to the glTF frame
+    /// (Z-negated rotation/scale + translation scaled to metres). Used
+    /// to compute world matrices when emitting inverse-bind matrices.
+    local_mats: Vec<[f32; 16]>,
+    /// Mirror of `visual.nodes.parent_ids` (0xFFFF = root) so callers
+    /// can walk the hierarchy without re-borrowing the visual.
+    parents: Vec<u16>,
+}
+
+/// Push one glTF Node per visual node, wire up the hierarchy via
+/// `parent_ids`, and return the resulting `SkinTree`. The nodes carry
+/// their local matrix in the glTF frame so a consumer that rotates a
+/// bone sees the same rest pose this exporter saw.
+///
+/// The returned bone nodes are NOT yet attached to the scene. Callers
+/// add the roots (parent == 0xFFFF) to `scene_nodes` once they know
+/// any skin actually needs them.
+fn emit_bone_node_tree(
+    root: &mut json::Root,
+    visual: &VisualPrototype,
+    db: &PrototypeDatabase<'_>,
+) -> SkinTree {
+    let nodes = &visual.nodes;
+    let count = nodes.matrices.len();
+
+    // 1. Convert every local matrix to the glTF frame once. Chaining
+    //    these gives world matrices in the same frame as the exported
+    //    vertex positions.
+    let local_mats: Vec<[f32; 16]> = nodes
+        .matrices
+        .iter()
+        .map(|m| {
+            let mut nm = negate_z_transform(m.0);
+            scale_translation_to_metres(&mut nm);
+            nm
+        })
+        .collect();
+
+    // 2. Resolve names through the name_map. `name_map_name_ids[i]` is
+    //    the name_id assigned to `name_map_node_ids[i]`, so build a
+    //    reverse table indexed by node idx.
+    let mut name_by_node: Vec<Option<String>> = vec![None; count];
+    for (i, &node_id) in nodes.name_map_node_ids.iter().enumerate() {
+        if (node_id as usize) < count {
+            let name_id = nodes.name_map_name_ids[i];
+            if let Some(name) = db.strings.get_string_by_id(name_id) {
+                name_by_node[node_id as usize] = Some(name.to_string());
+            }
+        }
+    }
+
+    // 3. Push glTF nodes — children are filled in the second pass so we
+    //    have stable indices to point at.
+    let mut bone_node_idx: Vec<json::Index<json::Node>> = Vec::with_capacity(count);
+    for i in 0..count {
+        let idx = root.push(json::Node {
+            name: name_by_node[i].clone(),
+            matrix: Some(local_mats[i]),
+            ..Default::default()
+        });
+        bone_node_idx.push(idx);
+    }
+
+    // 4. Wire children using parent_ids. Skipping 0xFFFF (root sentinel)
+    //    and out-of-range guards against corrupt inputs without crashing.
+    let mut children_by_parent: Vec<Vec<json::Index<json::Node>>> = vec![Vec::new(); count];
+    for i in 0..count {
+        let parent = nodes.parent_ids[i];
+        if parent == 0xFFFF || (parent as usize) >= count {
+            continue;
+        }
+        children_by_parent[parent as usize].push(bone_node_idx[i]);
+    }
+    for (i, kids) in children_by_parent.into_iter().enumerate() {
+        if kids.is_empty() {
+            continue;
+        }
+        let idx_value = bone_node_idx[i].value();
+        root.nodes[idx_value].children = Some(kids);
+    }
+
+    SkinTree { bone_node_idx, local_mats, parents: nodes.parent_ids.clone() }
+}
+
+/// World matrix at bind pose for a given visual node: chain locals from
+/// the node up to its root, multiplying parent-on-the-left so column-major
+/// `v' = M * v` semantics hold.
+fn skin_tree_world_matrix(skin_tree: &SkinTree, node_idx: u16) -> [f32; 16] {
+    let count = skin_tree.parents.len();
+    if (node_idx as usize) >= count {
+        return [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0, //
+        ];
+    }
+    let mut current = node_idx;
+    let mut world = skin_tree.local_mats[current as usize];
+    loop {
+        let parent = skin_tree.parents[current as usize];
+        if parent == 0xFFFF || (parent as usize) >= count {
+            break;
+        }
+        world = mat4_mul_col(&skin_tree.local_mats[parent as usize], &world);
+        current = parent;
+    }
+    world
+}
+
+/// Resolve a render-set bone palette (list of name_ids) to the
+/// corresponding visual node indices. Slots that don't resolve fall back
+/// to 0 — corrupt input shouldn't crash, and joint 0 is always the
+/// scene root, so a stray reference rests at the origin instead of
+/// folding the mesh into a singularity.
+fn resolve_palette_to_visual_indices(visual: &VisualPrototype, palette: &[u32]) -> Vec<u16> {
+    palette
+        .iter()
+        .map(|&name_id| {
+            visual
+                .nodes
+                .name_map_name_ids
+                .iter()
+                .position(|&nid| nid == name_id)
+                .map(|i| visual.nodes.name_map_node_ids[i])
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+/// Push a `Skin` to the glTF root with one joint per palette slot. Emits
+/// the IBM accessor inline using the `SkinTree`'s bind-pose locals.
+fn emit_skin_for_palette(
+    root: &mut json::Root,
+    bin_data: &mut Vec<u8>,
+    skin_tree: &SkinTree,
+    visual: &VisualPrototype,
+    palette: &[u32],
+    name: Option<String>,
+) -> json::Index<json::Skin> {
+    let visual_indices = resolve_palette_to_visual_indices(visual, palette);
+    let joint_nodes: Vec<json::Index<json::Node>> = visual_indices
+        .iter()
+        .map(|&vidx| skin_tree.bone_node_idx[vidx as usize])
+        .collect();
+
+    // Build IBM accessor: one Mat4 per joint, inverse of world matrix
+    // at bind pose. Three.js / Unity / Blender all expect this.
+    let byte_offset = bin_data.len();
+    for &vidx in &visual_indices {
+        let world = skin_tree_world_matrix(skin_tree, vidx);
+        let ibm = invert_mat4_col(&world);
+        for v in ibm {
+            bin_data.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    pad_to_4(bin_data);
+    let byte_length = bin_data.len() - byte_offset;
+
+    let bv = root.push(json::buffer::View {
+        buffer: json::Index::new(0),
+        byte_length: USize64::from(byte_length),
+        byte_offset: Some(USize64::from(byte_offset)),
+        byte_stride: None,
+        target: None,
+        name: None,
+        extensions: Default::default(),
+        extras: Default::default(),
+    });
+    let ibm_accessor = root.push(json::Accessor {
+        buffer_view: Some(bv),
+        byte_offset: Some(USize64(0)),
+        count: USize64::from(palette.len()),
+        component_type: Valid(json::accessor::GenericComponentType(json::accessor::ComponentType::F32)),
+        type_: Valid(json::accessor::Type::Mat4),
+        min: None,
+        max: None,
+        name: None,
+        normalized: false,
+        sparse: None,
+        extensions: Default::default(),
+        extras: Default::default(),
+    });
+
+    root.push(json::Skin {
+        joints: joint_nodes,
+        inverse_bind_matrices: Some(ibm_accessor),
+        skeleton: None,
+        name,
+        extensions: Default::default(),
+        extras: Default::default(),
+    })
 }
 
 /// Apply a pitch rotation to vertices whose dominant bone is a barrel bone.
@@ -2836,6 +3264,90 @@ fn add_primitive_to_root(
         None
     };
 
+    // --- Skin: JOINTS_0 (u8 Vec4) + WEIGHTS_0 (f32 Vec4) ---
+    //
+    // Joint indices into the per-primitive bone palette emitted later as
+    // a glTF `Skin.joints` array. The 3 active palette slots from the
+    // `iiiww` vertex format are forwarded with the 4th slot zeroed
+    // (joint 0, weight 0) so the GPU has a Vec4-shaped pair. Weights are
+    // already normalized to sum=1.0 by `unpack_vertices`.
+    let joints_accessor = if let Some(bones) = &prim.bones {
+        let byte_offset = bin_data.len();
+        for b in bones {
+            bin_data.extend_from_slice(b);
+        }
+        pad_to_4(bin_data);
+        let byte_length = bin_data.len() - byte_offset;
+
+        let bv = root.push(json::buffer::View {
+            buffer: json::Index::new(0),
+            byte_length: USize64::from(byte_length),
+            byte_offset: Some(USize64::from(byte_offset)),
+            byte_stride: None,
+            target: Some(Valid(json::buffer::Target::ArrayBuffer)),
+            name: None,
+            extensions: Default::default(),
+            extras: Default::default(),
+        });
+
+        Some(root.push(json::Accessor {
+            buffer_view: Some(bv),
+            byte_offset: Some(USize64(0)),
+            count: USize64::from(bones.len()),
+            component_type: Valid(json::accessor::GenericComponentType(json::accessor::ComponentType::U8)),
+            type_: Valid(json::accessor::Type::Vec4),
+            min: None,
+            max: None,
+            name: None,
+            normalized: false,
+            sparse: None,
+            extensions: Default::default(),
+            extras: Default::default(),
+        }))
+    } else {
+        None
+    };
+
+    let weights_accessor = if let Some(weights) = &prim.weights {
+        let byte_offset = bin_data.len();
+        for w in weights {
+            bin_data.extend_from_slice(&w[0].to_le_bytes());
+            bin_data.extend_from_slice(&w[1].to_le_bytes());
+            bin_data.extend_from_slice(&w[2].to_le_bytes());
+            bin_data.extend_from_slice(&w[3].to_le_bytes());
+        }
+        pad_to_4(bin_data);
+        let byte_length = bin_data.len() - byte_offset;
+
+        let bv = root.push(json::buffer::View {
+            buffer: json::Index::new(0),
+            byte_length: USize64::from(byte_length),
+            byte_offset: Some(USize64::from(byte_offset)),
+            byte_stride: None,
+            target: Some(Valid(json::buffer::Target::ArrayBuffer)),
+            name: None,
+            extensions: Default::default(),
+            extras: Default::default(),
+        });
+
+        Some(root.push(json::Accessor {
+            buffer_view: Some(bv),
+            byte_offset: Some(USize64(0)),
+            count: USize64::from(weights.len()),
+            component_type: Valid(json::accessor::GenericComponentType(json::accessor::ComponentType::F32)),
+            type_: Valid(json::accessor::Type::Vec4),
+            min: None,
+            max: None,
+            name: None,
+            normalized: false,
+            sparse: None,
+            extensions: Default::default(),
+            extras: Default::default(),
+        }))
+    } else {
+        None
+    };
+
     // Build attribute map.
     if let Some(pos) = pos_accessor {
         attributes.insert(Valid(json::mesh::Semantic::Positions), pos);
@@ -2848,6 +3360,12 @@ fn add_primitive_to_root(
     }
     if let Some(tan) = tangent_accessor {
         attributes.insert(Valid(json::mesh::Semantic::Tangents), tan);
+    }
+    if let Some(j) = joints_accessor {
+        attributes.insert(Valid(json::mesh::Semantic::Joints(0)), j);
+    }
+    if let Some(w) = weights_accessor {
+        attributes.insert(Valid(json::mesh::Semantic::Weights(0)), w);
     }
 
     // Determine cache key: prefer MFM stem, fall back to material name.
