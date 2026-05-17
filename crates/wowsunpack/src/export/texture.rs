@@ -889,8 +889,8 @@ pub fn bake_tiledland_albedo(
 /// PBR auxiliary channels loaded for a material alongside the albedo.
 ///
 /// Each field is `Some(png_bytes)` when the corresponding MFM property
-/// (`normalMap`, `metallicGlossMap`, `ambientOcclusionMap`) resolves to a
-/// readable DDS in the VFS.
+/// (`normalMap`, `metallicGlossMap`, `ambientOcclusionMap`, `detailMap`)
+/// resolves to a readable DDS in the VFS.
 ///
 /// **Phase A (current)**: PNG bytes are the raw DDS→PNG conversion with
 /// WG's original channel layout — no swizzling to match glTF conventions.
@@ -909,6 +909,48 @@ pub struct PbrChannels {
     /// `ambientOcclusionMap` — usually R-channel grayscale. Passes through
     /// raw; glTF reads R for occlusion so this path is already correct.
     pub occlusion: Option<Vec<u8>>,
+    /// `detailMap` — high-frequency surface-detail normal atlas (the
+    /// shared `ship_atlas_detail.dds` used by 67.8% of WG ship materials).
+    /// Sampled at a per-material UV scale (typically 32× across the hull
+    /// UV) and added to the tangent normal weighted by
+    /// `g_detailNormalInfluence` × distance falloff — the engine recipe
+    /// at chunk012:71-74 of `PBS_ship_metallic.win.dx11`. Without this
+    /// layer ship surfaces look flat compared to in-game (the base
+    /// normalMap on hulls carries very little detail; the rivet / plate /
+    /// weathering grain comes from the detail map).
+    pub detail: Option<Vec<u8>>,
+}
+
+/// Per-material scalar parameters that control the detail-map blend.
+/// Mirror the corresponding `g_detail*` fields in `PBS_ship_metallic.fx`
+/// `$Globals` CB. Read from the same MFM that supplies the texture
+/// hashes; default to "no contribution" so a material that omits any
+/// field passes through cleanly.
+///
+/// Engine consumes these in chunk012:43-74 of `PBS_ship_metallic.win.dx11`:
+/// `r2.w = saturate(1 - (g_detailFadeDistance / view_dist - vertex.depth/15) / 15)`
+/// (the distance falloff), `r7.xyz = r2.w * (g_detailNormalInfluence,
+/// g_detailAlbedoInfluence, g_detailGlossInfluence)`, then
+/// `tangent_normal_xy += detail.rg_signed * r7.x` and analogous mixes for
+/// albedo / gloss.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct DetailParams {
+    /// Per-material normal-blend strength. Typical: 0.40 on hulls + most
+    /// accessories; 0.0 for materials that author the detail map but
+    /// don't want the normal contribution.
+    pub normal_influence: f32,
+    /// Per-material albedo-modulation strength. Typical: 0.60 on hulls.
+    pub albedo_influence: f32,
+    /// Per-material gloss-modulation strength. Typical: 1.0 on hulls.
+    pub gloss_influence: f32,
+    /// Camera-distance threshold for the falloff curve (metres). At
+    /// `view_dist > 15 × fade_distance` the detail contribution is fully
+    /// gated off. Typical: 3-5 across the corpus.
+    pub fade_distance: f32,
+    /// UV tile scale for the detail sample. Typical 32 for hull / large
+    /// surfaces, 8 for turret bodies, 2 for small accessories.
+    pub scale_u: f32,
+    pub scale_v: f32,
 }
 
 /// Resolve PBR auxiliary texture hashes from an MFM and load their DDS
@@ -962,8 +1004,38 @@ pub fn load_pbr_channels(
     let occlusion = load_raw("ambientOcclusionMap");
     let metallic_roughness = load_raw("metallicGlossMap")
         .and_then(|png| repack_wg_mg_to_gltf_mr(&png).ok());
+    // Detail map: shared high-frequency normal atlas
+    // (`ship_atlas_detail.dds`) used by 67.8% of WG ship/character/
+    // accessory materials. Passes through raw — channels are standard
+    // tangent-space (R=X, G=Y, B=Z) per empirical histograms on the
+    // 2048² atlas (all three centred at u8≈128 with std ~0.06).
+    // The per-material blend (UV tile scale, normal/albedo/gloss
+    // influence, distance falloff) is in [`DetailParams`].
+    let detail = load_raw("detailMap");
 
-    PbrChannels { normal, metallic_roughness, occlusion }
+    PbrChannels { normal, metallic_roughness, occlusion, detail }
+}
+
+/// Read the 5 per-material detail-blend scalars from an MFM.
+///
+/// Returns `None` when the MFM can't be parsed; missing individual
+/// fields default to 0 (no contribution). When all 3 influences are 0
+/// the detail layer has no visible effect regardless of texture
+/// binding — useful as a producer-side gate to skip emitting the
+/// detail texture for materials that don't use it.
+pub fn load_detail_params(
+    db: &PrototypeDatabase<'_>,
+    mfm_path_id: u64,
+) -> Option<DetailParams> {
+    let mat = parse_mfm_from_db(db, mfm_path_id)?;
+    Some(DetailParams {
+        normal_influence: mat.get_float("g_detailNormalInfluence").unwrap_or(0.0),
+        albedo_influence: mat.get_float("g_detailAlbedoInfluence").unwrap_or(0.0),
+        gloss_influence:  mat.get_float("g_detailGlossInfluence").unwrap_or(0.0),
+        fade_distance:    mat.get_float("g_detailFadeDistance").unwrap_or(0.0),
+        scale_u:          mat.get_float("g_detailScaleU").unwrap_or(1.0),
+        scale_v:          mat.get_float("g_detailScaleV").unwrap_or(1.0),
+    })
 }
 
 /// Repack WG's `metallicGlossMap` PNG into a glTF-conformant
