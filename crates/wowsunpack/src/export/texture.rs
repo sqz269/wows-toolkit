@@ -302,23 +302,38 @@ impl RawDdsDumper {
                 }
             }
         } else if let Some(stem) = stem_no_mip.strip_suffix("_mg") {
-            // Metallic-gloss map: emit swizzled _mr sibling.
+            // Metallic-gloss map: split into _mr + _camomask siblings.
             let mr_name = format!("{stem}_mr{mip_suffix}");
-            if self.written.contains(&mr_name) {
+            let mask_name = format!("{stem}_camomask{mip_suffix}");
+
+            let need_mr = !self.written.contains(&mr_name);
+            let need_mask = !self.written.contains(&mask_name);
+            if !need_mr && !need_mask {
                 return;
             }
-            match swizzle_wg_mg_dds_to_mr(bytes) {
-                Ok(mr_dds) => {
-                    let out = self.dir.join(&mr_name);
-                    if let Err(e) = std::fs::write(&out, &mr_dds) {
-                        eprintln!("  Warning: failed to write {}: {e}", out.display());
-                    } else {
-                        self.written.insert(mr_name);
+
+            match split_wg_mg_dds(bytes) {
+                Ok((mr_dds, mask_dds)) => {
+                    if need_mr {
+                        let out = self.dir.join(&mr_name);
+                        if let Err(e) = std::fs::write(&out, &mr_dds) {
+                            eprintln!("  Warning: failed to write {}: {e}", out.display());
+                        } else {
+                            self.written.insert(mr_name);
+                        }
+                    }
+                    if need_mask {
+                        let out = self.dir.join(&mask_name);
+                        if let Err(e) = std::fs::write(&out, &mask_dds) {
+                            eprintln!("  Warning: failed to write {}: {e}", out.display());
+                        } else {
+                            self.written.insert(mask_name);
+                        }
                     }
                 }
                 Err(e) => {
                     eprintln!(
-                        "  Warning: failed to swizzle WG MG {filename}: {e:?} \
+                        "  Warning: failed to split WG MG {filename}: {e:?} \
                          (consumer must swizzle on bind from raw _mg.dd?)"
                     );
                 }
@@ -1085,16 +1100,71 @@ fn encode_single_mip_dds(
 /// WG MG packing (BC1 no-alpha is canonical for `_mg` files; A is
 /// always unused).
 ///
+/// Thin wrapper around [`split_wg_mg_dds`] that drops the `_camomask`
+/// output. Retained for callers that only need the MR sibling; new
+/// callers should prefer [`split_wg_mg_dds`] (it shares the decode
+/// cost between the two encodes).
+///
 /// Single mip — WG splits the mip pyramid across `.dd0` / `.dd1` /
 /// `.dd2` / `.dds` files, each carrying one mip level. Callers iterate
 /// per-file.
 pub fn swizzle_wg_mg_dds_to_mr(dds_bytes: &[u8]) -> Result<Vec<u8>, Report<TextureError>> {
-    let mut rgba = decode_single_mip_dds(dds_bytes)?;
-    for pixel in rgba.pixels_mut() {
+    let (mr, _camomask) = split_wg_mg_dds(dds_bytes)?;
+    Ok(mr)
+}
+
+/// Split a single-mip WG `_mg` DDS into two glTF-conformant siblings:
+///
+/// 1. `_mr.dds` — BC1 RGBA, glTF metallicRoughness layout:
+///    R = cavity pass-through, G = 255 - input.B (gloss → roughness),
+///    B = input.G (metallic), A = 255. Pixel-identical to the legacy
+///    [`swizzle_wg_mg_dds_to_mr`] output.
+/// 2. `_camomask.dds` — BC4 single-channel, original `_mg.B` preserved
+///    (the WG paint-zone mask channel that drives the Path A camo
+///    exclusion gate in `ship_camo_material.fx`).
+///
+/// The split is the `_mg` analogue of [`split_wg_normal_dds`] (which
+/// preserves `_n.B` as `_nbmask.dds`). Both `_nbmask` and `_camomask`
+/// expose channels that the glTF conformant siblings would otherwise
+/// drop: `_nbmask.B` is the Path B 4-threshold deny list (_n.B);
+/// `_camomask.R` is the Path A paint mask (_mg.B). Engine recipe
+/// authority: `reference/topics/camo/wg_camo_shader_reference.md`
+/// in the pipeline repo.
+///
+/// Single mip — WG splits the mip pyramid across `.dd0` / `.dd1` /
+/// `.dd2` / `.dds` files, each carrying one mip level. Callers iterate
+/// per-file.
+pub fn split_wg_mg_dds(
+    dds_bytes: &[u8],
+) -> Result<(Vec<u8> /* mr */, Vec<u8> /* camomask */), Report<TextureError>> {
+    let rgba = decode_single_mip_dds(dds_bytes)?;
+    let (w, h) = (rgba.width(), rgba.height());
+
+    let mut mr_buf: Vec<u8> = Vec::with_capacity((w * h * 4) as usize);
+    let mut camomask_buf: Vec<u8> = Vec::with_capacity((w * h * 4) as usize);
+
+    for pixel in rgba.pixels() {
         let [r, g, b, _a] = pixel.0;
-        pixel.0 = [r, 255u8.saturating_sub(b), g, 255];
+        // glTF MR: R cavity pass-through, G = 255 - input.B (gloss →
+        // roughness), B = input.G (metallic), A = 255. Pixel-identical
+        // to the legacy swizzle_wg_mg_dds_to_mr.
+        mr_buf.extend_from_slice(&[r, 255u8.saturating_sub(b), g, 255]);
+        // BC4 mask: encoder reads R only; pad G/B/A to keep the RGBA8
+        // surface shape consistent (encoder ignores G/B/A for BC4R).
+        // The preserved channel is input.B = WG mg.B (Path A paint
+        // mask).
+        camomask_buf.extend_from_slice(&[b, 0, 0, 255]);
     }
-    encode_single_mip_dds(&rgba, image_dds::ImageFormat::BC1RgbaUnorm)
+
+    let mr_img = image_dds::image::RgbaImage::from_raw(w, h, mr_buf)
+        .ok_or_else(|| Report::new(TextureError::DdsEncode("mr buf size mismatch".into())))?;
+    let camomask_img = image_dds::image::RgbaImage::from_raw(w, h, camomask_buf)
+        .ok_or_else(|| Report::new(TextureError::DdsEncode("camomask buf size mismatch".into())))?;
+
+    let mr_dds = encode_single_mip_dds(&mr_img, image_dds::ImageFormat::BC1RgbaUnorm)?;
+    let camomask_dds = encode_single_mip_dds(&camomask_img, image_dds::ImageFormat::BC4RUnorm)?;
+
+    Ok((mr_dds, camomask_dds))
 }
 
 /// Split a single-mip WG `_n` DDS into two glTF-conformant siblings:
@@ -1154,7 +1224,7 @@ pub fn split_wg_normal_dds(
 /// siblings alongside each non-conformant file:
 ///
 ///   `<stem>_n.dd?`  → `<stem>_normal.dd?` + `<stem>_nbmask.dd?`
-///   `<stem>_mg.dd?` → `<stem>_mr.dd?`
+///   `<stem>_mg.dd?` → `<stem>_mr.dd?` + `<stem>_camomask.dd?`
 ///
 /// Other DDS files (`_a`, `_ao`, decorative atlases, etc.) are skipped.
 /// The directory walk is non-recursive — callers that need recursion
@@ -1249,17 +1319,28 @@ pub fn swizzle_dir(
         } else if let Some(stem) = stem_no_mip.strip_suffix("_mg") {
             processed += 1;
             let mr_name = format!("{stem}_mr{mip_suffix}");
-            let mr_out  = output_dir.join(&mr_name);
-            if mr_out.exists() { continue; }
-            match swizzle_wg_mg_dds_to_mr(&bytes) {
-                Ok(mr_dds) => {
-                    if let Err(e) = std::fs::write(&mr_out, &mr_dds) {
-                        eprintln!("  Warning: failed to write {}: {e}", mr_out.display());
-                    } else { written += 1; }
+            let mask_name = format!("{stem}_camomask{mip_suffix}");
+            let mr_out = output_dir.join(&mr_name);
+            let mask_out = output_dir.join(&mask_name);
+            let need_mr = !mr_out.exists();
+            let need_mask = !mask_out.exists();
+            if !need_mr && !need_mask { continue; }
+            match split_wg_mg_dds(&bytes) {
+                Ok((mr_dds, mask_dds)) => {
+                    if need_mr {
+                        if let Err(e) = std::fs::write(&mr_out, &mr_dds) {
+                            eprintln!("  Warning: failed to write {}: {e}", mr_out.display());
+                        } else { written += 1; }
+                    }
+                    if need_mask {
+                        if let Err(e) = std::fs::write(&mask_out, &mask_dds) {
+                            eprintln!("  Warning: failed to write {}: {e}", mask_out.display());
+                        } else { written += 1; }
+                    }
                 }
                 Err(e) => {
                     eprintln!(
-                        "  Warning: failed to swizzle WG MG {filename}: {e:?}"
+                        "  Warning: failed to split WG MG {filename}: {e:?}"
                     );
                 }
             }
