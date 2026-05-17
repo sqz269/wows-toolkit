@@ -24,7 +24,9 @@
 //!     +0x10  u64 p1        offset → u32[count] (parent-bone hash; Murmur3_32
 //!                                               seed=0, e.g. "Scene Root"
 //!                                               = 0x10C30510)
-//!     +0x18  u64 p2        offset → (count-1) × 64B matrices + 32B trailer
+//!     +0x18  u64 p2        offset → count × 64B matrices (the last slot
+//!                                   is sometimes a real placement, sometimes
+//!                                   a junk "trailer" — `is_affine` filters)
 //!
 //! +~0x9060   Record array ends. Variable per-file.
 //!
@@ -60,7 +62,11 @@ pub const RECORD_STRIDE: usize = 0x20;
 /// Matrix stride in the p2 payload (bytes): 4×4 f32 column-major.
 pub const MATRIX_SIZE: usize = 64;
 
-/// Size of the unexplained trailer at the end of each record's p2 region.
+/// Legacy: was used when the parser read `count - 1` matrices and treated
+/// the trailing 32 B as opaque. The current parser reads all `count`
+/// matrices and lets [`is_affine`] reject junk slots, so this constant is
+/// no longer consulted by parsing — kept for back-compat with downstream
+/// code that imports it.
 pub const TRAILER_SIZE: usize = 32;
 
 /// Upper bound on bytes to scan for records at file start. Montana's base
@@ -250,10 +256,27 @@ fn read_matrix(buf: &[u8], off: usize) -> Option<[f32; 16]> {
 
 /// Parse all affine placements from a `.skel_ext` file.
 ///
-/// For each parsed record, reads the `count - 1` full matrices at p2 (skipping
-/// the trailing 32 B) and returns those that pass [`is_affine`]. Each
-/// placement also carries the per-index p0 and p1 u32 values from the
-/// record's arrays.
+/// For each parsed record, reads the full `count` matrices at p2 and returns
+/// those that pass [`is_affine`]. Each placement also carries the per-index
+/// p0 and p1 u32 values from the record's arrays.
+///
+/// The original RE notes described the last 32 B of p2 as a "trailer" and the
+/// parser previously read only `count - 1` matrices (skipping the trailing
+/// 32 B). Empirical recheck (AD001_Director_Mk37 / AGM622_8in55_CA68_Azur,
+/// 2026-05-10) showed the bytes at `p2 + (count-1) * 64` are sometimes a
+/// **valid affine matrix** corresponding to the last entry of the record's
+/// p0/p1 arrays — for example, `MP_AM702_Radar_Mk12` lives at index
+/// `count - 1` of record 0x0 in `AD001_Director_Mk37.skel_ext`. Skipping the
+/// last slot dropped that placement (and ~200 others per AD001 build),
+/// causing Iowa-class directors to render with no attached radar in
+/// downstream consumers (the per-HP miscFilter whitelist asks for AM702
+/// only, and the parser never surfaced it).
+///
+/// Reading `count` matrices and letting [`is_affine`] filter junk trailer
+/// bytes (1479 of 1679 records in AD001 fail the affine check and are
+/// correctly dropped) recovers the missing placements without false
+/// positives. See `tools/reference/investigations/misc_filter_per_mount_handoff.md`
+/// in the pipeline repo for the bug's user-visible impact.
 pub fn parse_skel_ext(buf: &[u8]) -> Result<Vec<SkelExtPlacement>, SkelExtError> {
     if buf.len() < RECORD_STRIDE {
         return Err(SkelExtError::TooShort { size: buf.len() });
@@ -266,7 +289,7 @@ pub fn parse_skel_ext(buf: &[u8]) -> Result<Vec<SkelExtPlacement>, SkelExtError>
     let mut out = Vec::new();
     for r in &recs {
         let c = r.count as usize;
-        if c < 2 {
+        if c < 1 {
             continue;
         }
         let p0_off = r.p0 as usize;
@@ -277,12 +300,12 @@ pub fn parse_skel_ext(buf: &[u8]) -> Result<Vec<SkelExtPlacement>, SkelExtError>
         // the whole record (better to drop questionable data than panic).
         if p0_off + c * 4 > buf.len()
             || p1_off + c * 4 > buf.len()
-            || p2_off + (c - 1) * MATRIX_SIZE > buf.len()
+            || p2_off + c * MATRIX_SIZE > buf.len()
         {
             continue;
         }
 
-        for i in 0..(c - 1) {
+        for i in 0..c {
             let m_off = p2_off + i * MATRIX_SIZE;
             let Some(m) = read_matrix(buf, m_off) else {
                 continue;

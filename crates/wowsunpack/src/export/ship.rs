@@ -324,7 +324,41 @@ pub fn write_skel_ext_candidates_json(
         SkelExtSubject::Model { .. } => "model",
     };
 
-    let schema_version = if bone_visual.is_some() { 2 } else { 1 };
+    // schema_version=3 (2026-05-10): the Ry(180°) factor on each placement
+    // is now conditional on the asset's `Rotate_Y_BlendBone` rest pose. WG
+    // ships two valid (bone, mesh) authoring conventions:
+    //   A. Z-mirror BlendBone (`det < 0`) + +Z mesh barrels  → POST-multiply Ry(180°)
+    //   B. Identity BlendBone (`det >= 0`) + -Z mesh barrels → PRE-multiply  Ry(180°)
+    //
+    // The schema_v2 unconditional POST-Ry(180°) was calibrated on convention A
+    // (covers Iowa/Baltimore/Atago and most stock turrets) but over-flips
+    // accessories on convention B (Ohio's AGM182_18in48_MK1_Twin, Fletcher's
+    // AGS001 — anywhere the host's BlendBone is identity, since
+    // `mount.transform = HP · ensure_proper(inv(M_BB))` is then identity-on-M_BB
+    // and absorbs no Ry(180°)).
+    //
+    // Why pre-multiply for convention B (not just drop the factor):
+    //
+    // The WG runtime model is `world_sub = mount.transform · bone_composed
+    // · pl.matrix · pl_local`. Convention A has `mount.transform = HP · Ry(180°)`,
+    // which mirrors the placement's authored (-X, -Z) values through the turret
+    // pivot, landing decoratives on the breech side. Convention B has
+    // `mount.transform = HP · I`, which carries no such mirror. WG authors
+    // both conventions' `.skel_ext` data with the same (-X, -Z) sign convention
+    // (verified empirically: AGM034 / AGM019 / AGM182 all author boats at
+    // negative composed_pos) — so without an explicit Ry(180°) at the toolkit
+    // emit, convention-B accessories land on the muzzle side instead of the
+    // breech side. Pre-multiply restores the mirror through the pivot Y axis.
+    //
+    // A first cut of schema_v3 (2026-05-10 03:00) DROPPED the Ry(180°) entirely
+    // for convention B — that fixed orientation but left positions on the
+    // muzzle side. The pre-multiply correction is the universal form that
+    // addresses both at once (mirror = position + orientation flipped).
+    //
+    // The det<0 detection is a single bit of conditional, fed by the asset's
+    // own `.visual` data — no per-asset list, no swap-pair table. Output is
+    // byte-identical to schema_v2 for every convention-A asset.
+    let schema_version = if bone_visual.is_some() { 3 } else { 1 };
 
     if skel_ext_files.is_empty() {
         let manifest = json!({
@@ -362,12 +396,22 @@ pub fn write_skel_ext_candidates_json(
     let mut seen: HashSet<(u32, i64, i64, i64)> = HashSet::new();
     let mut candidates: Vec<serde_json::Value> = Vec::new();
 
-    // schema_version=2 emit cache: per-bone composed rest poses (avoids
+    // schema_version=2/3 emit cache: per-bone composed rest poses (avoids
     // re-walking the parent chain for every placement that shares a
     // bone — typical .skel_ext has 99% of placements rooted on the
     // same `Rotate_Y`).
     let mut bone_rest_cache: HashMap<u32, Option<[f32; 16]>> = HashMap::new();
     let mut unresolved_p1: HashMap<u32, u32> = HashMap::new();
+
+    // schema_version=3: the post-Ry(180°) is gated on the asset's
+    // `Rotate_Y_BlendBone` det sign. Read it once per asset (None when
+    // the asset has no BB — AA mounts, torpedo tubes, depth charges —
+    // which fall back to identity → no Ry(180°), matching their
+    // `mount.transform = HP` parent placement).
+    let bb_is_z_mirror: bool = bone_visual
+        .and_then(|(vp, strings)| vp.find_node_local_matrix("Rotate_Y_BlendBone", strings))
+        .map(|bb_local| mat3_determinant(&bb_local) < 0.0)
+        .unwrap_or(false);
 
     for (segment, pl) in &global_placements {
         let p = pl.position();
@@ -382,23 +426,30 @@ pub fn write_skel_ext_candidates_json(
         }
 
         let emit_matrix = if let Some((vp, strings)) = bone_visual {
-            // schema_version=2: compose parent-bone rest pose into the
-            // placement, post-multiply by Ry(180°), scale translation
-            // ×15. This produces a matrix the consumer can decompose
-            // verbatim — no further Z-mirror, Ry(180°) flip, or Y
-            // bone-rest offset needed at the consumer side.
+            // schema_version=2/3: compose parent-bone rest pose into the
+            // placement, conditionally post-multiply by Ry(180°) (v3:
+            // only when the asset's `Rotate_Y_BlendBone` is Z-mirror;
+            // v2 was unconditional), scale translation ×15. This produces
+            // a matrix the consumer can decompose verbatim — no further
+            // Z-mirror, Ry(180°) flip, or Y bone-rest offset needed at
+            // the consumer side.
             //
-            // Why these three steps fold into one toolkit-side emit:
+            // Why these steps fold into one toolkit-side emit:
             //   - bone composition: WG runtime parents the placement
             //     under the parent bone (typically `Rotate_Y` for guns,
             //     the asset's own root node for directors). Without
             //     composing the bone rest, the placement lands at the
             //     bone's position rather than at the asset root.
-            //   - Ry(180°) post-multiply: WG asset GLBs author their
-            //     "natural front" pointing opposite to where the
-            //     `negate_z` basis conversion alone would face them.
-            //     Folding the 180° rotation into emit means consumers
-            //     don't need per-asset facing logic.
+            //   - Conditional Ry(180°) post-multiply: when the asset's
+            //     `mount.transform = HP · ensure_proper(inv(M_BB))` is
+            //     `HP · Ry(180°)` (M_BB is Z-mirror), the post-Ry(180°)
+            //     on the sub-matrix composes with the host's Ry(180°)
+            //     rotation to produce the visually-correct orientation.
+            //     When `mount.transform = HP` (M_BB is identity), there's
+            //     no host Ry(180°) to compose with, so the sub-matrix
+            //     must NOT carry one either or directional accessories
+            //     end up 180° flipped. The det<0 test is the single bit
+            //     that distinguishes the two cases.
             //   - Skip negate_z entirely: the previous schema_version=1
             //     emit applied `S·M·S` which the consumer then had to
             //     undo with another `S·M·S` (composing to identity).
@@ -412,15 +463,63 @@ pub fn write_skel_ext_candidates_json(
                 Some(rest) => {
                     // composed_native = bone_rest @ pl.matrix
                     let composed = mat4_mul_col_major(rest, &pl.matrix);
-                    // composed @ Ry(180°)  (post-multiply)
-                    let with_ry180 = mat4_mul_col_major(&composed, &RY_180_4X4);
+                    // Convention-A (Z-mirror M_BB): POST-multiply Ry(180°).
+                    // Matches schema_v2 byte-equal — mount.transform carries
+                    // its own Ry(180°) (from HP · ensure_proper(inv(M_BB))),
+                    // and the post-Ry on sub composes with that to land
+                    // boats / periscopes on the breech side of the turret.
+                    //
+                    // Convention-B (identity M_BB): mirror only the X+Z
+                    // translation through the turret pivot Y axis; leave
+                    // rotation untouched.
+                    //
+                    //   composed = R_c | t_c    →    emit = R_c | (−t_c.x, t_c.y, −t_c.z)
+                    //
+                    // Why position-only and not pre-multiply Ry(180°):
+                    //
+                    // The WG-authored .skel_ext data uses the same negative-
+                    // X/negative-Z sign convention for both A and B turrets
+                    // (verified: AGM034 boat composed_pos (-5.63, 1.64, -4.56);
+                    // AGM182 boat composed_pos (-4.70, 1.82, -3.24)). Convention
+                    // A's `mount.transform = HP · Ry(180°)` mirrors this through
+                    // the pivot, putting boats on the breech side; convention B's
+                    // `mount.transform = HP · I` carries no such mirror, so the
+                    // placement-side has to do it. Post-mul on the sub matrix
+                    // doesn't affect col_3 (translation), so we cannot use the
+                    // schema_v2 form — we have to reach into col_3 directly.
+                    //
+                    // Pre-multiplying Ry(180°) (an earlier candidate) WOULD
+                    // mirror col_3, but it ALSO negates rotation rows 0+2,
+                    // which over-rotates assets whose mesh-local origin is
+                    // not at the bone center. Example: AM788_Rangefinder is
+                    // authored with mesh extents at Z ∈ [+6.24, +8.54] (the
+                    // optic head sits 6-9 m forward of the placement origin)
+                    // while composed_pos = (0, 0.09, 0). Pre-mul would leave
+                    // its position at the pivot but rotate it 180° around Y,
+                    // sending the mesh into world −Z (muzzle side). Position-
+                    // only flip leaves the rotation as identity, so the mesh
+                    // extent stays in world +Z (breech side, correct).
+                    //
+                    // For Y-symmetric decoratives (AM055 boats are X+Z
+                    // mirror-symmetric, AM777 periscopes are X+Z symmetric)
+                    // the rotation choice is invisible — both pre-mul and
+                    // position-only render the same. Position-only is the
+                    // strict refinement that doesn't break the Z-asymmetric
+                    // assets like AM788.
+                    let final_unscaled = if bb_is_z_mirror {
+                        mat4_mul_col_major(&composed, &RY_180_4X4)
+                    } else {
+                        let mut m = composed;
+                        m[12] = -m[12]; // negate world-x of col_3
+                        m[14] = -m[14]; // negate world-z of col_3
+                        m
+                    };
                     // Scale translation × 15 (native → metres). No
                     // basis conversion: the matrix is in WG-native LH
                     // coordinates, but the asset's GLB vertices were
-                    // also negate_z'd, so the LH placement matches
-                    // the negate_z'd GLB after Ry(180°) flips the
-                    // asset's authored-forward to glTF-forward.
-                    let mut m = with_ry180;
+                    // also negate_z'd, so the LH placement matches the
+                    // negate_z'd GLB.
+                    let mut m = final_unscaled;
                     m[12] *= crate::models::skel_ext::NATIVE_TO_METRES;
                     m[13] *= crate::models::skel_ext::NATIVE_TO_METRES;
                     m[14] *= crate::models::skel_ext::NATIVE_TO_METRES;
@@ -482,11 +581,12 @@ pub fn write_skel_ext_candidates_json(
         "pipeline": {
             "toolkit_version": toolkit_version,
             "generated_at":    now,
-            "skel_ext_emit": if schema_version == 2 {
-                "bone_composed + Ry(180°) + ×15 (post-2026-05-08)"
-            } else {
-                "to_metric_glft (legacy: S·M·S + ×15)"
+            "skel_ext_emit": match schema_version {
+                3 => "bone_composed + {Ry(180°) post if det(M_BB)<0 else col_3 X+Z negate} + ×15 (post-2026-05-10)",
+                2 => "bone_composed + Ry(180°) post + ×15 (2026-05-08; over-flips identity-BB hosts)",
+                _ => "to_metric_glft (legacy: S·M·S + ×15)",
             },
+            "host_bone_z_mirror": bb_is_z_mirror,
         },
         "stats": {
             "file_count":         skel_ext_files.len(),
@@ -2457,34 +2557,52 @@ pub fn build_material_entries_for_visual(
         };
 
         let mut textures_obj = serde_json::Map::new();
+        let mut floats_obj = serde_json::Map::new();
         for prop in &mat.properties {
-            if prop.property_type != PropertyType::Texture {
-                continue;
+            match prop.property_type {
+                PropertyType::Texture => {
+                    let hash = match &prop.value {
+                        Some(PropertyValue::Texture(h)) if *h != 0 => *h,
+                        _ => continue,
+                    };
+                    let Some(&tex_idx) = self_id_index.get(&hash) else {
+                        continue;
+                    };
+                    let vfs_path = db.reconstruct_path(tex_idx, self_id_index);
+                    let (stem, channel) = derive_texture_stem_and_channel(&vfs_path);
+
+                    let slot_name = match prop.name {
+                        Some(n) => n.to_string(),
+                        None => format!("0x{:08x}", prop.name_hash),
+                    };
+
+                    textures_obj.insert(
+                        slot_name,
+                        json!({
+                            "stem":     stem,
+                            "channel":  channel,
+                            "vfs_path": vfs_path,
+                            "hash":     format!("0x{:016x}", hash),
+                        }),
+                    );
+                }
+                // Capture float scalars too — the engine reads
+                // `g_detailNormalInfluence`, `g_detailScaleU`, etc. as
+                // per-material blend params for the detail-map normal
+                // layer (PBS_ship_metallic chunk012:43-74). Downstream
+                // pipeline consumers (sidecar emit) pull these out
+                // alongside the texture references.
+                PropertyType::FloatA | PropertyType::FloatB => {
+                    if let Some(PropertyValue::Float(v)) = prop.value {
+                        let name = match prop.name {
+                            Some(n) => n.to_string(),
+                            None => format!("0x{:08x}", prop.name_hash),
+                        };
+                        floats_obj.insert(name, json!(v));
+                    }
+                }
+                _ => {}
             }
-            let hash = match &prop.value {
-                Some(PropertyValue::Texture(h)) if *h != 0 => *h,
-                _ => continue,
-            };
-            let Some(&tex_idx) = self_id_index.get(&hash) else {
-                continue;
-            };
-            let vfs_path = db.reconstruct_path(tex_idx, self_id_index);
-            let (stem, channel) = derive_texture_stem_and_channel(&vfs_path);
-
-            let slot_name = match prop.name {
-                Some(n) => n.to_string(),
-                None => format!("0x{:08x}", prop.name_hash),
-            };
-
-            textures_obj.insert(
-                slot_name,
-                json!({
-                    "stem":     stem,
-                    "channel":  channel,
-                    "vfs_path": vfs_path,
-                    "hash":     format!("0x{:016x}", hash),
-                }),
-            );
         }
 
         entries.push(json!({
@@ -2496,6 +2614,7 @@ pub fn build_material_entries_for_visual(
             "render_set":          render_set_name,
             "skinned":             rs.skinned,
             "textures":            textures_obj,
+            "floats":              floats_obj,
         }));
     }
 
