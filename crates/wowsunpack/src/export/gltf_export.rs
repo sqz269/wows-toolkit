@@ -58,6 +58,14 @@ struct DecodedPrimitive {
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     uvs: Vec<[f32; 2]>,
+    /// MikkTSpace tangents (vec4: xyz = tangent dir, w = handedness sign
+    /// per glTF spec). Empty when the input lacked the data the
+    /// generator needs (no UVs, mismatched array lengths, degenerate
+    /// triangles) — in that case the emit skips the TANGENT attribute
+    /// and consumers fall back to derivative-based reconstruction.
+    /// Populated by [`tangents::compute_mikkt_tangents`] at the same
+    /// site that fills `positions` / `normals` / `uvs`.
+    tangents: Vec<[f32; 4]>,
     indices: Vec<u32>,
     material_name: String,
     /// MFM stem for texture lookup (e.g. "JSB039_Yamato_1945_Hull").
@@ -1619,11 +1627,19 @@ pub fn export_geometry_raw(geometry: &MergedGeometry, writer: &mut impl Write) -
         let mut verts = unpack_vertices(vert_slice, stride, &format);
         scale_positions_to_metres(&mut verts.positions);
 
+        let tangents = super::tangents::compute_mikkt_tangents(
+            &verts.positions,
+            &verts.normals,
+            &verts.uvs,
+            &indices,
+        );
+
         // Build a DecodedPrimitive for reuse with add_primitive_to_root.
         let prim = DecodedPrimitive {
             positions: verts.positions,
             normals: verts.normals,
             uvs: verts.uvs,
+            tangents,
             indices,
             material_name: format!("Primitive_{i}"),
             mfm_stem: None,
@@ -1885,10 +1901,17 @@ fn decode_render_set_primitive(
         (None, None)
     };
 
+    let tangents = super::tangents::compute_mikkt_tangents(
+        &verts.positions,
+        &verts.normals,
+        &verts.uvs,
+        &indices,
+    );
     Ok(Some(DecodedPrimitive {
         positions: verts.positions,
         normals: verts.normals,
         uvs: verts.uvs,
+        tangents,
         indices,
         material_name,
         mfm_stem,
@@ -2063,10 +2086,17 @@ fn collect_primitives(
             (None, None)
         };
 
+        let tangents = super::tangents::compute_mikkt_tangents(
+            &verts.positions,
+            &verts.normals,
+            &verts.uvs,
+            &indices,
+        );
         result.push(DecodedPrimitive {
             positions: verts.positions,
             normals: verts.normals,
             uvs: verts.uvs,
+            tangents,
             indices,
             material_name,
             mfm_stem,
@@ -2724,6 +2754,50 @@ fn add_primitive_to_root(
         None
     };
 
+    // --- Tangents (MikkTSpace; vec4 = xyz tangent, w handedness sign).
+    // Emitted whenever the upstream generator produced a per-vertex
+    // tangent. glTF spec requires Vec4 with the handedness byte in .w so
+    // shading-side bitangent = sign × cross(normal, tangent.xyz).
+    let tangent_accessor = if !prim.tangents.is_empty() {
+        let byte_offset = bin_data.len();
+        for t in &prim.tangents {
+            bin_data.extend_from_slice(&t[0].to_le_bytes());
+            bin_data.extend_from_slice(&t[1].to_le_bytes());
+            bin_data.extend_from_slice(&t[2].to_le_bytes());
+            bin_data.extend_from_slice(&t[3].to_le_bytes());
+        }
+        pad_to_4(bin_data);
+        let byte_length = bin_data.len() - byte_offset;
+
+        let bv = root.push(json::buffer::View {
+            buffer: json::Index::new(0),
+            byte_length: USize64::from(byte_length),
+            byte_offset: Some(USize64::from(byte_offset)),
+            byte_stride: None,
+            target: Some(Valid(json::buffer::Target::ArrayBuffer)),
+            name: None,
+            extensions: Default::default(),
+            extras: Default::default(),
+        });
+
+        Some(root.push(json::Accessor {
+            buffer_view: Some(bv),
+            byte_offset: Some(USize64(0)),
+            count: USize64::from(prim.tangents.len()),
+            component_type: Valid(json::accessor::GenericComponentType(json::accessor::ComponentType::F32)),
+            type_: Valid(json::accessor::Type::Vec4),
+            min: None,
+            max: None,
+            name: None,
+            normalized: false,
+            sparse: None,
+            extensions: Default::default(),
+            extras: Default::default(),
+        }))
+    } else {
+        None
+    };
+
     // --- Indices ---
     let indices_accessor = if !prim.indices.is_empty() {
         let byte_offset = bin_data.len();
@@ -2771,6 +2845,9 @@ fn add_primitive_to_root(
     }
     if let Some(uv) = uv_accessor {
         attributes.insert(Valid(json::mesh::Semantic::TexCoords(0)), uv);
+    }
+    if let Some(tan) = tangent_accessor {
+        attributes.insert(Valid(json::mesh::Semantic::Tangents), tan);
     }
 
     // Determine cache key: prefer MFM stem, fall back to material name.

@@ -8,6 +8,8 @@ pub mod gltf_export;
 #[cfg(feature = "models")]
 pub mod ship;
 #[cfg(feature = "models")]
+pub mod tangents;
+#[cfg(feature = "models")]
 pub mod texture;
 
 /// When true, export functions emit verbose diagnostic output to stderr
