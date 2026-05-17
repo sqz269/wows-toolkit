@@ -1263,6 +1263,15 @@ fn build_map_mesh_primitive(
             // Textured material: reference the shared glTF Texture.
             let (alpha_mode, alpha_cutoff_val, double_sided) = if let Some(cutoff) = mesh.alpha_cutoff {
                 (Valid(json::material::AlphaMode::Mask), Some(json::material::AlphaCutoff(cutoff)), true)
+            } else if mesh.alpha_blend {
+                // WG `ship_transparent_*.fx` materials (SHIPGLASS, semi-transparent
+                // armor visualizers). Without this branch, textured-transparent
+                // meshes got AlphaMode::Opaque, which broke downstream consumers
+                // that rely on glTF alphaMode for blending state (three.js's
+                // `material.transparent`, Blender, etc.). Sidecar's
+                // `render_queue: "transparent"` is now the authoritative source;
+                // this aligns the GLB itself.
+                (Valid(json::material::AlphaMode::Blend), None, true)
             } else {
                 (Valid(json::material::AlphaMode::Opaque), None, false)
             };
