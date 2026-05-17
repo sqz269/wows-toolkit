@@ -919,15 +919,19 @@ pub struct PbrChannels {
 /// or the properties aren't present.
 ///
 /// The `metallicGlossMap` channel is swizzled from WG's packing
-/// (R=cavity/specOcc, G=metallic, B=gloss, A=unused) to the glTF
-/// metallicRoughnessTexture convention (R=unused, G=roughness, B=metallic,
-/// A=unused) via [`repack_wg_mg_to_gltf_mr`]. `normalMap` and
-/// `ambientOcclusionMap` pass through unchanged (already glTF-compatible).
+/// (R=gloss, G=metallic, B=binary paint mask, A=unused) to the glTF
+/// metallicRoughnessTexture convention (R=gloss preserved, G=roughness,
+/// B=metallic, A=unused) via [`repack_wg_mg_to_gltf_mr`]. `normalMap`
+/// and `ambientOcclusionMap` pass through unchanged (already
+/// glTF-compatible).
 ///
-/// Packing authority: WoWS `PBS_ship_metallic` shader fxo metadata,
-/// cross-referenced with empirical channel statistics on 4 PBS
-/// materials. See `tools/toolkit_integration/pbr_textures.md` in the
-/// pipeline repo for the full derivation.
+/// Packing authority: ship_camo_material.win.dx11.chunk001 DXBC trace
+/// (the camo PS reads `mg.G` for metallic at line 24/26, `mg.R` for
+/// the BRDF roughness at lines 43-45, and `mg.B` as the camo paint
+/// lerp gate at line 42) + empirical channel histograms on the Montana
+/// hull `_mg.dds` (R continuous, G narrow, B binary-score 87.6%). See
+/// `reference/topics/camo/wg_camo_shader_reference.md` §"Path A" in
+/// the pipeline repo for the engine recipe.
 pub fn load_pbr_channels(
     vfs: &vfs::VfsPath,
     db: &PrototypeDatabase<'_>,
@@ -965,12 +969,28 @@ pub fn load_pbr_channels(
 /// Repack WG's `metallicGlossMap` PNG into a glTF-conformant
 /// `metallicRoughnessTexture` PNG.
 ///
-/// WG packing (observed + confirmed against PBS_ship_metallic.fxo strings
-/// in the SEA-group shader backup):
-///   R = cavity / specular occlusion (continuous, panel-line detail)
-///   G = metallic mask (bimodal 0/1)
-///   B = gloss (continuous, higher = smoother)
-///   A = unused (BC1 no-alpha path, always 255)
+/// WG packing (verified 2026-05-17 from the ship_camo_material chunk001
+/// DXBC trace + empirical channel histograms on Montana hull
+/// `_mg.dds`):
+///   R = gloss          (continuous; engine recipe at chunk001:43-45
+///                       computes `roughness = 1 - mg.R` for the BRDF)
+///   G = metallic       (engine reads `mg.G` for the F0/Lambert split
+///                       at chunk001:24-26; can be bimodal or continuous
+///                       depending on the material)
+///   B = paint mask     (binary 0/255 in WG art convention; the camo
+///                       paint lerp gate at chunk001:42, also reused by
+///                       `*_emissive.mfm` and Path B's
+///                       `useCamoMaskGlobal`)
+///   A = unused         (BC1 no-alpha path, always 255)
+///
+/// **History.** Prior to 2026-05-17 the labels here were R=cavity /
+/// B=gloss, taken from the 2026-04-22 Phase B empirical inspection
+/// (`pbr_textures.md`). That inspection split channels visually in
+/// Blender and called B "gloss-like" without checking the binary-score
+/// metric. Subsequent DXBC RE + histograms reversed the R/B labels.
+/// The earlier wrong swizzle `out.G = 255 - in.B` consequently emitted
+/// `1 - paint_mask` into the roughness slot — painted areas rendered
+/// as mirror-smooth and unpainted as matte.
 ///
 /// glTF metallicRoughnessTexture packing (spec):
 ///   R = unused (or occlusion when using combined ORM)
@@ -979,10 +999,19 @@ pub fn load_pbr_channels(
 ///   A = unused
 ///
 /// Swizzle:
-///   out.R = in.R         (preserve cavity; no-op if consumer ignores R)
-///   out.G = 255 - in.B   (roughness = 1 - gloss)
+///   out.R = in.R         (preserve gloss verbatim; harmless since glTF
+///                         consumers ignore .R unless using combined
+///                         ORM, in which case our separate
+///                         `occlusionTexture` slot is the canonical
+///                         source)
+///   out.G = 255 - in.R   (roughness = 1 - gloss)
 ///   out.B = in.G         (metallic passes through)
 ///   out.A = 255
+///
+/// The paint-mask channel (in.B) is preserved on disk as a separate
+/// `_camomask.dd?` BC4 sibling by [`split_wg_mg_dds`]; in-GLB consumers
+/// must bind that sibling to recover the engine-faithful camo paint
+/// gate.
 ///
 /// The gloss→roughness inversion is *linear* here. The WG shader may
 /// apply a `g_legacyGlossRemap` power curve before the inversion; when
@@ -999,12 +1028,15 @@ pub fn repack_wg_mg_to_gltf_mr(png_bytes: &[u8]) -> Result<Vec<u8>, Report<Textu
     let mut rgba = img.into_rgba8();
 
     for pixel in rgba.pixels_mut() {
-        let [r, g, b, _a] = pixel.0;
-        // R: pass-through cavity/specOcc (glTF readers that use combined
-        // ORM pack occlusion in R; dedicated consumers can ignore it).
-        // G: roughness = 255 - gloss.
+        let [r, g, _b, _a] = pixel.0;
+        // R: pass-through gloss (glTF readers that use combined ORM
+        //    pack occlusion in R, but our pipeline emits a separate
+        //    occlusionTexture, so dedicated consumers can ignore .R).
+        // G: roughness = 255 - gloss = 255 - mg.R.
         // B: metallic from WG's G channel.
-        pixel.0 = [r, 255u8.saturating_sub(b), g, 255];
+        // (input .B is the binary paint mask, preserved as a sibling
+        //  `_camomask.dd?` by split_wg_mg_dds — NOT consumed here.)
+        pixel.0 = [r, 255u8.saturating_sub(r), g, 255];
     }
 
     let mut out = Vec::new();
@@ -1095,10 +1127,11 @@ fn encode_single_mip_dds(
 /// Swizzle a single-mip WG `_mg` DDS into a glTF-conformant `_mr` DDS.
 ///
 /// The pixel-level swizzle is identical to [`repack_wg_mg_to_gltf_mr`]
-/// (R cavity pass-through, G = 255 - B (gloss → roughness), B = G
-/// (metallic), A = 255). Output format is `BC1RgbaUnorm` to match the
-/// WG MG packing (BC1 no-alpha is canonical for `_mg` files; A is
-/// always unused).
+/// (R gloss pass-through, G = 255 - R (gloss → roughness), B = G
+/// (metallic), A = 255). See that function's doc for the full channel
+/// derivation. Output format is `BC1RgbaUnorm` to match the WG MG
+/// packing (BC1 no-alpha is canonical for `_mg` files; A is always
+/// unused).
 ///
 /// Thin wrapper around [`split_wg_mg_dds`] that drops the `_camomask`
 /// output. Retained for callers that only need the MR sibling; new
@@ -1116,12 +1149,13 @@ pub fn swizzle_wg_mg_dds_to_mr(dds_bytes: &[u8]) -> Result<Vec<u8>, Report<Textu
 /// Split a single-mip WG `_mg` DDS into two glTF-conformant siblings:
 ///
 /// 1. `_mr.dds` — BC1 RGBA, glTF metallicRoughness layout:
-///    R = cavity pass-through, G = 255 - input.B (gloss → roughness),
-///    B = input.G (metallic), A = 255. Pixel-identical to the legacy
-///    [`swizzle_wg_mg_dds_to_mr`] output.
+///    R = gloss pass-through, G = 255 - input.R (gloss → roughness),
+///    B = input.G (metallic), A = 255. Pixel-identical to
+///    [`repack_wg_mg_to_gltf_mr`] — see that function's doc for the
+///    channel derivation.
 /// 2. `_camomask.dds` — BC4 single-channel, original `_mg.B` preserved
-///    (the WG paint-zone mask channel that drives the Path A camo
-///    exclusion gate in `ship_camo_material.fx`).
+///    (the binary paint mask channel that drives the camo exclusion
+///    gate at chunk001:42 of `ship_camo_material.fx`).
 ///
 /// The split is the `_mg` analogue of [`split_wg_normal_dds`] (which
 /// preserves `_n.B` as `_nbmask.dds`). Both `_nbmask` and `_camomask`
@@ -1145,13 +1179,13 @@ pub fn split_wg_mg_dds(
 
     for pixel in rgba.pixels() {
         let [r, g, b, _a] = pixel.0;
-        // glTF MR: R cavity pass-through, G = 255 - input.B (gloss →
-        // roughness), B = input.G (metallic), A = 255. Pixel-identical
-        // to the legacy swizzle_wg_mg_dds_to_mr.
-        mr_buf.extend_from_slice(&[r, 255u8.saturating_sub(b), g, 255]);
+        // glTF MR: R gloss pass-through, G = 255 - input.R (gloss →
+        // roughness), B = input.G (metallic), A = 255. See
+        // repack_wg_mg_to_gltf_mr doc for the channel derivation.
+        mr_buf.extend_from_slice(&[r, 255u8.saturating_sub(r), g, 255]);
         // BC4 mask: encoder reads R only; pad G/B/A to keep the RGBA8
         // surface shape consistent (encoder ignores G/B/A for BC4R).
-        // The preserved channel is input.B = WG mg.B (Path A paint
+        // The preserved channel is input.B = WG mg.B (binary paint
         // mask).
         camomask_buf.extend_from_slice(&[b, 0, 0, 255]);
     }
