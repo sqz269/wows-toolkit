@@ -4,7 +4,6 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::io::Read;
 use std::io::Write;
 
 use gltf_json as json;
@@ -677,39 +676,22 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         }
     }
 
-    // Generate terrain mesh, optionally with lightmap texture.
-    let terrain = env.terrain.as_ref().map(|cfg| {
-        let mut mesh = generate_terrain_mesh(cfg);
-
-        // Try to load the lightmap shadow DDS as terrain albedo.
-        if let Some(vfs) = vfs
-            && let Some(lm_path) = &cfg.lightmap_path
-        {
-            let dds_bytes: Option<Vec<u8>> = (|| {
-                let mut buf = Vec::new();
-                vfs.join(lm_path).ok()?.open_file().ok()?.read_to_end(&mut buf).ok()?;
-                if buf.is_empty() { None } else { Some(buf) }
-            })();
-            match dds_bytes {
-                Some(dds_bytes) => match texture::dds_to_png_resized(&dds_bytes, max_texture_size) {
-                    Ok(mut png_bytes) => {
-                        // Force alpha=255: the lightmap DDS stores shadow data in
-                        // the alpha channel which causes terrain transparency in viewers.
-                        texture::force_png_opaque(&mut png_bytes);
-                        let idx = textures.len();
-                        textures.push(png_bytes);
-                        mesh.albedo_texture = Some(idx);
-                        mesh.base_color = [1.0, 1.0, 1.0, 1.0];
-                        eprintln!("  Terrain lightmap loaded: {lm_path}");
-                    }
-                    Err(e) => eprintln!("  Warning: failed to decode terrain lightmap: {e}"),
-                },
-                None => eprintln!("  Warning: terrain lightmap not found: {lm_path}"),
-            }
-        }
-
-        mesh
-    });
+    // Generate terrain mesh. We DON'T use `lightmap_shadow.dds` as the
+    // terrain albedo — empirically (Okinawa, verified by both
+    // `image_dds` and Pillow) the RGB channels of that DDS decode to
+    // striped non-albedo noise (likely a packed cascade-shadow / detail-
+    // blend mask the engine combines with separate tiled detail textures
+    // from `terrain.bin`'s RLE region). Feeding that through the GLB as
+    // a baseColorTexture produces a yellow/orange/red checkerboard
+    // pattern that doesn't resemble any real terrain.
+    //
+    // Until terrain.bin RLE detail decoding lands (audit doc § "Terrain
+    // detail RLE"), the terrain mesh renders with the default
+    // `generate_terrain_mesh` brown color. The lightmap *could* be
+    // usefully consumed as a luminance multiplier once we have a real
+    // albedo to multiply against — leaving the path in place behind a
+    // comment so a future pass knows the file exists.
+    let terrain = env.terrain.as_ref().map(generate_terrain_mesh);
 
     // Generate water plane.
     let water = env.water.as_ref().map(generate_water_mesh);
@@ -1569,6 +1551,14 @@ fn build_map_mesh_primitive(
             let double_sided = mesh.double_sided
                 || mesh.alpha_cutoff.is_some()
                 || mesh.alpha_blend;
+            // Map materials are environmental geometry (terrain, buildings,
+            // foliage cards) — non-metal, rough. glTF defaults (metallic=1,
+            // roughness=1) treat the base color as F0 specular reflectance,
+            // which with no environment map blacks out the diffuse and
+            // collapses the surface to faint specular highlights only.
+            // Explicit `metallic=0, roughness=1` puts the surface into pure
+            // diffuse so the texture/color reads correctly under any
+            // lighting setup.
             root.push(json::Material {
                 name: Some(mesh.name.clone()),
                 pbr_metallic_roughness: json::material::PbrMetallicRoughness {
@@ -1579,6 +1569,8 @@ fn build_map_mesh_primitive(
                         extras: Default::default(),
                     }),
                     base_color_factor: json::material::PbrBaseColorFactor([1.0, 1.0, 1.0, 1.0]),
+                    metallic_factor: json::material::StrengthFactor(0.0),
+                    roughness_factor: json::material::StrengthFactor(1.0),
                     ..Default::default()
                 },
                 alpha_mode,
@@ -1591,6 +1583,8 @@ fn build_map_mesh_primitive(
                 name: Some(mesh.name.clone()),
                 pbr_metallic_roughness: json::material::PbrMetallicRoughness {
                     base_color_factor: json::material::PbrBaseColorFactor(mesh.base_color),
+                    metallic_factor: json::material::StrengthFactor(0.0),
+                    roughness_factor: json::material::StrengthFactor(1.0),
                     ..Default::default()
                 },
                 alpha_mode: Valid(json::material::AlphaMode::Blend),
@@ -1602,6 +1596,8 @@ fn build_map_mesh_primitive(
                 name: Some(mesh.name.clone()),
                 pbr_metallic_roughness: json::material::PbrMetallicRoughness {
                     base_color_factor: json::material::PbrBaseColorFactor(mesh.base_color),
+                    metallic_factor: json::material::StrengthFactor(0.0),
+                    roughness_factor: json::material::StrengthFactor(1.0),
                     ..Default::default()
                 },
                 double_sided: mesh.double_sided,
