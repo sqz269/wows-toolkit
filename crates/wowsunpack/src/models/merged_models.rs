@@ -77,12 +77,28 @@ pub struct SkeletonProto {
 
 /// A single model instance from `space.bin`, combining a world transform
 /// with a reference to the model prototype via `path_id`.
+///
+/// Per-instance metadata (`is_landscape`, `min_quality_level`) is surfaced
+/// from engine offsets +0x58 / +0x5b of the 0x70-stride ModelInstance
+/// record. The dye / material-instance override arrays at +0x60 / +0x68
+/// are parsed but not yet exported (those need a separate consumer
+/// pass — see audit doc Phase 2 backlog).
 #[derive(Debug)]
 pub struct SpaceInstance {
     /// 4×4 world transform matrix (column-major, row 3 = translation + w=1).
     pub transform: Matrix4x4,
     /// selfId matching a `MergedModelRecord::path_id` in the sibling `models.bin`.
     pub path_id: u64,
+    /// Engine `isLandscape` flag — true for LNR* / TILEDLAND backdrop
+    /// landmass proxies that the engine renders with a more aggressive
+    /// `landscapeBias` LOD policy. Consumers can use this to apply
+    /// distance fog or LOD distance gating that matches engine behavior.
+    pub is_landscape: bool,
+    /// Engine `minimumQualityLevel` (graphics::preferences::Quality enum:
+    /// 0=Low, 1=Medium, 2=High, 3=Ultra). The engine skips this instance
+    /// when the runtime quality preset is below this value; useful as a
+    /// viewer-side detail filter.
+    pub min_quality_level: u8,
 }
 
 /// Parsed `space.bin` instance placements.
@@ -168,14 +184,31 @@ fn parse_visual_proto_inline_fields(input: &mut &[u8]) -> WResult<VisualProtoInl
     })
 }
 
-// space.bin instance entry
+// space.bin instance entry (engine `SpaceContent::ModelInstance`, stride 0x70)
+//
+// Layout (Ghidra @ FUN_1408985c0, audit doc 2026-05-21):
+//   +0x00  16× f32   transform
+//   +0x40  u32       guidCount       — DROPPED
+//   +0x44  i64       guids relptr    — DROPPED
+//   +0x50  u64       resourceId      — path_id
+//   +0x58  u8        isLandscape
+//   +0x59  u8        modelDyesCount
+//   +0x5a  u8        materialInstanceCount
+//   +0x5b  u8        minimumQualityLevel
+//   +0x5c  4 bytes   pad
+//   +0x60  i64       modelDyes relptr            — DROPPED (Phase 2)
+//   +0x68  i64       materialInstances relptr    — DROPPED (Phase 2)
 
 fn parse_space_instance_entry(input: &mut &[u8]) -> WResult<SpaceInstance> {
     let transform = parser_utils::parse_matrix4x4(input)?;
-    let _ = take(16usize).parse_next(input)?; // padding +0x40..+0x50
+    let _ = take(16usize).parse_next(input)?; // +0x40..+0x50: guidCount + guids relptr
     let path_id = le_u64.parse_next(input)?;
-    let _ = take(24usize).parse_next(input)?; // remaining to 0x70 stride
-    Ok(SpaceInstance { transform, path_id })
+    let is_landscape = le_u8.parse_next(input)? != 0;
+    let _model_dyes_count = le_u8.parse_next(input)?;
+    let _material_instance_count = le_u8.parse_next(input)?;
+    let min_quality_level = le_u8.parse_next(input)?;
+    let _ = take(20usize).parse_next(input)?; // +0x5c..+0x70: pad + dyes + materialInstances relptrs
+    Ok(SpaceInstance { transform, path_id, is_landscape, min_quality_level })
 }
 
 // ── Helper: parse array at offset, wrapping winnow errors ───────────────────

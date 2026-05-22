@@ -358,6 +358,19 @@ pub struct MapModelInstance {
     /// map-local prototypes (vri == 0 or unresolvable). When set, downstream
     /// GLB export uses it as the node name instead of the generic `Instance_N`.
     pub asset_name: Option<String>,
+    /// Engine `isLandscape` flag from the ModelInstance record. Identifies
+    /// LNR* / TILEDLAND backdrop landmass proxies that the engine renders
+    /// with a coarser LOD policy + distance-fog attenuation.
+    pub is_landscape: bool,
+    /// Engine `minimumQualityLevel` (0=Low, 1=Medium, 2=High, 3=Ultra).
+    /// Engine skips the instance when runtime quality is below this.
+    pub min_quality_level: u8,
+    /// Per-LOD extent in metres from the prototype's `VisualProto.lods`.
+    /// Last value is typically the asset's "draw distance" cap; engine
+    /// LOD-switches the mesh by camera distance against these values.
+    /// Length matches `record.visual_proto.lods.len()`; empty when the
+    /// prototype has no LOD chain.
+    pub lod_extents: Vec<f32>,
 }
 
 /// Complete decoded map scene, format-agnostic.
@@ -568,6 +581,14 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         model_mesh_ranges.push(range_start..model_meshes.len());
     }
 
+    // Per-prototype LOD extent arrays: cached once per model to avoid
+    // re-cloning per-instance. lods.iter().map(|l| l.extent).collect().
+    let model_lod_extents: Vec<Vec<f32>> = merged
+        .models
+        .iter()
+        .map(|r| r.visual_proto.lods.iter().map(|l| l.extent).collect())
+        .collect();
+
     // Build model instances from space.bin transforms.
     let mut model_instances: Vec<MapModelInstance> = Vec::new();
     let mut vegetation_instances: Vec<(usize, Vec<[f32; 3]>)> = Vec::new();
@@ -585,6 +606,9 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                 mesh_range: range.clone(),
                 transform: inst.transform.0,
                 asset_name: asset_names[model_idx].clone(),
+                is_landscape: inst.is_landscape,
+                min_quality_level: inst.min_quality_level,
+                lod_extents: model_lod_extents[model_idx].clone(),
             });
         }
     } else {
@@ -597,6 +621,9 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                 mesh_range: range.clone(),
                 transform: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
                 asset_name: asset_names[model_idx].clone(),
+                is_landscape: false,
+                min_quality_level: 0,
+                lod_extents: model_lod_extents[model_idx].clone(),
             });
         }
     }
@@ -925,6 +952,36 @@ fn generate_water_mesh(cfg: &WaterConfig<'_>) -> MapMesh {
     }
 }
 
+/// Build glTF `extras` for a map instance node.
+///
+/// Emits a JSON object surfacing engine ModelInstance metadata
+/// (`is_landscape`, `min_quality_level`) + the prototype's per-LOD
+/// `extent` array. Three.js exposes this as `Object3D.userData`;
+/// Blender 4+ exposes it as `object["gltf_extras"]`.
+///
+/// The output is intentionally compact (no nested objects) so the
+/// extras blob stays small even when 5000+ instances each get one.
+/// Default-valued fields are still emitted so consumers can rely on
+/// a stable schema:
+///
+/// ```json
+/// {
+///   "is_landscape": false,
+///   "min_quality_level": 0,
+///   "lod_extents": [70.0, 160.0, 260.0, 500.0, 50000.0]
+/// }
+/// ```
+fn build_instance_extras(inst: &MapModelInstance) -> json::extras::Extras {
+    let value = serde_json::json!({
+        "is_landscape": inst.is_landscape,
+        "min_quality_level": inst.min_quality_level,
+        "lod_extents": inst.lod_extents,
+    });
+    // RawValue serialization is infallible for a Value that's already
+    // valid JSON (which a serde_json::Value always is).
+    serde_json::value::to_raw_value(&value).ok().map(Box::from)
+}
+
 // ---------------------------------------------------------------------------
 // GLB serialization for MapScene
 // ---------------------------------------------------------------------------
@@ -1032,11 +1089,18 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
             Some(stem) => format!("{stem}_{i}"),
             None => format!("Instance_{i}"),
         };
+        // glTF `extras` for per-instance engine metadata. Consumers
+        // (three.js, Blender) surface this as `Object3D.userData`.
+        // We emit a compact JSON object always — the cost is small
+        // (a few hundred bytes per instance) and avoiding it keeps the
+        // GLB self-describing without a sidecar.
+        let extras = build_instance_extras(inst);
         if instance_meshes.len() == 1 {
             let node = root.push(json::Node {
                 mesh: Some(instance_meshes[0]),
                 name: Some(inst_label),
                 matrix: Some(inst.transform),
+                extras,
                 ..Default::default()
             });
             scene_nodes.push(node);
@@ -1056,6 +1120,7 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
                 children: Some(children),
                 name: Some(inst_label),
                 matrix: Some(inst.transform),
+                extras,
                 ..Default::default()
             });
             scene_nodes.push(parent);
