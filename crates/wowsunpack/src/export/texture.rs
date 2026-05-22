@@ -693,6 +693,54 @@ pub fn parse_mfm_from_db(db: &PrototypeDatabase<'_>, mfm_path_id: u64) -> Option
     material::parse_material(record_data).ok()
 }
 
+/// Alpha + face-culling state extracted from an MFM material.
+///
+/// The engine bakes `BlendState`/`DepthStencilState`/`RasterizerState` into
+/// the compiled `.fxo` blob — the MFM only carries the *property bag* the
+/// shader samples. So we infer the glTF `alphaMode` heuristically from the
+/// canonical property names WG uses:
+///
+/// - `alphaTestEnable=true` + `alphaReference=N` → `alphaMode: MASK`,
+///   `alphaCutoff = N/255.0`.
+/// - `alphaMul`/`alphaPow` present (no `alphaTestEnable`) → `alphaMode: BLEND`
+///   (used by `LNR002_waterfall` etc.; full alpha-blending tuning).
+/// - Otherwise → `alphaMode: OPAQUE`.
+///
+/// `doubleSided` propagates verbatim. This struct is computed at
+/// texture-load time and threaded into `MapMesh` / `MapMaterialKey` so the
+/// downstream glTF material emission can pick the right `alphaMode`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MfmAlphaState {
+    pub alpha_blend: bool,
+    pub alpha_cutoff: Option<f32>,
+    pub double_sided: bool,
+}
+
+/// Extract `MfmAlphaState` from a parsed material.
+///
+/// Centralised so the same heuristic applies wherever we emit a glTF material
+/// from an MFM (`build_map_scene` model meshes; eventually ship-side exports
+/// too). The fallback cutoff `0.5` matches WG's typical leaf-card threshold
+/// when `alphaReference` is missing.
+pub fn read_mfm_alpha_state(mat: &MaterialPrototype) -> MfmAlphaState {
+    let alpha_test = mat.get_bool("alphaTestEnable").unwrap_or(false);
+    let alpha_cutoff = if alpha_test {
+        let r = mat.get_int("alphaReference").unwrap_or(128);
+        Some((r as f32 / 255.0).clamp(0.0, 1.0))
+    } else {
+        None
+    };
+    // alphaMul/alphaPow are the BLEND tuning knobs WG uses for waterfalls,
+    // light shafts, etc. They appear without alphaTestEnable.
+    let alpha_blend = !alpha_test
+        && (mat.get_property("alphaMul").is_some() || mat.get_property("alphaPow").is_some());
+    MfmAlphaState {
+        alpha_blend,
+        alpha_cutoff,
+        double_sided: mat.get_bool("doubleSided").unwrap_or(false),
+    }
+}
+
 /// Check if a material is a TILEDLAND terrain material.
 ///
 /// TILEDLAND materials have `AHArray` (tile atlas), `blendMap`, and `g_tilesIndex`.
@@ -1501,18 +1549,55 @@ pub fn load_or_bake_albedo(
     self_id_index: Option<&HashMap<u64, usize>>,
     max_size: Option<u32>,
 ) -> Option<Vec<u8>> {
+    load_or_bake_albedo_with_alpha(vfs, mfm_full_path, mfm_path_id, db, self_id_index, max_size)
+        .map(|(png, _)| png)
+}
+
+/// Same as [`load_or_bake_albedo`] but also returns the source MFM's alpha
+/// state (extracted via [`read_mfm_alpha_state`]).
+///
+/// Used by `build_map_scene` so per-prim alpha-test / alpha-blend / double-
+/// sided flags propagate from the WG material into the emitted glTF
+/// material. Returns `(png_bytes, MfmAlphaState)`. When the MFM can't be
+/// parsed (e.g. assets.bin not available), alpha state defaults to OPAQUE.
+///
+/// CAVEAT: the alpha state is read from the MFM property bag, NOT from the
+/// compiled `.fxo` shader render state. WG bakes BlendState/DepthState into
+/// `.fxo` and only the property bag survives in the MFM. The heuristic
+/// `alphaTestEnable + alphaReference → MASK` is empirically the right
+/// signal for the foliage-card / fence / decal materials that need it; see
+/// `reference/maps/map_extraction_audit_2026_05_21.md` Section D.
+pub fn load_or_bake_albedo_with_alpha(
+    vfs: &vfs::VfsPath,
+    mfm_full_path: &str,
+    mfm_path_id: u64,
+    db: Option<&PrototypeDatabase<'_>>,
+    self_id_index: Option<&HashMap<u64, usize>>,
+    max_size: Option<u32>,
+) -> Option<(Vec<u8>, MfmAlphaState)> {
+    // Parse the MFM once if available so we can both check TILEDLAND and read
+    // the alpha state from the same prototype. Without `db`, we fall straight
+    // to filename-based lookup with default (OPAQUE) alpha state.
+    let parsed_mat = match (db, self_id_index, mfm_path_id) {
+        (Some(db), Some(_), p) if p != 0 => parse_mfm_from_db(db, p),
+        _ => None,
+    };
+    let alpha_state = parsed_mat
+        .as_ref()
+        .map(read_mfm_alpha_state)
+        .unwrap_or_default();
+
     // Try MFM-based TILEDLAND baking first (terrain materials).
     // This must come before filename-based lookup because _od files exist for
     // TILEDLAND tiles but are overlay maps, not standalone albedo textures.
-    if let Some(db) = db
+    if let Some(mat) = &parsed_mat
+        && let Some(db) = db
         && let Some(idx) = self_id_index
-        && mfm_path_id != 0
-        && let Some(mat) = parse_mfm_from_db(db, mfm_path_id)
-        && is_tiledland_material(&mat)
+        && is_tiledland_material(mat)
     {
         eprintln!("  Baking TILEDLAND texture for: {mfm_full_path}");
-        if let Some(png) = bake_tiledland_albedo(&mat, vfs, db, idx, max_size) {
-            return Some(png);
+        if let Some(png) = bake_tiledland_albedo(mat, vfs, db, idx, max_size) {
+            return Some((png, alpha_state));
         }
         eprintln!("    Warning: TILEDLAND bake failed, falling back to filename lookup");
     }
@@ -1523,7 +1608,7 @@ pub fn load_or_bake_albedo(
     let dds_bytes = load_base_albedo_bytes(vfs, mfm_full_path, None)?;
     let mut png = dds_to_png_resized(&dds_bytes, max_size).ok()?;
     force_png_opaque(&mut png);
-    Some(png)
+    Some((png, alpha_state))
 }
 
 #[cfg(test)]

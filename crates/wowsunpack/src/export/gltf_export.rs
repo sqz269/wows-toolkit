@@ -343,6 +343,8 @@ pub struct MapMesh {
     pub alpha_blend: bool,
     /// Alpha cutoff for mask mode (e.g. `Some(0.5)` for leaf transparency).
     pub alpha_cutoff: Option<f32>,
+    /// Double-sided face culling (alpha-cut foliage cards need this).
+    pub double_sided: bool,
 }
 
 /// A positioned model instance in the map.
@@ -389,6 +391,7 @@ struct MapMaterialKey {
     base_color_bits: [u32; 4],
     alpha_blend: bool,
     alpha_cutoff_bits: Option<u32>,
+    double_sided: bool,
 }
 
 /// Material cache mapping unique material parameters to their glTF index.
@@ -446,8 +449,11 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
 
     // Shared texture storage: each unique texture is stored once.
     let mut textures: Vec<Vec<u8>> = Vec::new();
-    // Cache: MFM full path → Option<texture index>
-    let mut texture_cache: HashMap<String, Option<usize>> = HashMap::new();
+    // Cache: MFM full path → Option<(texture index, alpha state from MFM)>.
+    // The alpha state is per-MFM (independent of texture sharing — two prims
+    // pointing at the same MFM share both their texture AND their alpha mode).
+    let mut texture_cache: HashMap<String, Option<(usize, texture::MfmAlphaState)>> =
+        HashMap::new();
 
     // Build path_id → model index map for instance lookups.
     let path_to_model: HashMap<u64, usize> = merged.models.iter().enumerate().map(|(i, r)| (r.path_id, i)).collect();
@@ -516,12 +522,14 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
 
         for prim in primitives {
             // Load texture on demand via full MFM path (deduplicated).
-            // Falls back to TILEDLAND baking for terrain materials.
-            let albedo_texture = if let Some(vfs) = vfs
+            // Falls back to TILEDLAND baking for terrain materials. The cache
+            // also carries the MFM's alpha state so each prim emits the right
+            // glTF alphaMode (foliage/fence/decal cards have alphaTestEnable).
+            let cache_entry = if let Some(vfs) = vfs
                 && let Some(mfm_path) = &prim.mfm_full_path
             {
                 *texture_cache.entry(mfm_path.clone()).or_insert_with(|| {
-                    texture::load_or_bake_albedo(
+                    texture::load_or_bake_albedo_with_alpha(
                         vfs,
                         mfm_path,
                         prim.mfm_path_id,
@@ -529,14 +537,18 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                         self_id_index.as_ref(),
                         max_texture_size,
                     )
-                    .map(|png_bytes| {
+                    .map(|(png_bytes, alpha_state)| {
                         let idx = textures.len();
                         textures.push(png_bytes);
-                        idx
+                        (idx, alpha_state)
                     })
                 })
             } else {
                 None
+            };
+            let (albedo_texture, alpha_state) = match cache_entry {
+                Some((idx, state)) => (Some(idx), state),
+                None => (None, texture::MfmAlphaState::default()),
             };
 
             model_meshes.push(MapMesh {
@@ -547,8 +559,9 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                 indices: prim.indices,
                 albedo_texture,
                 base_color: [1.0, 1.0, 1.0, 1.0],
-                alpha_blend: false,
-                alpha_cutoff: None,
+                alpha_blend: alpha_state.alpha_blend,
+                alpha_cutoff: alpha_state.alpha_cutoff,
+                double_sided: alpha_state.double_sided,
             });
         }
 
@@ -653,6 +666,7 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                 base_color: [1.0, 1.0, 1.0, 1.0],
                 alpha_blend: false,
                 alpha_cutoff: Some(0.5),
+                double_sided: true,
             });
             species_mesh_ranges.push(Some(mesh_idx));
         }
@@ -875,6 +889,7 @@ fn generate_terrain_mesh(cfg: &TerrainConfig<'_>) -> MapMesh {
         base_color: [0.3, 0.35, 0.25, 1.0],
         alpha_blend: false,
         alpha_cutoff: None,
+        double_sided: false,
     }
 }
 
@@ -906,6 +921,7 @@ fn generate_water_mesh(cfg: &WaterConfig<'_>) -> MapMesh {
         base_color: [0.1, 0.3, 0.5, 0.85],
         alpha_blend: true,
         alpha_cutoff: None,
+        double_sided: false,
     }
 }
 
@@ -1317,13 +1333,17 @@ fn build_map_mesh_primitive(
         attributes.insert(Valid(json::mesh::Semantic::TexCoords(0)), uv);
     }
 
-    // Material: deduplicate by (texture index, base color, alpha blend, alpha cutoff).
-    // Encode base_color as [u32; 4] for HashMap key (f32 isn't Hash).
+    // Material: deduplicate by (texture index, base color, alpha blend, alpha
+    // cutoff, double sided). Encode base_color as [u32; 4] for HashMap key
+    // (f32 isn't Hash). `double_sided` lives in the key because two MFMs
+    // sharing the same texture+alpha may still differ on culling
+    // (foliage card = double-sided, opaque rock = single-sided).
     let mat_key = MapMaterialKey {
         albedo_texture: mesh.albedo_texture,
         base_color_bits: mesh.base_color.map(|c| c.to_bits()),
         alpha_blend: mesh.alpha_blend,
         alpha_cutoff_bits: mesh.alpha_cutoff.map(|c| c.to_bits()),
+        double_sided: mesh.double_sided,
     };
 
     let material = *mat_cache.entry(mat_key).or_insert_with(|| {
@@ -1331,8 +1351,12 @@ fn build_map_mesh_primitive(
             && let Some(&gltf_tex) = gltf_texture_cache.get(&tex_idx)
         {
             // Textured material: reference the shared glTF Texture.
-            let (alpha_mode, alpha_cutoff_val, double_sided) = if let Some(cutoff) = mesh.alpha_cutoff {
-                (Valid(json::material::AlphaMode::Mask), Some(json::material::AlphaCutoff(cutoff)), true)
+            // alphaMode follows the MFM-derived signals (alpha_cutoff =>
+            // MASK, alpha_blend => BLEND, else OPAQUE). double_sided is
+            // honoured separately: alpha-cut cards always default to
+            // double-sided because they're authored as single quads.
+            let (alpha_mode, alpha_cutoff_val) = if let Some(cutoff) = mesh.alpha_cutoff {
+                (Valid(json::material::AlphaMode::Mask), Some(json::material::AlphaCutoff(cutoff)))
             } else if mesh.alpha_blend {
                 // WG `ship_transparent_*.fx` materials (SHIPGLASS, semi-transparent
                 // armor visualizers). Without this branch, textured-transparent
@@ -1341,10 +1365,13 @@ fn build_map_mesh_primitive(
                 // `material.transparent`, Blender, etc.). Sidecar's
                 // `render_queue: "transparent"` is now the authoritative source;
                 // this aligns the GLB itself.
-                (Valid(json::material::AlphaMode::Blend), None, true)
+                (Valid(json::material::AlphaMode::Blend), None)
             } else {
-                (Valid(json::material::AlphaMode::Opaque), None, false)
+                (Valid(json::material::AlphaMode::Opaque), None)
             };
+            let double_sided = mesh.double_sided
+                || mesh.alpha_cutoff.is_some()
+                || mesh.alpha_blend;
             root.push(json::Material {
                 name: Some(mesh.name.clone()),
                 pbr_metallic_roughness: json::material::PbrMetallicRoughness {
@@ -1370,6 +1397,7 @@ fn build_map_mesh_primitive(
                     ..Default::default()
                 },
                 alpha_mode: Valid(json::material::AlphaMode::Blend),
+                double_sided: mesh.double_sided,
                 ..Default::default()
             })
         } else {
@@ -1379,6 +1407,7 @@ fn build_map_mesh_primitive(
                     base_color_factor: json::material::PbrBaseColorFactor(mesh.base_color),
                     ..Default::default()
                 },
+                double_sided: mesh.double_sided,
                 ..Default::default()
             })
         }

@@ -605,6 +605,14 @@ impl MaterialPrototype {
         })
     }
 
+    /// Get an int32 property value.
+    pub fn get_int(&self, name: &str) -> Option<i32> {
+        self.get_property(name).and_then(|p| match &p.value {
+            Some(PropertyValue::Int32(v)) => Some(*v),
+            _ => None,
+        })
+    }
+
     /// Print a human-readable summary of the material.
     pub fn print_summary(&self, prop_names: &HashMap<u32, &str>) {
         println!("  material_hash: 0x{:016X}", self.material_hash);
