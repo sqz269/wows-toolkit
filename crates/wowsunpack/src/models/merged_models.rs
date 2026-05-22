@@ -9,6 +9,7 @@
 use rootcause::Report;
 use thiserror::Error;
 use winnow::Parser;
+use winnow::binary::le_f32;
 use winnow::binary::le_i64;
 use winnow::binary::le_u8;
 use winnow::binary::le_u16;
@@ -75,6 +76,53 @@ pub struct SkeletonProto {
     pub nodes: VisualNodes,
 }
 
+/// A per-instance dye override: an 8-byte `{matter_id, replaces_id}` pair.
+/// `matter_id` is the new texture/color to apply; `replaces_id` is the
+/// prototype slot it targets.
+///
+/// Engine treats both fields as opaque u32 IDs. Empirically the encoding
+/// varies between maps: some carry `MurmurHash3_32` hashes (consistent
+/// with ship-side camo per `[[project_mat_camo_hybrid_shipped]]`),
+/// others store 4-byte ASCII fragments in the u32 slots directly (e.g.
+/// `0x38303134 = "4108"` followed by `0x43363244 = "D26C"`). Consumers
+/// must not assume one encoding — preserve the raw u32 and resolve
+/// downstream against whichever hash/string table the engine uses for
+/// that map.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelDye {
+    pub matter_id: u32,
+    pub replaces_id: u32,
+}
+
+/// A single PointLightInstance from `space.bin` (0xc0-stride record from
+/// the `pointLights[]` sub-array). Engine struct: transform at +0x00
+/// (16-float 4×4) → opaque properties array at +0x40 → inline
+/// `Lighting::PointLightPrototype` at +0x50. We compute the world position
+/// up-front (transform × localPosition) so consumers can drop the value
+/// straight into a `THREE.PointLight.position` without re-doing the math.
+///
+/// Animation tracks (colorAnimation, radiusAnimation) at +0x50 / +0x70 of
+/// the instance are skipped — keyframe data lives behind separate
+/// relptrs and v1 consumers don't need it.
+///
+/// See `map_extraction_audit_2026_05_21.md` § "pointLights[]" + RE of
+/// FUN_140899190 (instance reader) + FUN_140712390 (prototype reader).
+#[derive(Debug, Clone)]
+pub struct SpacePointLight {
+    /// World-space position (instance transform applied to prototype
+    /// `localPosition`). Most prototypes carry `localPosition = (0, 0, 0)`
+    /// so this typically equals the transform's translation column.
+    pub world_position: [f32; 3],
+    /// Engine `color` Vec4 RGBA. Convention: RGB is linear color, alpha is
+    /// the intensity multiplier consumers feed into `THREE.PointLight`.
+    pub color: [f32; 4],
+    /// Falloff radius in metres. Maps to `THREE.PointLight.distance`.
+    pub radius: f32,
+    /// Engine `Quality` enum minimum: 0=Low, 1=Medium, 2=High, 3=Ultra.
+    /// Engine skips the light when the runtime quality is below this.
+    pub min_quality: u32,
+}
+
 /// A single model instance from `space.bin`, combining a world transform
 /// with a reference to the model prototype via `path_id`.
 ///
@@ -99,12 +147,25 @@ pub struct SpaceInstance {
     /// when the runtime quality preset is below this value; useful as a
     /// viewer-side detail filter.
     pub min_quality_level: u8,
+    /// Per-instance `modelDyes[]` override pairs from +0x60 (relptr) /
+    /// +0x59 (u8 count). Resolved at parse time; relptr is rel-to-position
+    /// (rec_base+0x60 + i64). Visual impact varies by map — themed event
+    /// maps carry hundreds, "plain" maps (Okinawa) carry zero.
+    pub model_dyes: Vec<ModelDye>,
+    /// Count of `materialInstances[]` override records at +0x68 (relptr)
+    /// / +0x5a (u8 count). v1 surfaces the count only; the 0x70-stride
+    /// `MaterialInstancePrototype` records carry full per-instance
+    /// material property bags (Vec4 tints, texture swaps, shader vars).
+    /// Decoding them requires reusing `models/material.rs` with a stride
+    /// adjustment — deferred to a follow-up pass.
+    pub material_instance_count: u8,
 }
 
-/// Parsed `space.bin` instance placements.
+/// Parsed `space.bin` instance placements + lighting.
 #[derive(Debug)]
 pub struct SpaceInstances {
     pub instances: Vec<SpaceInstance>,
+    pub point_lights: Vec<SpacePointLight>,
 }
 
 // ── Winnow sub-parsers (merged-specific) ────────────────────────────────────
@@ -199,16 +260,57 @@ fn parse_visual_proto_inline_fields(input: &mut &[u8]) -> WResult<VisualProtoInl
 //   +0x60  i64       modelDyes relptr            — DROPPED (Phase 2)
 //   +0x68  i64       materialInstances relptr    — DROPPED (Phase 2)
 
-fn parse_space_instance_entry(input: &mut &[u8]) -> WResult<SpaceInstance> {
+/// Parse a single ModelInstance record (0x70 bytes) into a fully-resolved
+/// `SpaceInstance`. Inner relptrs at +0x60 (modelDyes) and +0x68
+/// (materialInstances) are resolved using `rec_base` as the position
+/// reference — both are rel-to-position-within-file (verified
+/// empirically on `20_NE_two_brothers/space.bin`).
+fn parse_space_instance_record(
+    file_data: &[u8],
+    rec_base: usize,
+) -> WResult<SpaceInstance> {
+    let input = &mut &file_data[rec_base..rec_base + SPACE_INSTANCE_SIZE];
     let transform = parser_utils::parse_matrix4x4(input)?;
     let _ = take(16usize).parse_next(input)?; // +0x40..+0x50: guidCount + guids relptr
     let path_id = le_u64.parse_next(input)?;
     let is_landscape = le_u8.parse_next(input)? != 0;
-    let _model_dyes_count = le_u8.parse_next(input)?;
-    let _material_instance_count = le_u8.parse_next(input)?;
+    let model_dyes_count = le_u8.parse_next(input)?;
+    let material_instance_count = le_u8.parse_next(input)?;
     let min_quality_level = le_u8.parse_next(input)?;
-    let _ = take(20usize).parse_next(input)?; // +0x5c..+0x70: pad + dyes + materialInstances relptrs
-    Ok(SpaceInstance { transform, path_id, is_landscape, min_quality_level })
+    let _ = take(4usize).parse_next(input)?; // +0x5c..+0x60: pad
+    let model_dyes_relptr = le_i64.parse_next(input)?;
+    let _material_instances_relptr = le_i64.parse_next(input)?;
+
+    // Resolve modelDyes[]: rec_base+0x60 + relptr → start of N×8 dye records.
+    // The relptr can legitimately be 0 (no overrides — file has padding here)
+    // when count is 0; defensively guard against out-of-bounds + negative
+    // resolved offsets.
+    let mut model_dyes = Vec::with_capacity(model_dyes_count as usize);
+    if model_dyes_count > 0 {
+        let dye_pos = rec_base + 0x60;
+        let resolved = dye_pos as i64 + model_dyes_relptr;
+        if resolved >= 0 {
+            let start = resolved as usize;
+            let need = (model_dyes_count as usize) * 8;
+            if start + need <= file_data.len() {
+                let mut dye_input = &file_data[start..start + need];
+                for _ in 0..model_dyes_count {
+                    let matter_id = le_u32.parse_next(&mut dye_input)?;
+                    let replaces_id = le_u32.parse_next(&mut dye_input)?;
+                    model_dyes.push(ModelDye { matter_id, replaces_id });
+                }
+            }
+        }
+    }
+
+    Ok(SpaceInstance {
+        transform,
+        path_id,
+        is_landscape,
+        min_quality_level,
+        model_dyes,
+        material_instance_count,
+    })
 }
 
 // ── Helper: parse array at offset, wrapping winnow errors ───────────────────
@@ -296,9 +398,28 @@ pub fn parse_merged_models(file_data: &[u8]) -> Result<MergedModels, Report<Merg
 
 const SPACE_HEADER_SIZE: usize = 0x60;
 const SPACE_INSTANCE_SIZE: usize = 0x70;
+const SPACE_POINT_LIGHT_SIZE: usize = 0xc0;
 
-/// Parse a `space.bin` file to extract instance placements (world transforms).
-pub fn parse_space_instances(file_data: &[u8]) -> Result<SpaceInstances, Report<MergedModelsError>> {
+// Header layout (see audit doc § "8 typed sub-arrays"):
+//   +0x00..+0x20  eight u32 counts in declaration order
+//   +0x20..+0x60  eight i64 relptrs in declaration order
+// Sub-array order: models, obstacles, particles, pointLights, probes,
+// staticDecals, userObjects, prefabs.
+const SUBARRAY_MODELS: usize = 0;
+const SUBARRAY_POINT_LIGHTS: usize = 3;
+
+/// Parse the 8 (count, relptr) pairs out of the space.bin header.
+///
+/// Header relptrs are absolute byte offsets from the start of the file
+/// (base=0), same convention as `parse_merged_models` for models.bin.
+/// This contrasts with deeper engine structs where relptrs are typically
+/// stored relative to the pointer's own file position; for the
+/// outer `SpaceContent::Instances` block the engine resolves them against
+/// the file base. Empirically confirmed by inspecting Okinawa's
+/// space.bin: `models[]` relptr value is `0x60`, which lands on a clean
+/// Matrix4x4 record at file offset `0x60` (not `0x80` as a
+/// relative-to-pointer convention would imply).
+fn parse_space_header(file_data: &[u8]) -> Result<[(u32, usize); 8], Report<MergedModelsError>> {
     if file_data.len() < SPACE_HEADER_SIZE {
         return Err(Report::new(MergedModelsError::DataTooShort {
             offset: 0,
@@ -306,29 +427,131 @@ pub fn parse_space_instances(file_data: &[u8]) -> Result<SpaceInstances, Report<
             have: file_data.len(),
         }));
     }
-
-    let input = &mut &file_data[..];
-    let instance_count = le_u32
+    let input = &mut &file_data[..SPACE_HEADER_SIZE];
+    let counts: Vec<u32> = winnow::combinator::repeat(8usize, le_u32)
         .parse_next(input)
-        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("space header: {e}"))))?
-        as usize;
-
-    let need = instance_count * SPACE_INSTANCE_SIZE;
-    if SPACE_HEADER_SIZE + need > file_data.len() {
-        return Err(Report::new(MergedModelsError::DataTooShort {
-            offset: SPACE_HEADER_SIZE,
-            need,
-            have: file_data.len(),
-        }));
+        .map_err(|e: ErrMode<ContextError>| {
+            Report::new(MergedModelsError::ParseError(format!("space counts: {e}")))
+        })?;
+    let relptrs: Vec<i64> = winnow::combinator::repeat(8usize, le_i64)
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| {
+            Report::new(MergedModelsError::ParseError(format!("space relptrs: {e}")))
+        })?;
+    let mut out = [(0u32, 0usize); 8];
+    for i in 0..8 {
+        // Absolute-from-file-start, NOT base+offset. See doc above.
+        out[i] = (counts[i], relptrs[i].max(0) as usize);
     }
+    Ok(out)
+}
 
-    let input = &mut &file_data[SPACE_HEADER_SIZE..];
-    let instances: Vec<SpaceInstance> =
-        winnow::combinator::repeat(instance_count, parse_space_instance_entry).parse_next(input).map_err(
-            |e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("space instances: {e}"))),
-        )?;
+/// Parse a `space.bin` file to extract model placements + point lights.
+///
+/// The engine's `SpaceContent::Instances` block carries eight typed
+/// sub-arrays; we currently consume two: models (visible meshes) and
+/// pointLights (atmospheric lighting). The other six are intentionally
+/// dropped — see the audit doc backlog.
+pub fn parse_space_instances(file_data: &[u8]) -> Result<SpaceInstances, Report<MergedModelsError>> {
+    let header = parse_space_header(file_data)?;
+    let (instance_count, instances_offset) = header[SUBARRAY_MODELS];
+    let (light_count, lights_offset) = header[SUBARRAY_POINT_LIGHTS];
 
-    Ok(SpaceInstances { instances })
+    let instances = if instance_count == 0 {
+        Vec::new()
+    } else {
+        let need = instance_count as usize * SPACE_INSTANCE_SIZE;
+        if instances_offset + need > file_data.len() {
+            return Err(Report::new(MergedModelsError::DataTooShort {
+                offset: instances_offset,
+                need,
+                have: file_data.len(),
+            }));
+        }
+        let mut out = Vec::with_capacity(instance_count as usize);
+        for i in 0..instance_count as usize {
+            let rec_base = instances_offset + i * SPACE_INSTANCE_SIZE;
+            let rec = parse_space_instance_record(file_data, rec_base).map_err(
+                |e: ErrMode<ContextError>| {
+                    Report::new(MergedModelsError::ParseError(format!(
+                        "space instance[{i}] @ 0x{rec_base:x}: {e}"
+                    )))
+                },
+            )?;
+            out.push(rec);
+        }
+        out
+    };
+
+    let point_lights = if light_count == 0 {
+        Vec::new()
+    } else {
+        let need = light_count as usize * SPACE_POINT_LIGHT_SIZE;
+        if lights_offset + need > file_data.len() {
+            return Err(Report::new(MergedModelsError::DataTooShort {
+                offset: lights_offset,
+                need,
+                have: file_data.len(),
+            }));
+        }
+        let input = &mut &file_data[lights_offset..];
+        winnow::combinator::repeat(light_count as usize, parse_space_point_light_entry)
+            .parse_next(input)
+            .map_err(|e: ErrMode<ContextError>| {
+                Report::new(MergedModelsError::ParseError(format!("space point lights: {e}")))
+            })?
+    };
+
+    Ok(SpaceInstances { instances, point_lights })
+}
+
+// PointLightInstance layout (0xc0 stride). Cursor offsets are checked
+// against the reflection registrations in FUN_140899190 / FUN_140712390.
+//
+//   +0x00  Matrix4x4  transform     (16 f32, 4×4 column-major like ModelInstance)
+//   +0x40  16 bytes   <unnamed>     (count u32 + pad + relptr — opaque, skip)
+//   +0x50  AnimProto  colorAnimation  (0x20 bytes — AnimationPrototype<Vec4>, skip)
+//   +0x70  AnimProto  radiusAnimation (0x20 bytes — AnimationPrototype<f32>,  skip)
+//   +0x90  Vec4       color          (RGBA f32; A is intensity)
+//   +0xa0  Vec3+pad   localPosition  (12 f32 + 4 byte pad)
+//   +0xb0  f32        radius
+//   +0xb4  u32        minQuality
+//   +0xb8  2 bytes    animatedColor / animatedRadius (bools, skip)
+//   +0xba  6 bytes    padding to 0xc0
+fn parse_space_point_light_entry(input: &mut &[u8]) -> WResult<SpacePointLight> {
+    let transform = parser_utils::parse_matrix4x4(input)?;
+    let _ = take(16usize).parse_next(input)?; // +0x40 array desc (opaque)
+    let _ = take(32usize).parse_next(input)?; // +0x50 colorAnimation
+    let _ = take(32usize).parse_next(input)?; // +0x70 radiusAnimation
+    let cr = le_f32.parse_next(input)?;
+    let cg = le_f32.parse_next(input)?;
+    let cb = le_f32.parse_next(input)?;
+    let ca = le_f32.parse_next(input)?;
+    let lx = le_f32.parse_next(input)?;
+    let ly = le_f32.parse_next(input)?;
+    let lz = le_f32.parse_next(input)?;
+    let _ = take(4usize).parse_next(input)?; // localPosition pad
+    let radius = le_f32.parse_next(input)?;
+    let min_quality = le_u32.parse_next(input)?;
+    let _ = take(8usize).parse_next(input)?; // animatedColor + animatedRadius + pad
+    Ok(SpacePointLight {
+        world_position: transform_point(&transform, [lx, ly, lz]),
+        color: [cr, cg, cb, ca],
+        radius,
+        min_quality,
+    })
+}
+
+/// Apply a glTF-style column-major 4×4 transform to a 3D point. Mirrors
+/// the convention used by [`SpaceInstance::transform`] — translation lives
+/// in elements 12..15.
+fn transform_point(m: &Matrix4x4, p: [f32; 3]) -> [f32; 3] {
+    let a = &m.0;
+    [
+        a[0] * p[0] + a[4] * p[1] + a[8] * p[2] + a[12],
+        a[1] * p[0] + a[5] * p[1] + a[9] * p[2] + a[13],
+        a[2] * p[0] + a[6] * p[1] + a[10] * p[2] + a[14],
+    ]
 }
 
 // ── Model Record ─────────────────────────────────────────────────────────────

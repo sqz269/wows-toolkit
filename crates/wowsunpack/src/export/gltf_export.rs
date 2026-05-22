@@ -390,6 +390,15 @@ pub struct MapModelInstance {
     /// Length matches `record.visual_proto.lods.len()`; empty when the
     /// prototype has no LOD chain.
     pub lod_extents: Vec<f32>,
+    /// Per-instance `modelDyes[]` overrides — themed event maps tag
+    /// individual instances with dye keys that re-skin the prototype.
+    /// Empty on most maps. Surfaced for downstream consumers; the
+    /// webview v1 doesn't apply them visually yet.
+    pub model_dyes: Vec<crate::models::merged_models::ModelDye>,
+    /// Count of `materialInstances[]` overrides on this instance. v1
+    /// surfaces the count only; the 0x70-stride MaterialInstancePrototype
+    /// records aren't decoded yet (needs material.rs stride adjustment).
+    pub material_instance_count: u8,
 }
 
 /// Complete decoded map scene, format-agnostic.
@@ -416,6 +425,11 @@ pub struct MapScene {
     /// GPU-instanced vegetation: `(mesh_idx, positions)` per species.
     /// Exported as `EXT_mesh_gpu_instancing` nodes (one node per species).
     pub vegetation_instances: Vec<(usize, Vec<[f32; 3]>)>,
+    /// Engine PointLightInstance placements from `space.bin`'s pointLights[]
+    /// sub-array (stride 0xc0). Emitted into Scene extras as a `lights`
+    /// array — the webview consumer instantiates `THREE.PointLight` per
+    /// entry. World position already has the instance transform applied.
+    pub point_lights: Vec<crate::models::merged_models::SpacePointLight>,
 }
 
 /// Cache key for deduplicating map materials by visual parameters.
@@ -640,6 +654,8 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                 is_landscape: inst.is_landscape,
                 min_quality_level: inst.min_quality_level,
                 lod_extents: model_lod_extents[model_idx].clone(),
+                model_dyes: inst.model_dyes.clone(),
+                material_instance_count: inst.material_instance_count,
             });
         }
     } else {
@@ -655,6 +671,8 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                 is_landscape: false,
                 min_quality_level: 0,
                 lod_extents: model_lod_extents[model_idx].clone(),
+                model_dyes: Vec::new(),
+                material_instance_count: 0,
             });
         }
     }
@@ -790,6 +808,22 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         eprintln!("  Water plane generated");
     }
 
+    // Surface dye/material override counts — themed event maps may carry
+    // hundreds; "normal" maps zero. Useful for verifying parse coverage.
+    let instances_with_dyes = model_instances.iter().filter(|i| !i.model_dyes.is_empty()).count();
+    let instances_with_mat_overrides = model_instances.iter().filter(|i| i.material_instance_count > 0).count();
+    if instances_with_dyes > 0 || instances_with_mat_overrides > 0 {
+        eprintln!(
+            "  Per-instance overrides: {instances_with_dyes} with dyes, \
+             {instances_with_mat_overrides} with materialInstances"
+        );
+    }
+
+    let point_lights = space.map(|s| s.point_lights.clone()).unwrap_or_default();
+    if !point_lights.is_empty() {
+        eprintln!("  {} point lights", point_lights.len());
+    }
+
     Ok(MapScene {
         model_meshes,
         model_instances,
@@ -799,6 +833,7 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         bounds: bounds.clone(),
         fog: fog.clone(),
         vegetation_instances,
+        point_lights,
     })
 }
 
@@ -1004,22 +1039,58 @@ fn generate_water_mesh(cfg: &WaterConfig<'_>) -> MapMesh {
 /// }
 /// ```
 fn build_instance_extras(inst: &MapModelInstance) -> json::extras::Extras {
-    let value = serde_json::json!({
+    // Dyes emit as `[[matter_id, replaces_id], ...]`; treat each u32 as
+    // an opaque identifier (consumers can interpret as MurmurHash3 or
+    // ASCII per the source format). Skip the field entirely when empty
+    // to keep extras compact on the 95%+ of instances without dyes.
+    let dyes: Vec<[u32; 2]> = inst
+        .model_dyes
+        .iter()
+        .map(|d| [d.matter_id, d.replaces_id])
+        .collect();
+    let mut value = serde_json::json!({
         "is_landscape": inst.is_landscape,
         "min_quality_level": inst.min_quality_level,
         "lod_extents": inst.lod_extents,
     });
+    if !dyes.is_empty() {
+        value["dyes"] = serde_json::json!(dyes);
+    }
+    if inst.material_instance_count > 0 {
+        value["material_instance_count"] = serde_json::json!(inst.material_instance_count);
+    }
     // RawValue serialization is infallible for a Value that's already
     // valid JSON (which a serde_json::Value always is).
     serde_json::value::to_raw_value(&value).ok().map(Box::from)
 }
 
-/// Build glTF `extras` for the root Scene: map bounds + engine fog state.
+/// Build glTF `extras` for the root Scene: map bounds + engine fog state
+/// + point lights.
 ///
 /// Three.js maps Scene extras to `gltf.scene.userData`, so the webview
-/// can pull `bounds` (playable area) and `fog` (color + density + near
-/// distance + far plane) without a separate sidecar fetch.
-fn build_scene_extras(bounds: &SpaceBounds, fog: Option<&SpaceFog>) -> json::extras::Extras {
+/// can pull `bounds` (playable area), `fog` (color + density + near
+/// distance + far plane), and `lights` (engine point lights) without a
+/// separate sidecar fetch. We don't use `KHR_lights_punctual` because
+/// the toolkit's `gltf-json` build doesn't enable that extension feature
+/// — scene extras is the lower-friction path and three.js consumes it as
+/// `gltf.scene.userData.lights` natively.
+fn build_scene_extras(
+    bounds: &SpaceBounds,
+    fog: Option<&SpaceFog>,
+    point_lights: &[crate::models::merged_models::SpacePointLight],
+) -> json::extras::Extras {
+    let lights: Vec<_> = point_lights
+        .iter()
+        .map(|l| {
+            serde_json::json!({
+                "type": "point",
+                "position": l.world_position,
+                "color": l.color,
+                "radius": l.radius,
+                "min_quality": l.min_quality,
+            })
+        })
+        .collect();
     let value = serde_json::json!({
         "bounds": {
             "min_x": bounds.min_x,
@@ -1033,6 +1104,7 @@ fn build_scene_extras(bounds: &SpaceBounds, fog: Option<&SpaceFog>) -> json::ext
             "fog_near_distance": f.fog_near_distance,
             "far_plane": f.far_plane,
         })),
+        "lights": lights,
     });
     serde_json::value::to_raw_value(&value).ok().map(Box::from)
 }
@@ -1256,7 +1328,7 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
     // far-plane parameters. Three.js exposes them as
     // `gltf.scene.userData`; the webview drives THREE.FogExp2 +
     // PerspectiveCamera.far from this.
-    let scene_extras = build_scene_extras(&scene.bounds, scene.fog.as_ref());
+    let scene_extras = build_scene_extras(&scene.bounds, scene.fog.as_ref(), &scene.point_lights);
     let gltf_scene = root.push(json::Scene {
         nodes: scene_nodes,
         name: None,
