@@ -298,6 +298,25 @@ pub struct SpaceBounds {
     pub max_z: f32,
 }
 
+/// Atmospheric fog + far-plane parameters from a map's `space.ubersettings`.
+///
+/// space.ubersettings carries multiple Fog blocks for the time-of-day rotation
+/// (typically 4 — morning / noon / evening / night). For a static viewer we
+/// just take the first one and treat it as the "canonical" lighting state.
+/// Per-block values are nested under `<General><settings>` (farPlane) and
+/// `<*><Fog><settings>` (everything else).
+#[derive(Debug, Clone)]
+pub struct SpaceFog {
+    /// Linear RGBA. The engine uses A as max-fog opacity / intensity weight.
+    pub fog_color: [f32; 4],
+    /// Exponential-squared fog density per metre (THREE.FogExp2 compatible).
+    pub fog_density: f32,
+    /// Near distance below which fog is zero (THREE.Fog `near` analog).
+    pub fog_near_distance: f32,
+    /// Camera far plane in metres (THREE.PerspectiveCamera.far analog).
+    pub far_plane: f32,
+}
+
 /// Configuration for terrain mesh generation.
 pub struct TerrainConfig<'a> {
     pub terrain: &'a Terrain,
@@ -390,6 +409,10 @@ pub struct MapScene {
     pub water: Option<MapMesh>,
     /// World-space bounds of the map.
     pub bounds: SpaceBounds,
+    /// Atmospheric fog + far-plane parameters from space.ubersettings, when
+    /// parseable. Webview drives `THREE.FogExp2` from this; on `None`, the
+    /// webview falls back to a hardcoded default.
+    pub fog: Option<SpaceFog>,
     /// GPU-instanced vegetation: `(mesh_idx, positions)` per species.
     /// Exported as `EXT_mesh_gpu_instancing` nodes (one node per species).
     pub vegetation_instances: Vec<(usize, Vec<[f32; 3]>)>,
@@ -439,6 +462,7 @@ pub struct BuildMapSceneParams<'a> {
     pub vfs: Option<&'a vfs::VfsPath>,
     pub env: &'a MapEnvironment<'a>,
     pub bounds: SpaceBounds,
+    pub fog: Option<SpaceFog>,
     pub max_texture_size: Option<u32>,
     pub vegetation: Option<&'a VegetationData>,
     pub vegetation_density: f32,
@@ -454,6 +478,7 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         vfs,
         env,
         ref bounds,
+        ref fog,
         max_texture_size,
         vegetation,
         vegetation_density,
@@ -766,6 +791,7 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         terrain,
         water,
         bounds: bounds.clone(),
+        fog: fog.clone(),
         vegetation_instances,
     })
 }
@@ -979,6 +1005,29 @@ fn build_instance_extras(inst: &MapModelInstance) -> json::extras::Extras {
     });
     // RawValue serialization is infallible for a Value that's already
     // valid JSON (which a serde_json::Value always is).
+    serde_json::value::to_raw_value(&value).ok().map(Box::from)
+}
+
+/// Build glTF `extras` for the root Scene: map bounds + engine fog state.
+///
+/// Three.js maps Scene extras to `gltf.scene.userData`, so the webview
+/// can pull `bounds` (playable area) and `fog` (color + density + near
+/// distance + far plane) without a separate sidecar fetch.
+fn build_scene_extras(bounds: &SpaceBounds, fog: Option<&SpaceFog>) -> json::extras::Extras {
+    let value = serde_json::json!({
+        "bounds": {
+            "min_x": bounds.min_x,
+            "max_x": bounds.max_x,
+            "min_z": bounds.min_z,
+            "max_z": bounds.max_z,
+        },
+        "fog": fog.map(|f| serde_json::json!({
+            "fog_color": f.fog_color,
+            "fog_density": f.fog_density,
+            "fog_near_distance": f.fog_near_distance,
+            "far_plane": f.far_plane,
+        })),
+    });
     serde_json::value::to_raw_value(&value).ok().map(Box::from)
 }
 
@@ -1197,13 +1246,18 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
         }
     }
 
-    let scene = root.push(json::Scene {
+    // Scene-level extras carry map-wide engine state: world bounds + fog /
+    // far-plane parameters. Three.js exposes them as
+    // `gltf.scene.userData`; the webview drives THREE.FogExp2 +
+    // PerspectiveCamera.far from this.
+    let scene_extras = build_scene_extras(&scene.bounds, scene.fog.as_ref());
+    let gltf_scene = root.push(json::Scene {
         nodes: scene_nodes,
         name: None,
         extensions: Default::default(),
-        extras: Default::default(),
+        extras: scene_extras,
     });
-    root.scene = Some(scene);
+    root.scene = Some(gltf_scene);
 
     let json_string =
         json::serialize::to_string(&root).map_err(|e| Report::new(ExportError::Serialize(e.to_string())))?;

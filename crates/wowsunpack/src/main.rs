@@ -2249,6 +2249,44 @@ fn parse_lightmap_path(xml: &str) -> Option<String> {
     if path.is_empty() || path == "null" { None } else { Some(path.to_string()) }
 }
 
+/// Parse atmospheric fog + farPlane from space.ubersettings XML.
+///
+/// space.ubersettings stores 4+ Fog blocks for the time-of-day rotation
+/// (typically morning / noon / evening / night). For static export we just
+/// take the first one — engineers can pick a different ToD in a later
+/// follow-up.
+///
+/// `farPlane` is global (single `<value>` inside `<General><settings>`).
+/// Fog params live nested under `<*><Fog><settings>` with one `<value>`
+/// element per parameter; we read `fogColor` (4× f32), `fogDensity` (f32),
+/// `fogNearDistance` (f32).
+fn parse_space_fog(xml: &str) -> Option<gltf_export::SpaceFog> {
+    let doc = roxmltree::Document::parse(xml).ok()?;
+    let scalar = |tag: &str| -> Option<f32> {
+        let node = doc.descendants().find(|n| n.has_tag_name(tag))?;
+        let value = node.descendants().find(|n| n.has_tag_name("value"))?;
+        value.text()?.trim().parse().ok()
+    };
+    let vec4 = |tag: &str| -> Option<[f32; 4]> {
+        let node = doc.descendants().find(|n| n.has_tag_name(tag))?;
+        let value = node.descendants().find(|n| n.has_tag_name("value"))?;
+        let parts: Vec<f32> = value
+            .text()?
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if parts.len() < 4 { None } else { Some([parts[0], parts[1], parts[2], parts[3]]) }
+    };
+
+    let far_plane = scalar("farPlane").unwrap_or(5000.0);
+    // Take the first fogColor / fogDensity occurrence (the morning ToD block).
+    let fog_color = vec4("fogColor")?;
+    let fog_density = scalar("fogDensity")?;
+    let fog_near_distance = scalar("fogNearDistance").unwrap_or(0.0);
+
+    Some(gltf_export::SpaceFog { fog_color, fog_density, fog_near_distance, far_plane })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_export_map(
     space_dir: &Path,
@@ -2375,19 +2413,28 @@ fn run_export_map(
         }
     };
 
-    // 6. Load space.ubersettings for terrain lightmap path.
-    let lightmap_path = if !no_textures && !no_terrain {
+    // 6. Load space.ubersettings for terrain lightmap path + fog params.
+    // The XML is large (~140 KB on battle maps) so we cache the parsed
+    // string and pull both fields from it. lightmap_path needs textures
+    // + terrain enabled; fog is unconditionally useful for the consumer.
+    let uber_xml: Option<String> = {
         let uber_path = space_file(space_dir, "space.ubersettings", no_vfs);
-        match read_file_data(&uber_path, no_vfs, vfs) {
-            Ok(data) => {
-                let xml = String::from_utf8_lossy(&data);
-                parse_lightmap_path(&xml)
-            }
-            Err(_) => None,
-        }
+        read_file_data(&uber_path, no_vfs, vfs)
+            .ok()
+            .map(|d| String::from_utf8_lossy(&d).into_owned())
+    };
+    let lightmap_path = if !no_textures && !no_terrain {
+        uber_xml.as_deref().and_then(parse_lightmap_path)
     } else {
         None
     };
+    let fog = uber_xml.as_deref().and_then(parse_space_fog);
+    if let Some(f) = &fog {
+        eprintln!(
+            "  Fog: color={:?} density={} near={} farPlane={}",
+            f.fog_color, f.fog_density, f.fog_near_distance, f.far_plane
+        );
+    }
 
     // 7. Load terrain.bin if terrain is enabled.
     let terrain_data = if !no_terrain {
@@ -2516,6 +2563,7 @@ fn run_export_map(
         vfs: vfs_for_textures,
         env: &env,
         bounds: bounds.clone(),
+        fog: fog.clone(),
         max_texture_size,
         vegetation: vegetation_data.as_ref(),
         vegetation_density,
