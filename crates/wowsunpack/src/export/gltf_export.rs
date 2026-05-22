@@ -164,7 +164,7 @@ pub fn export_glb(
 
         let lod_entry = &visual.lods[lod];
         let primitives =
-            collect_primitives(visual, geometry, Some(db), Some(&self_id_index), lod_entry, damaged, None)?;
+            collect_primitives(visual, geometry, Some(db), Some(&self_id_index), lod_entry, damaged, None, true)?;
 
         if primitives.is_empty() {
             eprintln!("Warning: no primitives found for LOD {lod}");
@@ -549,7 +549,13 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         }
 
         let lod_entry = &vp.lods[lod];
-        let primitives = match collect_primitives(vp, geometry, db, self_id_index.as_ref(), lod_entry, false, None) {
+        // apply_metric_scale=false for map content: space.bin matrices
+        // already encode world-metric translations and the matrix scale
+        // is meant to apply directly to native vertex bbox. The toolkit's
+        // pre-multiplying vertex positions by 15× was a bug specific to
+        // map content — for LNR landmasses (scale=11.16), it inflated
+        // the rendered geometry from ~558m to ~8500m world-space.
+        let primitives = match collect_primitives(vp, geometry, db, self_id_index.as_ref(), lod_entry, false, None, false) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("Warning: model[{model_idx}]: {e}");
@@ -1596,7 +1602,8 @@ pub fn export_merged_models_glb(
         }
 
         let lod_entry = &vp.lods[lod];
-        let primitives = match collect_primitives(vp, geometry, db, self_id_index.as_ref(), lod_entry, false, None) {
+        // apply_metric_scale=false: see build_map_scene caller for rationale.
+        let primitives = match collect_primitives(vp, geometry, db, self_id_index.as_ref(), lod_entry, false, None, false) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("Warning: model[{model_idx}]: {e}");
@@ -2161,6 +2168,15 @@ fn collect_primitives(
     lod: &crate::models::visual::Lod,
     damaged: bool,
     barrel_pitch: Option<&BarrelPitch>,
+    // When `true`, multiply vertex positions by `NATIVE_TO_METRES`. Ship
+    // exports want this (vertex positions in models.geometry are in native
+    // BigWorld units that need conversion). Map exports do NOT — map
+    // matrices in space.bin already store translations in metres AND the
+    // matrix scale is meant to apply directly to the native vertex bbox
+    // to produce world metres. Applying ×15 on both ends double-scales
+    // map geometry (LNR landmass proxies blow up from ~558m to ~8500m
+    // world-space).
+    apply_metric_scale: bool,
 ) -> Result<Vec<DecodedPrimitive>, Report<ExportError>> {
     let mut result = Vec::new();
     let exclude = if damaged { DAMAGED_EXCLUDE } else { INTACT_EXCLUDE };
@@ -2290,7 +2306,9 @@ fn collect_primitives(
         if let Some(bp) = barrel_pitch {
             apply_barrel_pitch(&mut verts.positions, &mut verts.normals, vert_slice, stride, &format, bp);
         }
-        scale_positions_to_metres(&mut verts.positions);
+        if apply_metric_scale {
+            scale_positions_to_metres(&mut verts.positions);
+        }
 
         // Material name for this render set.
         let material_name = db
@@ -5192,6 +5210,7 @@ pub fn export_ship_glb(
             lod_entry,
             damaged,
             sub.barrel_pitch.as_ref(),
+            true, // ship export: apply NATIVE_TO_METRES to vertex positions
         )?;
 
         if primitives.is_empty() {
