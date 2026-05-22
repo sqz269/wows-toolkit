@@ -3,33 +3,43 @@
 //! These files store per-instance placement data for SpeedTree vegetation
 //! (trees, bushes, algae, etc.) across a map space.
 //!
-//! ## File Layout
+//! ## File Layout (engine-verified, 2026-05-22 audit)
 //!
 //! ```text
-//! Header (32 bytes):
-//!   u64  num_species
-//!   u64  string_table_offset
-//!   u64  (reserved)
-//!   u64  lod0_total_instances
+//! Header (16 bytes):
+//!   u32 num_species + 4-byte pad
+//!   i64 string_table_relptr  (relative to file base; lands at abs 0x250 in all observed files)
 //!
-//! LOD Blocks (variable, between header and string table):
-//!   Each LOD block contains:
-//!   - Species group ranges (u32 pairs, terminated by first >= num_species)
-//!   - (u32 num_species, u32 0)         // end marker
-//!   - (u32 num_species, u32 lod_flag)  // LOD header
-//!   - num_species × (u32 start, u32 count)  // per-species instance table
+//! Layers (4 × 0x90 bytes, starting at file offset 0x10):
+//!   Layer[0] @ 0x10   = "Primary"        (LOD-0 above-water placements)
+//!   Layer[1] @ 0xA0   = "PrimaryRare"
+//!   Layer[2] @ 0x130  = "Underwater"
+//!   Layer[3] @ 0x1C0  = "UnderwaterRare"
 //!
-//! String Table (at string_table_offset):
-//!   num_species × (u64 len, i64 relptr)  // species name entries
+//!   Per-layer struct (0x90 bytes):
+//!     +0x00  i64  buffer_relptr   (relative to layer base; points to instance data)
+//!     +0x08  u32  buffer_count    (number of f32x4 instance records)
+//!     +0x0c  u32  pad/unknown     (always 0 in observed files)
+//!     +0x10  cell[0] (0x80 bytes):
+//!       num_species × (u32 start, u32 count)  // per-species (start, count) ranges
+//!       ...rest of cell is zero padding to 0x80
+//!
+//! String Table (@ string_table_relptr; abs 0x250):
+//!   num_species × (u64 len, i64 relptr)  // entries
 //!   ...followed by null-terminated string data...
 //!
-//! Instance Data (from end of string pool to EOF):
+//! Instance Data (per-layer; reached via Layer.buffer_relptr):
 //!   Dense array of 16-byte records (f32 x, f32 y, f32 z, f32 w).
-//!   LOD levels are stored sequentially. Each LOD's species table uses
-//!   indices relative to that LOD's base within this array.
+//!   Layer 0's records typically start right after the string pool.
 //! ```
 //!
-//! We parse only the highest-detail **LOD 0** instances.
+//! Engine: `forest::ForestSystemImpl::loadForestData` @ 0x140fdddc0 →
+//! root parser `FUN_140fe2240` → per-layer parser `FUN_140fe24c0`. Layer
+//! label strings live at `.rdata` `0x14251c690ff`.
+//!
+//! We parse only the highest-detail **LOD 0** instances (Layer[0] = Primary).
+//! Underwater layers are decoded by the engine but typically absent on
+//! battle maps; the file shape supports them via Layer[2..4].
 
 use rootcause::Report;
 use thiserror::Error;
@@ -53,8 +63,6 @@ pub enum ForestError {
     DataTooShort { offset: usize, need: usize, have: usize },
     #[error("parse error: {0}")]
     ParseError(String),
-    #[error("LOD0 species table not found in header")]
-    NoLod0Table,
 }
 
 /// A single vegetation instance with its species assignment.
@@ -97,33 +105,59 @@ fn parse_raw_instance(input: &mut &[u8]) -> WResult<RawInstance> {
     Ok(RawInstance { x, y, z })
 }
 
-/// Find the LOD 0 per-species (start, count) table in the header.
+// Layer offsets in the file (4 layers, 0x90 bytes each, starting at 0x10).
+// Layer[0] = "Primary" = LOD-0 above-water placements (what we consume here).
+// Cell[0] inside each layer holds the per-species (u32 start, u32 count) table.
+const LAYER_BASE: usize = 0x10;
+const _LAYER_STRIDE: usize = 0x90;
+const CELL_OFFSET_IN_LAYER: usize = 0x10;
+
+/// Read Layer[0] ("Primary") from the engine-defined fixed offset.
 ///
-/// Searches for the marker pattern `(num_species_u32, 0, num_species_u32, 1)`
-/// which immediately precedes the species table. The first occurrence is LOD 0.
-fn find_lod0_species_table(data: &[u8], num_species: usize, search_end: usize) -> Option<(usize, Vec<(usize, usize)>)> {
-    let ns = num_species as u32;
-    let marker = [ns.to_le_bytes(), 0u32.to_le_bytes(), ns.to_le_bytes(), 1u32.to_le_bytes()].concat();
-
-    let end = search_end.min(data.len());
-    let marker_pos = data[..end].windows(marker.len()).position(|w| w == marker)?;
-
-    let table_start = marker_pos + marker.len();
-    let table_end = table_start + num_species * 8;
-    if table_end > end {
-        return None;
+/// Returns `(instance_data_abs_offset, instance_count, per_species_ranges)`.
+///
+/// The previous implementation byte-grepped for a
+/// `(num_species, 0, num_species, 1)` marker, which failed on 70/70
+/// non-empty corpus files (the marker hits a false positive in 1/82 and
+/// never matches the real table location). Engine ground truth from
+/// `FUN_140fe24c0` (per-layer parser): the (start, count) table lives at
+/// a fixed offset (`layer_base + 0x10`) inside the 0x90-byte layer
+/// struct, and the instance buffer pointer lives at the layer base
+/// itself.
+fn read_primary_layer(
+    data: &[u8],
+    num_species: usize,
+) -> Result<(usize, usize, Vec<(usize, usize)>), ForestError> {
+    let layer_off = LAYER_BASE;
+    let cell_off = layer_off + CELL_OFFSET_IN_LAYER;
+    let need = cell_off + num_species * 8;
+    if data.len() < need {
+        return Err(ForestError::DataTooShort {
+            offset: layer_off,
+            need,
+            have: data.len(),
+        });
     }
 
-    let mut entries = Vec::with_capacity(num_species);
+    let buf_relptr = i64::from_le_bytes(data[layer_off..layer_off + 8].try_into().unwrap());
+    let buf_count = u32::from_le_bytes(data[layer_off + 8..layer_off + 12].try_into().unwrap()) as usize;
+    // buffer_relptr is relative to the layer base; resolve to abs file offset.
+    let buf_abs = (layer_off as i64).wrapping_add(buf_relptr) as usize;
+    if buf_count > 0 && buf_abs + buf_count * INSTANCE_SIZE > data.len() {
+        return Err(ForestError::ParseError(format!(
+            "Primary layer buffer out of bounds: abs=0x{buf_abs:X} count={buf_count} file_len={}",
+            data.len(),
+        )));
+    }
+
+    let mut ranges = Vec::with_capacity(num_species);
     for i in 0..num_species {
-        let off = table_start + i * 8;
-        let start = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
-        let count = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap()) as usize;
-        entries.push((start, count));
+        let o = cell_off + i * 8;
+        let start = u32::from_le_bytes(data[o..o + 4].try_into().unwrap()) as usize;
+        let count = u32::from_le_bytes(data[o + 4..o + 8].try_into().unwrap()) as usize;
+        ranges.push((start, count));
     }
-
-    let total: usize = entries.iter().map(|(_, c)| *c).sum();
-    Some((total, entries))
+    Ok((buf_abs, buf_count, ranges))
 }
 
 /// Parse a `forest.bin` file.
@@ -163,9 +197,9 @@ pub fn parse_forest(file_data: &[u8]) -> Result<Forest, Report<ForestError>> {
         }));
     }
 
-    // Parse species string table.
+    // Parse species string table. Names are emitted in file order, indexed
+    // by species_index in the per-layer (start, count) cell tables.
     let mut species = Vec::with_capacity(num_species);
-    let mut data_start = string_table_end;
 
     for i in 0..num_species {
         let entry_off = string_table_offset + i * 16;
@@ -185,24 +219,39 @@ pub fn parse_forest(file_data: &[u8]) -> Result<Forest, Report<ForestError>> {
         let name_bytes = &file_data[str_abs..str_abs + str_len - 1];
         let name = String::from_utf8_lossy(name_bytes).into_owned();
         species.push(name);
-
-        let str_end = str_abs + str_len;
-        if str_end > data_start {
-            data_start = str_end;
-        }
     }
 
-    // Find the LOD 0 per-species instance table in the header area
-    // (between the fixed header at 0x20 and the string table).
-    let (lod0_total, species_table) = find_lod0_species_table(file_data, num_species, string_table_offset)
-        .ok_or_else(|| Report::new(ForestError::NoLod0Table))?;
+    // Read Layer[0] (Primary = LOD-0 above-water) directly from its
+    // fixed engine-defined offset. The instance buffer pointer + count +
+    // per-species (start, count) table all live inside this layer; no
+    // byte-grep heuristic needed. See `read_primary_layer` and the
+    // module docstring for the layer layout.
+    let (instances_abs, lod0_total, species_table) =
+        read_primary_layer(file_data, num_species).map_err(Report::new)?;
 
-    // Parse raw instance data.
-    let remaining = file_data.len() - data_start;
-    let max_instances = remaining / INSTANCE_SIZE;
+    // Sanity: the per-species count sums should equal Layer[0].buffer_count.
+    // Diverges on malformed files; warn but trust the per-species ranges.
+    let sum: usize = species_table.iter().map(|(_, c)| *c).sum();
+    if sum != lod0_total {
+        eprintln!(
+            "Warning: forest.bin per-species sum ({sum}) != layer count ({lod0_total}); using per-species ranges"
+        );
+    }
 
-    let input = &mut &file_data[data_start..data_start + max_instances * INSTANCE_SIZE];
-    let raw_instances: Vec<RawInstance> = repeat(max_instances, parse_raw_instance)
+    // Parse raw instance data for Layer[0].
+    let bytes_needed = lod0_total * INSTANCE_SIZE;
+    if lod0_total == 0 {
+        return Ok(Forest { species, instances: Vec::new() });
+    }
+    if instances_abs + bytes_needed > file_data.len() {
+        return Err(Report::new(ForestError::DataTooShort {
+            offset: instances_abs,
+            need: bytes_needed,
+            have: file_data.len().saturating_sub(instances_abs),
+        }));
+    }
+    let input = &mut &file_data[instances_abs..instances_abs + bytes_needed];
+    let raw_instances: Vec<RawInstance> = repeat(lod0_total, parse_raw_instance)
         .parse_next(input)
         .map_err(|e: ErrMode<ContextError>| Report::new(ForestError::ParseError(format!("{e}"))))?;
 
