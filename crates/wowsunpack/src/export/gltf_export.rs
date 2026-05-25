@@ -207,14 +207,12 @@ pub fn export_glb(
     // exactly as before.
     if !skinned_mesh_nodes.is_empty() {
         let skin_tree = emit_bone_node_tree(&mut root, visual, db);
-        // Add root bones (parent == 0xFFFF) to the scene so consumers see
-        // the skeleton even with the mesh hidden. The skin still binds
-        // correctly without this but Blender / Three.js render the
-        // skeleton overlay from the scene tree.
-        for (vidx, &parent) in visual.nodes.parent_ids.iter().enumerate() {
-            if parent == 0xFFFF || parent as usize >= visual.nodes.parent_ids.len() {
-                scene_nodes.push(skin_tree.bone_node_idx[vidx]);
-            }
+        // Add the bone-tree entry point(s) to the scene so consumers see the
+        // skeleton even with the mesh hidden. `scene_roots` is the raw roots
+        // (parent == 0xFFFF), or the single Y180 wrapper node when the asset
+        // was bone-frame-baked (see `emit_bone_node_tree`).
+        for &root_node in &skin_tree.scene_roots {
+            scene_nodes.push(root_node);
         }
         for (mesh_node, palette, debug_name) in skinned_mesh_nodes.drain(..) {
             let skin = emit_skin_for_palette(
@@ -2696,6 +2694,26 @@ fn invert_mat4_col(m: &[f32; 16]) -> [f32; 16] {
     out
 }
 
+/// 180° about Y, column-major (= `diag(-1, 1, -1, 1)`). Its own inverse.
+/// Baked above the bone roots of Z-mirror gun visuals so the rest pose
+/// they ship in matches a consumer that pitches `Rotate_X` naively — see
+/// the bake block in `emit_bone_node_tree`.
+const RIG_Y180: [f32; 16] = [
+    -1.0, 0.0, 0.0, 0.0, //
+    0.0, 1.0, 0.0, 0.0, //
+    0.0, 0.0, -1.0, 0.0, //
+    0.0, 0.0, 0.0, 1.0, //
+];
+
+/// 3x3 determinant of the upper-left of a column-major 4x4. Local twin of
+/// `ship::mat3_determinant` (kept here to avoid a cross-module `pub`).
+/// Negative ⇒ the node bakes a Z-mirror (`col2.z < 0`), WG's convention
+/// for "this turret was authored mirrored".
+fn mat3_det(m: &[f32; 16]) -> f32 {
+    m[0] * (m[5] * m[10] - m[6] * m[9]) - m[4] * (m[1] * m[10] - m[2] * m[9])
+        + m[8] * (m[1] * m[6] - m[2] * m[5])
+}
+
 /// Per-export bone tree state: glTF node indices and matrices indexed by
 /// the source visual node index. Built once per export and reused across
 /// every skinned render set in the same visual.
@@ -2710,6 +2728,13 @@ struct SkinTree {
     /// Mirror of `visual.nodes.parent_ids` (0xFFFF = root) so callers
     /// can walk the hierarchy without re-borrowing the visual.
     parents: Vec<u16>,
+    /// `Some(Ry180)` when a Y180 wrapper was baked above the roots (Z-mirror
+    /// gun). `skin_tree_world_matrix` left-mul's it so the emitted IBMs match
+    /// the wrapped node tree and the rest pose is preserved. `None` otherwise.
+    root_premul: Option<[f32; 16]>,
+    /// Bone-tree entry point(s) for the scene graph: the raw roots
+    /// (`parent == 0xFFFF`), or the single Y180 wrapper node when baked.
+    scene_roots: Vec<json::Index<json::Node>>,
 }
 
 /// Push one glTF Node per visual node, wire up the hierarchy via
@@ -2784,7 +2809,61 @@ fn emit_bone_node_tree(
         root.nodes[idx_value].children = Some(kids);
     }
 
-    SkinTree { bone_node_idx, local_mats, parents: nodes.parent_ids.clone() }
+    // ── Y180 bone-frame bake ──────────────────────────────────────────
+    // WG authors many gun visuals with a Z-mirror rest pose: the 3x3 of
+    // `Rotate_Y_BlendBone` has `det < 0` (and the whole `*_BlendBone` set
+    // shares the sign). Under that convention the muzzle chain composes
+    // into the opposite Z half-space from the mesh it skins, so a consumer
+    // that pitches `Rotate_X` rotates about a pivot in the wrong half-space
+    // and the cradle tears off the trunnion. Webview/Unity correct this at
+    // runtime (insert Y180 above the root + right-mul the IBMs); we bake the
+    // same correction here so the on-disk GLB is self-consistent for every
+    // consumer — including Blender, which applies none.
+    //
+    // Scope: gated to assets that actually pitch — i.e. carry an
+    // `HP_gunFire*` muzzle — matching the runtime fix's scope. Yaw-only
+    // radars/directors are Z-mirror too, but `Ry(θ)` commutes with Y180 so
+    // they need no correction and are left untouched.
+    //
+    // Rest pose is preserved: the wrapper left-mul's Y180 into every joint
+    // world and `skin_tree_world_matrix` mirrors that, so `joint.world * IBM`
+    // is still identity at bind. Deterministic + idempotent across
+    // re-exports (recomputed from the visual; never reads a prior GLB). The
+    // `BoneFrameFixY180` node name is the marker consumers can detect.
+    let has_muzzle = name_by_node
+        .iter()
+        .flatten()
+        .any(|n| n.starts_with("HP_gunFire") && n.as_str() != "HP_gunFireEffect");
+    let blendbone_det = visual.find_node_local_matrix("Rotate_Y_BlendBone", &db.strings).map(|m| mat3_det(&m));
+    let bake_y180 = has_muzzle && matches!(blendbone_det, Some(d) if d < 0.0);
+
+    let raw_roots: Vec<json::Index<json::Node>> = (0..count)
+        .filter(|&i| {
+            let p = nodes.parent_ids[i];
+            p == 0xFFFF || (p as usize) >= count
+        })
+        .map(|i| bone_node_idx[i])
+        .collect();
+
+    let (root_premul, scene_roots) = if bake_y180 {
+        let wrapper = root.push(json::Node {
+            name: Some("BoneFrameFixY180".to_string()),
+            matrix: Some(RIG_Y180),
+            children: Some(raw_roots),
+            ..Default::default()
+        });
+        (Some(RIG_Y180), vec![wrapper])
+    } else {
+        (None, raw_roots)
+    };
+
+    SkinTree {
+        bone_node_idx,
+        local_mats,
+        parents: nodes.parent_ids.clone(),
+        root_premul,
+        scene_roots,
+    }
 }
 
 /// World matrix at bind pose for a given visual node: chain locals from
@@ -2809,6 +2888,12 @@ fn skin_tree_world_matrix(skin_tree: &SkinTree, node_idx: u16) -> [f32; 16] {
         }
         world = mat4_mul_col(&skin_tree.local_mats[parent as usize], &world);
         current = parent;
+    }
+    // Mirror the baked Y180 wrapper (when present) so the IBM derived from
+    // this world matches the wrapped glTF node tree — keeps the rest pose
+    // identical and the deformation Y180-conjugated under pitch.
+    if let Some(premul) = skin_tree.root_premul {
+        world = mat4_mul_col(&premul, &world);
     }
     world
 }
