@@ -226,6 +226,18 @@ pub fn export_glb(
             let value = mesh_node.value();
             root.nodes[value].skin = Some(skin);
         }
+    } else if visual.has_muzzle_locator(&db.strings) {
+        // Static weapon mounts (notably torpedo tubes) carry `HP_gunFire<N>`
+        // launch locators in the visual but skin no mesh, so the branch above
+        // skips them and the locators would be dropped from the GLB. Emit the
+        // bone node tree anyway — there is no skin to attach — so consumers can
+        // read the per-tube launch points (position + forward) exactly as they
+        // read gun muzzles. Scoped to visuals that actually carry a muzzle
+        // locator, so every other static accessory still exports mesh-only.
+        let skin_tree = emit_bone_node_tree(&mut root, visual, db);
+        for &root_node in &skin_tree.scene_roots {
+            scene_nodes.push(root_node);
+        }
     }
 
     // Pad binary data to 4-byte alignment.

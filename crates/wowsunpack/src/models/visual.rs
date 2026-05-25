@@ -432,6 +432,19 @@ impl VisualPrototype {
         }
     }
 
+    /// True when the visual carries at least one real muzzle/launch locator
+    /// (`HP_gunFire<N>`), excluding the `HP_gunFireEffect` VFX-only locator.
+    /// Mirrors the `has_muzzle` gate in the glTF bone-tree exporter so callers
+    /// (e.g. the static-mesh locator-retention path) see exactly the names
+    /// that exporter emits.
+    pub fn has_muzzle_locator(&self, strings: &StringsSection<'_>) -> bool {
+        self.nodes.name_map_name_ids.iter().any(|&name_id| {
+            strings
+                .get_string_by_id(name_id)
+                .is_some_and(|n| n.starts_with("HP_gunFire") && n != "HP_gunFireEffect")
+        })
+    }
+
     /// Find the node index for a given node name string.
     pub fn find_node_index_by_name(&self, name: &str, strings: &StringsSection<'_>) -> Option<u16> {
         for (i, &name_id) in self.nodes.name_map_name_ids.iter().enumerate() {
