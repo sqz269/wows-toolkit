@@ -240,6 +240,46 @@ pub fn export_glb(
         }
     }
 
+    // Armor: emit the geometry's embedded armor model(s) as an "Armor" group,
+    // mirroring `export_ship_glb`. Only guns/turrets carry armor models, so
+    // this is a no-op for the ~80% of accessories that ship without one. The
+    // per-vertex `_MATERIAL_ID` is intrinsic to the model; we pass no thickness
+    // map (a single model has no ship/mount context), so COLOR_0 stays neutral
+    // and consumers resolve thickness from the ship sidecar's per-mount armor
+    // table keyed by material_id. Lets a turret GLB carry its own armor so a
+    // consumer can parent it to the yaw bone and have it rotate with the mount.
+    let mut armor_nodes: Vec<json::Index<json::Node>> = Vec::new();
+    for am in &geometry.armor_models {
+        for sub in armor_sub_models_by_zone(am, None, None) {
+            if sub.positions.is_empty() {
+                continue;
+            }
+            let gltf_prim = add_armor_primitive_to_root(&mut root, &mut bin_data, &sub)?;
+            let mesh = root.push(json::Mesh {
+                primitives: vec![gltf_prim],
+                weights: None,
+                name: Some(sub.name.clone()),
+                extensions: Default::default(),
+                extras: Default::default(),
+            });
+            let node = root.push(json::Node {
+                mesh: Some(mesh),
+                name: Some(sub.name.clone()),
+                matrix: sub.transform.map(negate_z_transform),
+                ..Default::default()
+            });
+            armor_nodes.push(node);
+        }
+    }
+    if !armor_nodes.is_empty() {
+        let parent = root.push(json::Node {
+            children: Some(armor_nodes),
+            name: Some("Armor".to_string()),
+            ..Default::default()
+        });
+        scene_nodes.push(parent);
+    }
+
     // Pad binary data to 4-byte alignment.
     while !bin_data.len().is_multiple_of(4) {
         bin_data.push(0);
