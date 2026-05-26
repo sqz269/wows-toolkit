@@ -2299,6 +2299,22 @@ fn collect_primitives(
     let mut result = Vec::new();
     let exclude = if damaged { DAMAGED_EXCLUDE } else { INTACT_EXCLUDE };
 
+    // WG authors some skinned mounts (guns, radars, directors, catapults)
+    // with a Z-mirror rest pose: the `Rotate_Y_BlendBone` 3x3 has det < 0
+    // (the whole `*_BlendBone` set shares the sign). The uniform
+    // `flip_triangle_winding` below compensates the Z-negate in
+    // `unpack_vertices` for the COMMON, non-mirrored frame; for a Z-mirror
+    // skin it over-flips, leaving triangles facing inward once the placement
+    // strips the mirror to a proper rotation (`ensure_proper_rotation`,
+    // ship.rs). So for those render sets we skip the flip — the source
+    // BigWorld winding is already outward-facing under the de-mirrored
+    // placement. This is the deterministic, producer-side replacement for the
+    // downstream geometric winding-audit heuristic, and keys off the SAME det
+    // bit the Y180 bone-frame bake uses (see `emit_bone_node_tree`).
+    let zmirror_skin = db
+        .and_then(|db| visual.find_node_local_matrix("Rotate_Y_BlendBone", &db.strings))
+        .is_some_and(|m| mat3_det(&m) < 0.0);
+
     for &rs_name_id in &lod.render_set_names {
         // Find the render set with this name_id.
         let rs = visual
@@ -2412,7 +2428,11 @@ fn collect_primitives(
                 return Err(Report::new(ExportError::IndexDecode(format!("unsupported index size: {index_size}"))));
             }
         };
-        flip_triangle_winding(&mut indices);
+        // Z-mirror skinned render sets keep their source winding (see
+        // `zmirror_skin` above); everyone else gets the uniform flip.
+        if !(zmirror_skin && rs.skinned) {
+            flip_triangle_winding(&mut indices);
+        }
 
         // Indices are already 0-based relative to the vertex slice
         // (items_offset is applied when extracting the vertex slice).
