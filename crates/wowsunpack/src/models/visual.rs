@@ -417,6 +417,28 @@ impl VisualPrototype {
         Some(self.nodes.matrices[node_idx as usize].0)
     }
 
+    /// Local matrix of the first node whose name contains `"BlendBone"`.
+    ///
+    /// WG's Z-mirror authoring convention lives in the `*_BlendBone` rig
+    /// nodes (3x3 det < 0). The whole `*_BlendBone` set on an asset shares
+    /// that determinant sign, so any single representative reveals the
+    /// convention. Used by the glTF exporter's winding gate; the exact node
+    /// name varies (`Root_BlendBone`, `Rotate_Y_BlendBone`,
+    /// `Rotate_Y1_BlendBone`, `Roll_Back1_BlendBone`, lowercase
+    /// `rotate_Y_BlendBone`, …), so we match the stable `"BlendBone"`
+    /// substring rather than a fixed name.
+    pub fn find_any_blendbone_local_matrix(&self, strings: &StringsSection<'_>) -> Option<[f32; 16]> {
+        for (i, &name_id) in self.nodes.name_map_name_ids.iter().enumerate() {
+            if let Some(resolved) = strings.get_string_by_id(name_id)
+                && resolved.contains("BlendBone")
+            {
+                let node_idx = self.nodes.name_map_node_ids[i] as usize;
+                return Some(self.nodes.matrices[node_idx].0);
+            }
+        }
+        None
+    }
+
     /// Check whether `node_idx` is a descendant of `ancestor_idx` in the
     /// skeleton hierarchy.
     pub fn is_descendant_of(&self, mut node_idx: u16, ancestor_idx: u16) -> bool {

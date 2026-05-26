@@ -2113,7 +2113,7 @@ fn collect_all_render_set_primitives(
 /// Extracted from `collect_primitives` so both the filtered (`--lod`/`--damaged`)
 /// and the all-render-sets paths share one decoder.
 fn decode_render_set_primitive(
-    _visual: &VisualPrototype,
+    visual: &VisualPrototype,
     geometry: &MergedGeometry,
     db: Option<&PrototypeDatabase<'_>>,
     self_id_index: Option<&HashMap<u64, usize>>,
@@ -2206,7 +2206,18 @@ fn decode_render_set_primitive(
             return Err(Report::new(ExportError::IndexDecode(format!("unsupported index size: {index_size}"))));
         }
     };
-    flip_triangle_winding(&mut indices);
+    // Z-mirror skinned render sets keep their source winding (same gate as
+    // `collect_primitives`): WG authors these with `det(Rotate_Y_BlendBone)<0`
+    // and the de-mirrored placement (`ensure_proper_rotation`) would otherwise
+    // leave them inward-facing. THIS is the `--all-render-sets` decoder used by
+    // the accessory library + per-asset export-model (`batch_export_model`
+    // passes `all_render_sets=true`), so the gate is load-bearing here.
+    let zmirror_skin = db
+        .and_then(|db| visual.find_any_blendbone_local_matrix(&db.strings))
+        .is_some_and(|m| mat3_det(&m) < 0.0);
+    if !(zmirror_skin && rs.skinned) {
+        flip_triangle_winding(&mut indices);
+    }
 
     let mut verts = unpack_vertices(vert_slice, stride, &format);
 
@@ -2312,7 +2323,7 @@ fn collect_primitives(
     // downstream geometric winding-audit heuristic, and keys off the SAME det
     // bit the Y180 bone-frame bake uses (see `emit_bone_node_tree`).
     let zmirror_skin = db
-        .and_then(|db| visual.find_node_local_matrix("Rotate_Y_BlendBone", &db.strings))
+        .and_then(|db| visual.find_any_blendbone_local_matrix(&db.strings))
         .is_some_and(|m| mat3_det(&m) < 0.0);
 
     for &rs_name_id in &lod.render_set_names {
