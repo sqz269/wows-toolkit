@@ -205,8 +205,16 @@ pub fn export_glb(
     // Bone tree + skins. Only emitted when at least one render set carries
     // skin attributes; static visuals (most non-gun accessories) export
     // exactly as before.
+    //
+    // Captured for the Armor group below: when the bone tree bakes a Y180
+    // wrapper (Z-mirror gun, det(Rotate_Y_BlendBone) < 0), the skinned visual
+    // and the muzzle bones live in that rotated frame, but the Armor group is a
+    // scene-root SIBLING of the wrapper. Without the same RIG_Y180 it renders
+    // 180° about Y off the turret. Stays `None` for non-baked turrets.
+    let mut armor_y180: Option<[f32; 16]> = None;
     if !skinned_mesh_nodes.is_empty() {
         let skin_tree = emit_bone_node_tree(&mut root, visual, db);
+        armor_y180 = skin_tree.root_premul;
         // Add the bone-tree entry point(s) to the scene so consumers see the
         // skeleton even with the mesh hidden. `scene_roots` is the raw roots
         // (parent == 0xFFFF), or the single Y180 wrapper node when the asset
@@ -235,6 +243,7 @@ pub fn export_glb(
         // read gun muzzles. Scoped to visuals that actually carry a muzzle
         // locator, so every other static accessory still exports mesh-only.
         let skin_tree = emit_bone_node_tree(&mut root, visual, db);
+        armor_y180 = skin_tree.root_premul;
         for &root_node in &skin_tree.scene_roots {
             scene_nodes.push(root_node);
         }
@@ -275,6 +284,12 @@ pub fn export_glb(
         let parent = root.push(json::Node {
             children: Some(armor_nodes),
             name: Some("Armor".to_string()),
+            // Share the skinned visual's baked Y180 frame (captured above from the
+            // bone tree's `root_premul`). Z-mirror guns (det(Rotate_Y_BlendBone)<0)
+            // bake a `BoneFrameFixY180` wrapper above the bones; the muzzle + visual
+            // live in it, so this scene-root Armor sibling needs the same RIG_Y180 or
+            // it renders 180° about Y off the turret. `None` for non-baked turrets.
+            matrix: armor_y180,
             ..Default::default()
         });
         scene_nodes.push(parent);
