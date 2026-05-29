@@ -8,6 +8,30 @@ use image_dds::image::codecs::png::PngEncoder;
 use rootcause::Report;
 use thiserror::Error;
 
+/// Write `bytes` to `path` atomically: write a unique sibling temp file
+/// then rename over `path`. The rename swaps in a FRESH inode, so if
+/// `path` is a hardlink (e.g. after the export pipeline's texture dedup,
+/// which hardlinks the byte-identical `ship_atlas_detail.dds` across all
+/// accessory dirs to reclaim ~20 GB) the OTHER links are left intact
+/// rather than being truncated-in-place and aliased. Also crash-safe: a
+/// kill mid-write leaves the original file untouched (the partial write is
+/// in the temp file). Produces byte-identical output to a plain write.
+fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp{}", std::process::id()));
+    let tmp = std::path::PathBuf::from(tmp);
+    std::fs::write(&tmp, bytes)?;
+    // std::fs::rename replaces an existing destination atomically on both
+    // Windows (MoveFileEx REPLACE_EXISTING) and POSIX.
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum TextureError {
     #[error("failed to parse DDS: {0}")]
@@ -237,7 +261,7 @@ impl RawDdsDumper {
             }
             if let Some(bytes) = load_dds_from_vfs(vfs, &full_path) {
                 let out = self.dir.join(&filename);
-                if let Err(e) = std::fs::write(&out, &bytes) {
+                if let Err(e) = atomic_write(&out, &bytes) {
                     eprintln!("  Warning: failed to write raw DDS {}: {e}", out.display());
                 }
                 self.written.insert(filename.clone());
@@ -279,7 +303,7 @@ impl RawDdsDumper {
                 Ok((normal_dds, mask_dds)) => {
                     if need_normal {
                         let out = self.dir.join(&normal_name);
-                        if let Err(e) = std::fs::write(&out, &normal_dds) {
+                        if let Err(e) = atomic_write(&out, &normal_dds) {
                             eprintln!("  Warning: failed to write {}: {e}", out.display());
                         } else {
                             self.written.insert(normal_name);
@@ -287,7 +311,7 @@ impl RawDdsDumper {
                     }
                     if need_mask {
                         let out = self.dir.join(&mask_name);
-                        if let Err(e) = std::fs::write(&out, &mask_dds) {
+                        if let Err(e) = atomic_write(&out, &mask_dds) {
                             eprintln!("  Warning: failed to write {}: {e}", out.display());
                         } else {
                             self.written.insert(mask_name);
@@ -316,7 +340,7 @@ impl RawDdsDumper {
                 Ok((mr_dds, mask_dds)) => {
                     if need_mr {
                         let out = self.dir.join(&mr_name);
-                        if let Err(e) = std::fs::write(&out, &mr_dds) {
+                        if let Err(e) = atomic_write(&out, &mr_dds) {
                             eprintln!("  Warning: failed to write {}: {e}", out.display());
                         } else {
                             self.written.insert(mr_name);
@@ -324,7 +348,7 @@ impl RawDdsDumper {
                     }
                     if need_mask {
                         let out = self.dir.join(&mask_name);
-                        if let Err(e) = std::fs::write(&out, &mask_dds) {
+                        if let Err(e) = atomic_write(&out, &mask_dds) {
                             eprintln!("  Warning: failed to write {}: {e}", out.display());
                         } else {
                             self.written.insert(mask_name);
@@ -1454,12 +1478,12 @@ pub fn swizzle_dir(
             match split_wg_normal_dds(&bytes) {
                 Ok((normal_dds, mask_dds)) => {
                     if need_normal {
-                        if let Err(e) = std::fs::write(&normal_out, &normal_dds) {
+                        if let Err(e) = atomic_write(&normal_out, &normal_dds) {
                             eprintln!("  Warning: failed to write {}: {e}", normal_out.display());
                         } else { written += 1; }
                     }
                     if need_mask {
-                        if let Err(e) = std::fs::write(&mask_out, &mask_dds) {
+                        if let Err(e) = atomic_write(&mask_out, &mask_dds) {
                             eprintln!("  Warning: failed to write {}: {e}", mask_out.display());
                         } else { written += 1; }
                     }
@@ -1482,12 +1506,12 @@ pub fn swizzle_dir(
             match split_wg_mg_dds(&bytes) {
                 Ok((mr_dds, mask_dds)) => {
                     if need_mr {
-                        if let Err(e) = std::fs::write(&mr_out, &mr_dds) {
+                        if let Err(e) = atomic_write(&mr_out, &mr_dds) {
                             eprintln!("  Warning: failed to write {}: {e}", mr_out.display());
                         } else { written += 1; }
                     }
                     if need_mask {
-                        if let Err(e) = std::fs::write(&mask_out, &mask_dds) {
+                        if let Err(e) = atomic_write(&mask_out, &mask_dds) {
                             eprintln!("  Warning: failed to write {}: {e}", mask_out.display());
                         } else { written += 1; }
                     }
