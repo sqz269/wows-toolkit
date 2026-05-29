@@ -540,6 +540,98 @@ enum Commands {
         #[arg(long)]
         json: Option<PathBuf>,
     },
+    /// One-shot ship ingest for the extraction pipeline: produces the GLB plus
+    /// every sidecar (placements, skel_ext candidates, material mappings, armor
+    /// JSON, ammo/ballistics JSON) from a SINGLE VFS + GameParams parse.
+    ///
+    /// Equivalent to running `export-ship` + `armor --json` + `ammo --json`
+    /// back-to-back, but loads the 173 MB `assets.bin` + `GameParams.data`
+    /// exactly once instead of three times (saves ~13-16 s/ship). The GLB,
+    /// placements, skel_ext and material-mappings outputs go through the same
+    /// code path as `export-ship`; armor and ammo go through the same code as
+    /// `armor`/`ammo`. Outputs are byte-identical to the separate commands
+    /// (the GLB itself is non-deterministic run-to-run, as with `export-ship`).
+    IngestShip {
+        /// Ship name — either a model directory name (e.g. "JSB039_Yamato_1945")
+        /// or a translated display name (e.g. "Yamato") for fuzzy lookup
+        name: String,
+
+        /// Output GLB file path
+        #[arg(short, long, default_value = "output.glb")]
+        output: PathBuf,
+
+        /// LOD level (0 = highest detail)
+        #[arg(long, default_value = "0")]
+        lod: usize,
+
+        /// Hull upgrade to use for the GLB + armor (e.g. "A" for stock, "B" for
+        /// upgraded). Accepts a prefix match against upgrade keys. The ammo
+        /// `ranges` hull is decoupled — see `--ammo-hull`.
+        #[arg(long)]
+        hull: Option<String>,
+
+        /// Skip loading camouflage textures into the GLB
+        #[arg(long)]
+        no_textures: bool,
+
+        /// Bundle every render set in the visual as its own named mesh (all
+        /// LODs + both damage variants). Ignores `--lod`. Same semantics as
+        /// `export-ship --all-render-sets`.
+        #[arg(long)]
+        all_render_sets: bool,
+
+        /// Which accessory mounts to embed in the ship GLB
+        /// (embed / main-only / exclude). Same semantics as
+        /// `export-ship --accessories`.
+        #[arg(long, value_enum, default_value = "embed")]
+        accessories: CliAccessoryMode,
+
+        /// Optional sidecar-ready placements manifest (same as
+        /// `export-ship --placements-json`).
+        #[arg(long)]
+        placements_json: Option<PathBuf>,
+
+        /// Optional companion JSON for decorative `.skel_ext` placements
+        /// (same as `export-ship --skel-ext-candidates-json`).
+        #[arg(long)]
+        skel_ext_candidates_json: Option<PathBuf>,
+
+        /// Optional material → texture-stem mappings (same as
+        /// `export-ship --material-mappings-json`).
+        #[arg(long)]
+        material_mappings_json: Option<PathBuf>,
+
+        /// If set, dump raw WG DDS files (all mip levels) to this directory
+        /// (same as `export-ship --raw-dds-dir`).
+        #[arg(long)]
+        raw_dds_dir: Option<PathBuf>,
+
+        /// If set, write textures as PNG files into this directory and
+        /// reference them via URIs (same as `export-ship --textures-dir`).
+        #[arg(long)]
+        textures_dir: Option<PathBuf>,
+
+        /// URI prefix prepended to every texture filename in the glTF
+        /// (same as `export-ship --textures-uri-prefix`; default "textures/").
+        #[arg(long)]
+        textures_uri_prefix: Option<String>,
+
+        /// If set, write the armor materials table + zone aggregation to this
+        /// JSON path (same content as `armor --json`).
+        #[arg(long)]
+        armor_json: Option<PathBuf>,
+
+        /// If set, write the per-ship ballistics manifest to this JSON path
+        /// (same content as `ammo --json`).
+        #[arg(long)]
+        ammo_json: Option<PathBuf>,
+
+        /// Hull upgrade used for the ammo `ranges` section ONLY (decoupled from
+        /// `--hull`, which selects the GLB + armor hull). Same semantics as
+        /// `ammo --hull`. Defaults to the first hull by sorted name.
+        #[arg(long)]
+        ammo_hull: Option<String>,
+    },
     /// Parse and inspect an assets.bin (PrototypeDatabase) file
     AssetsBin {
         /// Path to the assets.bin file (VFS path by default, disk path with --no-vfs)
@@ -1396,6 +1488,50 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
             };
 
             run_ammo(vfs, &name, &game_dir, game_version, hull.as_deref(), json.as_deref())?;
+        }
+        Commands::IngestShip {
+            name,
+            output,
+            lod,
+            hull,
+            no_textures,
+            all_render_sets,
+            accessories,
+            placements_json,
+            skel_ext_candidates_json,
+            material_mappings_json,
+            raw_dds_dir,
+            textures_dir,
+            textures_uri_prefix,
+            armor_json,
+            ammo_json,
+            ammo_hull,
+        } => {
+            let Some(vfs) = &vfs else {
+                bail!("VFS required for ingest-ship. Use --game-dir to specify a game install.");
+            };
+
+            run_ingest_ship(
+                vfs,
+                &name,
+                &output,
+                lod,
+                &game_dir,
+                game_version,
+                hull.as_deref(),
+                no_textures,
+                all_render_sets,
+                accessories.into(),
+                placements_json.as_deref(),
+                skel_ext_candidates_json.as_deref(),
+                material_mappings_json.as_deref(),
+                raw_dds_dir.as_deref(),
+                textures_dir.as_deref(),
+                textures_uri_prefix.as_deref(),
+                armor_json.as_deref(),
+                ammo_json.as_deref(),
+                ammo_hull.as_deref(),
+            )?;
         }
         Commands::DumpUvs { name, hull } => {
             let Some(vfs) = &vfs else {
@@ -2719,6 +2855,135 @@ fn run_export_ship(
     Ok(())
 }
 
+/// One-shot pipeline ingest: build the GLB + every sidecar (placements,
+/// skel_ext candidates, material mappings, armor JSON, ammo JSON) from a SINGLE
+/// `ShipAssets::load` (one VFS + GameParams parse).
+///
+/// The GLB / placements / skel_ext / material-mappings emit goes through the
+/// exact same `ShipExportOptions` + `ctx` calls as [`run_export_ship`], so
+/// those outputs are produced by an identical code path. Armor and ammo reuse
+/// the SAME `ctx` (no second `load_ship` / `find_ship`):
+///   - `armor.armor_map()` / `hull_geom_bytes()` / `turret_geom_bytes()` are
+///     populated by `load_ship_inner` UNCONDITIONALLY (independent of
+///     `accessory_mode` / `textures` — those only gate `export_glb`), so the
+///     armor JSON is byte-identical regardless of the GLB's accessory/texture
+///     options.
+///   - the ammo manifest is driven by `emit_ammo_json(metadata, ctx.info(),
+///     ammo_hull, ...)` — a pure split of [`run_ammo`].
+#[allow(clippy::too_many_arguments)]
+fn run_ingest_ship(
+    vfs: &VfsPath,
+    name: &str,
+    output: &Path,
+    lod: usize,
+    game_dir: &Path,
+    game_version: Option<u64>,
+    hull_selection: Option<&str>,
+    no_textures: bool,
+    all_render_sets: bool,
+    accessory_mode: wowsunpack::export::ship::AccessoryMode,
+    placements_json: Option<&Path>,
+    skel_ext_candidates_json: Option<&Path>,
+    material_mappings_json: Option<&Path>,
+    raw_dds_dir: Option<&Path>,
+    textures_dir: Option<&Path>,
+    textures_uri_prefix: Option<&str>,
+    armor_json: Option<&Path>,
+    ammo_json: Option<&Path>,
+    ammo_hull: Option<&str>,
+) -> Result<(), Report> {
+    use wowsunpack::export::ship::ShipAssets;
+    use wowsunpack::export::ship::ShipExportOptions;
+
+    let assets = ShipAssets::load(vfs)?;
+
+    // Load translations if available (same block as run_export_ship / run_ammo).
+    if let Some(version) = game_version {
+        let mo_path = wowsunpack::game_data::translations_path(game_dir, version as u32);
+        if let Ok(data) = std::fs::read(&mo_path)
+            && let Ok(catalog) = gettext::Catalog::parse(&*data)
+        {
+            assets.set_translations(catalog);
+        }
+    }
+
+    // Build ShipExportOptions EXACTLY like run_export_ship so the GLB /
+    // placements / skel_ext / material-mappings go through an identical path.
+    // `damaged` defaults to false (matching `export-ship` without `--damaged`).
+    let options = ShipExportOptions {
+        lod,
+        hull: hull_selection.map(|s| s.to_string()),
+        textures: !no_textures,
+        damaged: false,
+        all_render_sets,
+        accessory_mode,
+        placements_json_path: placements_json.map(|p| p.to_path_buf()),
+        textures_dir: textures_dir.map(|p| p.to_path_buf()),
+        textures_uri_prefix: textures_uri_prefix
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "textures/".to_string()),
+        raw_dds_dir: raw_dds_dir.map(|p| p.to_path_buf()),
+        material_mappings_json_path: material_mappings_json.map(|p| p.to_path_buf()),
+        ..Default::default()
+    };
+    let ctx = assets.load_ship(name, &options)?;
+
+    println!(
+        "Found {} hull parts, {} mounts ({} unique turrets)",
+        ctx.hull_part_names().len(),
+        ctx.mount_count(),
+        ctx.unique_turret_count()
+    );
+
+    let has_armor = ctx.armor_map().is_some() || ctx.hull_splash_bytes().is_some();
+
+    // `debug` is always false here (ingest-ship has no --debug flag, matching
+    // `export-ship` without --debug).
+    wowsunpack::export::set_debug(false);
+    let mut file = std::fs::File::create(output).context("Failed to create output file")?;
+    ctx.export_glb(&mut file)?;
+
+    let file_size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
+    println!("Exported to {} ({} bytes)", output.display(), file_size);
+
+    // --- Same sidecar emit as run_export_ship @placements/skel/mm ---
+    if let Some(path) = placements_json {
+        ctx.write_placements_json(path)?;
+        let json_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        println!("Placements manifest → {} ({} bytes)", path.display(), json_size);
+    }
+
+    if let Some(path) = skel_ext_candidates_json {
+        ctx.write_skel_ext_candidates_json(path)?;
+        let json_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        println!("Skel-ext candidates → {} ({} bytes)", path.display(), json_size);
+    }
+
+    if let Some(path) = material_mappings_json {
+        ctx.write_material_mappings_json(path)?;
+        let json_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        println!("Material mappings → {} ({} bytes)", path.display(), json_size);
+    }
+
+    if has_armor {
+        print_armor_legend();
+    }
+
+    // --- Armor JSON: reuse THIS ctx, same call as run_armor. ---
+    if let Some(path) = armor_json {
+        write_armor_materials_json(&ctx, path)?;
+        let sz = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        println!("Armor materials table → {} ({} bytes)", path.display(), sz);
+    }
+
+    // --- Ammo JSON: reuse ctx.info() + metadata, same path as run_ammo. ---
+    if ammo_json.is_some() {
+        emit_ammo_json(assets.metadata(), ctx.info(), ammo_hull, ammo_json)?;
+    }
+
+    Ok(())
+}
+
 fn print_armor_legend() {
     use wowsunpack::export::gltf_export;
 
@@ -3208,10 +3473,7 @@ fn run_ammo(
     hull_selection: Option<&str>,
     json_path: Option<&Path>,
 ) -> Result<(), Report> {
-    use std::collections::BTreeSet;
     use wowsunpack::export::ship::ShipAssets;
-    use wowsunpack::game_params::types::GameParamProvider;
-    use wowsunpack::game_params::types::Vehicle;
 
     let assets = ShipAssets::load(vfs)?;
 
@@ -3226,6 +3488,25 @@ fn run_ammo(
 
     let info = assets.find_ship(name)?;
     let metadata = assets.metadata();
+
+    emit_ammo_json(metadata, &info, hull_selection, json_path)
+}
+
+/// Resolve every loadable shell / torpedo for a ship and emit the ballistics
+/// manifest (and stdout summary). Split out of [`run_ammo`] so a single
+/// VFS + GameParams parse (e.g. `ingest-ship`) can drive this without a second
+/// `ShipAssets::load`. The behavior is identical to the standalone `ammo`
+/// subcommand: same BTreeSet ordering, same serde_json insertion order, same
+/// `Warning: ... skipping` prints, byte-identical JSON.
+fn emit_ammo_json(
+    metadata: &wowsunpack::game_params::provider::GameMetadataProvider,
+    info: &wowsunpack::export::ship::ShipInfo,
+    hull_selection: Option<&str>,
+    json_path: Option<&Path>,
+) -> Result<(), Report> {
+    use std::collections::BTreeSet;
+    use wowsunpack::game_params::types::GameParamProvider;
+    use wowsunpack::game_params::types::Vehicle;
 
     // Locate the Vehicle by model_dir (matches what `load_ship` does internally,
     // but skips the hull-GLB load — we only need GameParams data).
@@ -3345,11 +3626,11 @@ fn run_ammo(
     let manifest = serde_json::json!({
         "schema_version": 1,
         "ship": {
-            "model_dir":    info.model_dir,
-            "display_name": info.display_name,
-            "param_index":  info.param_index,
-            "nation":       info.nation,
-            "species":      info.species,
+            "model_dir":    &info.model_dir,
+            "display_name": &info.display_name,
+            "param_index":  &info.param_index,
+            "nation":       &info.nation,
+            "species":      &info.species,
             "tier":         info.tier,
         },
         "pipeline": {
