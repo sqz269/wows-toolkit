@@ -895,6 +895,34 @@ impl ShipAssets {
         self.load_ship_inner(info, vehicle, options)
     }
 
+    /// Load a ship by an EXPLICIT GameParams vehicle id (param name like
+    /// `PASC108_Baltimore_1944` or short index like `PASC108`).
+    ///
+    /// Unlike [`load_ship`], which resolves the vehicle by first-match on the
+    /// model directory, this binds the armor map + mount points to the exact
+    /// param requested. Several Vehicles can share one model directory (a
+    /// current ship plus a legacy/re-release re-skin, e.g. Baltimore's
+    /// `PASC108` "Baltimore" and `PASC017` "Baltimore (old)"); `find_vehicle`
+    /// would pick whichever sorts first, which may carry an older / incomplete
+    /// armor table. Callers that already know the intended param (the
+    /// extraction pipeline does) use this to keep armor + ammo in sync with
+    /// the ship they mean.
+    pub fn load_ship_by_vehicle_id(
+        &self,
+        vehicle_id: &str,
+        options: &ShipExportOptions,
+    ) -> Result<ShipModelContext, Report> {
+        let param = self
+            .metadata
+            .game_param_by_name(vehicle_id)
+            .or_else(|| self.metadata.game_param_by_index(vehicle_id))
+            .ok_or_else(|| rootcause::report!("--vehicle {:?} not found in GameParams", vehicle_id))?;
+        let vehicle = param.vehicle().ok_or_else(|| {
+            rootcause::report!("GameParams entry {:?} has no Vehicle component", vehicle_id)
+        })?;
+        self.load_ship_from_vehicle(vehicle, options)
+    }
+
     /// Load a ship using a [`Vehicle`] reference instead of a name lookup.
     ///
     /// This is useful when the caller already has a `Vehicle` from their own

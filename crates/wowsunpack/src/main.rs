@@ -479,6 +479,14 @@ enum Commands {
         /// or a translated display name (e.g. "Yamato") for fuzzy lookup
         name: String,
 
+        /// Explicit GameParams vehicle id (param name like
+        /// `PASC108_Baltimore_1944` or short index like `PASC108`). When set,
+        /// the armor map binds to this exact param instead of first-match on
+        /// the model directory — needed when several params share one model
+        /// dir (a current ship plus a legacy re-release re-skin).
+        #[arg(long)]
+        vehicle: Option<String>,
+
         /// Hull upgrade to use (e.g. "A" for stock, "B" for upgraded)
         #[arg(long)]
         hull: Option<String>,
@@ -528,6 +536,14 @@ enum Commands {
         /// or a translated display name (e.g. "Yamato") for fuzzy lookup
         name: String,
 
+        /// Explicit GameParams vehicle id (param name like
+        /// `PASC108_Baltimore_1944` or short index like `PASC108`). When set,
+        /// the ammo/ranges bind to this exact param instead of first-match on
+        /// the model directory — needed when several params share one model
+        /// dir (a current ship plus a legacy re-release re-skin).
+        #[arg(long)]
+        vehicle: Option<String>,
+
         /// Hull upgrade to use for `ranges` calculation (e.g. "A" for stock,
         /// "B" for upgraded). Shells are always the union across all hulls
         /// — the same shell on hull A and hull B is one entry — but the
@@ -569,6 +585,14 @@ enum Commands {
         /// `ranges` hull is decoupled — see `--ammo-hull`.
         #[arg(long)]
         hull: Option<String>,
+
+        /// Explicit GameParams vehicle id (param name like
+        /// `PASC108_Baltimore_1944` or short index like `PASC108`). When set,
+        /// the armor map + mounts + ammo bind to this exact param instead of
+        /// first-match on the model directory — needed when several params
+        /// share one model dir (a current ship plus a legacy re-release).
+        #[arg(long)]
+        vehicle: Option<String>,
 
         /// Skip loading camouflage textures into the GLB
         #[arg(long)]
@@ -1475,19 +1499,35 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
                 max_texture_size,
             )?;
         }
-        Commands::Armor { name, hull, json } => {
+        Commands::Armor { name, vehicle, hull, json } => {
             let Some(vfs) = &vfs else {
                 bail!("VFS required for armor inspection. Use --game-dir to specify a game install.");
             };
 
-            run_armor(vfs, &name, &game_dir, game_version, hull.as_deref(), json.as_deref())?;
+            run_armor(
+                vfs,
+                &name,
+                &game_dir,
+                game_version,
+                hull.as_deref(),
+                json.as_deref(),
+                vehicle.as_deref(),
+            )?;
         }
-        Commands::Ammo { name, hull, json } => {
+        Commands::Ammo { name, vehicle, hull, json } => {
             let Some(vfs) = &vfs else {
                 bail!("VFS required for ammo inspection. Use --game-dir to specify a game install.");
             };
 
-            run_ammo(vfs, &name, &game_dir, game_version, hull.as_deref(), json.as_deref())?;
+            run_ammo(
+                vfs,
+                &name,
+                &game_dir,
+                game_version,
+                hull.as_deref(),
+                json.as_deref(),
+                vehicle.as_deref(),
+            )?;
         }
         Commands::IngestShip {
             name,
@@ -1506,6 +1546,7 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
             armor_json,
             ammo_json,
             ammo_hull,
+            vehicle,
         } => {
             let Some(vfs) = &vfs else {
                 bail!("VFS required for ingest-ship. Use --game-dir to specify a game install.");
@@ -1531,6 +1572,7 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
                 armor_json.as_deref(),
                 ammo_json.as_deref(),
                 ammo_hull.as_deref(),
+                vehicle.as_deref(),
             )?;
         }
         Commands::DumpUvs { name, hull } => {
@@ -2891,6 +2933,7 @@ fn run_ingest_ship(
     armor_json: Option<&Path>,
     ammo_json: Option<&Path>,
     ammo_hull: Option<&str>,
+    vehicle_id: Option<&str>,
 ) -> Result<(), Report> {
     use wowsunpack::export::ship::ShipAssets;
     use wowsunpack::export::ship::ShipExportOptions;
@@ -2926,7 +2969,10 @@ fn run_ingest_ship(
         material_mappings_json_path: material_mappings_json.map(|p| p.to_path_buf()),
         ..Default::default()
     };
-    let ctx = assets.load_ship(name, &options)?;
+    let ctx = match vehicle_id {
+        Some(vid) => assets.load_ship_by_vehicle_id(vid, &options)?,
+        None => assets.load_ship(name, &options)?,
+    };
 
     println!(
         "Found {} hull parts, {} mounts ({} unique turrets)",
@@ -2978,7 +3024,7 @@ fn run_ingest_ship(
 
     // --- Ammo JSON: reuse ctx.info() + metadata, same path as run_ammo. ---
     if ammo_json.is_some() {
-        emit_ammo_json(assets.metadata(), ctx.info(), ammo_hull, ammo_json)?;
+        emit_ammo_json(assets.metadata(), ctx.info(), ammo_hull, ammo_json, vehicle_id)?;
     }
 
     Ok(())
@@ -3002,6 +3048,7 @@ fn run_armor(
     game_version: Option<u64>,
     hull_selection: Option<&str>,
     json_path: Option<&Path>,
+    vehicle_id: Option<&str>,
 ) -> Result<(), Report> {
     use wowsunpack::export::ship::ShipAssets;
     use wowsunpack::export::ship::ShipExportOptions;
@@ -3021,7 +3068,10 @@ fn run_armor(
 
     let options =
         ShipExportOptions { hull: hull_selection.map(|s| s.to_string()), textures: false, ..Default::default() };
-    let ctx = assets.load_ship(name, &options)?;
+    let ctx = match vehicle_id {
+        Some(vid) => assets.load_ship_by_vehicle_id(vid, &options)?,
+        None => assets.load_ship(name, &options)?,
+    };
     let info = ctx.info();
     println!("Ship: {} ({})", info.display_name.as_deref().unwrap_or("?"), info.model_dir);
 
@@ -3472,6 +3522,7 @@ fn run_ammo(
     game_version: Option<u64>,
     hull_selection: Option<&str>,
     json_path: Option<&Path>,
+    vehicle_id: Option<&str>,
 ) -> Result<(), Report> {
     use wowsunpack::export::ship::ShipAssets;
 
@@ -3489,7 +3540,7 @@ fn run_ammo(
     let info = assets.find_ship(name)?;
     let metadata = assets.metadata();
 
-    emit_ammo_json(metadata, &info, hull_selection, json_path)
+    emit_ammo_json(metadata, &info, hull_selection, json_path, vehicle_id)
 }
 
 /// Resolve every loadable shell / torpedo for a ship and emit the ballistics
@@ -3503,22 +3554,38 @@ fn emit_ammo_json(
     info: &wowsunpack::export::ship::ShipInfo,
     hull_selection: Option<&str>,
     json_path: Option<&Path>,
+    vehicle_override: Option<&str>,
 ) -> Result<(), Report> {
     use std::collections::BTreeSet;
     use wowsunpack::game_params::types::GameParamProvider;
     use wowsunpack::game_params::types::Vehicle;
 
-    // Locate the Vehicle by model_dir (matches what `load_ship` does internally,
-    // but skips the hull-GLB load — we only need GameParams data).
-    let vehicle: &Vehicle = metadata
-        .params()
-        .iter()
-        .find_map(|p| {
-            p.vehicle().filter(|v| {
-                v.model_path().map(|mp| mp.contains(&info.model_dir)).unwrap_or(false)
+    // Resolve the Vehicle. With `--vehicle`, bind to that exact param (param
+    // name or short index); otherwise locate by model_dir (matches what
+    // `load_ship` does internally). The explicit form disambiguates ships
+    // whose model directory is shared by several params (a current ship + a
+    // legacy re-release), where the model_dir search would first-match the
+    // wrong one. `param` is held so the `&Vehicle` borrow stays valid.
+    let param = if let Some(vid) = vehicle_override {
+        metadata
+            .game_param_by_name(vid)
+            .or_else(|| metadata.game_param_by_index(vid))
+            .ok_or_else(|| rootcause::report!("--vehicle {:?} not found in GameParams", vid))?
+    } else {
+        metadata
+            .params()
+            .iter()
+            .find(|p| {
+                p.vehicle()
+                    .map(|v| v.model_path().map(|mp| mp.contains(&info.model_dir)).unwrap_or(false))
+                    .unwrap_or(false)
             })
-        })
-        .ok_or_else(|| rootcause::report!("No Vehicle found for ship '{}'.", info.model_dir))?;
+            .cloned()
+            .ok_or_else(|| rootcause::report!("No Vehicle found for ship '{}'.", info.model_dir))?
+    };
+    let vehicle: &Vehicle = param
+        .vehicle()
+        .ok_or_else(|| rootcause::report!("No Vehicle component for ship '{}'.", info.model_dir))?;
 
     let config_data = vehicle.config_data().ok_or_else(|| {
         rootcause::report!(
