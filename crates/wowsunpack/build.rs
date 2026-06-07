@@ -134,8 +134,7 @@ fn emit_capabilities_metadata(workspace_root: Option<&Path>) {
     // Use workspace root as git CWD if we found one; otherwise fall back to
     // the manifest dir. Either is inside the repo so `git -C <dir>` works.
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-    let git_cwd: PathBuf =
-        workspace_root.map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(&manifest_dir));
+    let git_cwd: PathBuf = workspace_root.map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(&manifest_dir));
 
     // Release tag: env override or "unknown" (we don't try to derive from
     // git tags here — a fork may have many irrelevant tags upstream).
@@ -145,12 +144,7 @@ fn emit_capabilities_metadata(workspace_root: Option<&Path>) {
         .map(|v| v.trim().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let git_commit = resolve_meta(
-        "WOWS_TOOLKIT_GIT_COMMIT",
-        &["rev-parse", "HEAD"],
-        &git_cwd,
-        "unknown",
-    );
+    let git_commit = resolve_meta("WOWS_TOOLKIT_GIT_COMMIT", &["rev-parse", "HEAD"], &git_cwd, "unknown");
 
     // Dirty: env override wins; else look at porcelain status. Empty
     // porcelain = clean; any output = dirty; failure = "unknown".
@@ -159,11 +153,7 @@ fn emit_capabilities_metadata(workspace_root: Option<&Path>) {
     {
         v.trim().to_string()
     } else {
-        match Command::new("git")
-            .current_dir(&git_cwd)
-            .args(["status", "--porcelain"])
-            .output()
-        {
+        match Command::new("git").current_dir(&git_cwd).args(["status", "--porcelain"]).output() {
             Ok(out) if out.status.success() => {
                 if out.stdout.iter().all(|&b| b == b' ' || b == b'\n' || b == b'\r' || b == b'\t') {
                     "false".to_string()

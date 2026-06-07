@@ -116,10 +116,8 @@ fn parse_git_dirty(raw: &str) -> bool {
 
 /// Build the capability descriptor for this binary.
 pub fn build() -> Capabilities {
-    let contracts: BTreeMap<&'static str, u32> =
-        CONTRACTS.iter().copied().collect();
-    let schemas: BTreeMap<&'static str, &'static str> =
-        SCHEMAS.iter().copied().collect();
+    let contracts: BTreeMap<&'static str, u32> = CONTRACTS.iter().copied().collect();
+    let schemas: BTreeMap<&'static str, &'static str> = SCHEMAS.iter().copied().collect();
     let features: Vec<&'static str> = FEATURES.to_vec();
 
     Capabilities {
@@ -167,10 +165,7 @@ mod tests {
         let caps = build();
         assert_eq!(caps.contracts.get("toolkit_capabilities").copied(), Some(1));
         assert_eq!(caps.contracts.get("skel_ext_candidates_json").copied(), Some(3));
-        assert_eq!(
-            caps.schemas.get("skel_ext_candidates_json").copied(),
-            Some("wowsunpack.skel_ext_candidates/v3"),
-        );
+        assert_eq!(caps.schemas.get("skel_ext_candidates_json").copied(), Some("wowsunpack.skel_ext_candidates/v3"),);
     }
 
     #[test]

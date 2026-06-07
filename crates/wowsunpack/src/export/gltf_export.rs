@@ -22,6 +22,7 @@ use crate::models::terrain::Terrain;
 use crate::models::vertex_format;
 use crate::models::vertex_format::AttributeSemantic;
 use crate::models::vertex_format::VertexFormat;
+use crate::models::visual::VisualNodes;
 use crate::models::visual::VisualPrototype;
 
 use super::texture;
@@ -135,7 +136,8 @@ pub fn export_glb(
         }
 
         for (rs_name, prim) in &named_primitives {
-            let gltf_prim = add_primitive_to_root(&mut root, &mut bin_data, tex_out, prim, texture_set, &mut mat_cache)?;
+            let gltf_prim =
+                add_primitive_to_root(&mut root, &mut bin_data, tex_out, prim, texture_set, &mut mat_cache)?;
             let mesh = root.push(json::Mesh {
                 primitives: vec![gltf_prim],
                 weights: None,
@@ -143,11 +145,7 @@ pub fn export_glb(
                 extensions: Default::default(),
                 extras: Default::default(),
             });
-            let node = root.push(json::Node {
-                mesh: Some(mesh),
-                name: Some(rs_name.clone()),
-                ..Default::default()
-            });
+            let node = root.push(json::Node { mesh: Some(mesh), name: Some(rs_name.clone()), ..Default::default() });
             scene_nodes.push(node);
             if let Some(palette) = &prim.bone_palette {
                 skinned_mesh_nodes.push((node, palette.clone(), rs_name.clone()));
@@ -163,7 +161,7 @@ pub fn export_glb(
 
         let lod_entry = &visual.lods[lod];
         let primitives =
-            collect_primitives(visual, geometry, Some(db), Some(&self_id_index), lod_entry, damaged, None, true)?;
+            collect_primitives(visual, geometry, Some(db), Some(&self_id_index), lod_entry, damaged, None, None, true)?;
 
         if primitives.is_empty() {
             eprintln!("Warning: no primitives found for LOD {lod}");
@@ -171,7 +169,8 @@ pub fn export_glb(
 
         let mut gltf_primitives = Vec::new();
         for prim in &primitives {
-            let gltf_prim = add_primitive_to_root(&mut root, &mut bin_data, tex_out, prim, texture_set, &mut mat_cache)?;
+            let gltf_prim =
+                add_primitive_to_root(&mut root, &mut bin_data, tex_out, prim, texture_set, &mut mat_cache)?;
             gltf_primitives.push(gltf_prim);
         }
 
@@ -448,6 +447,8 @@ pub struct MapModelInstance {
     /// Engine `minimumQualityLevel` (0=Low, 1=Medium, 2=High, 3=Ultra).
     /// Engine skips the instance when runtime quality is below this.
     pub min_quality_level: u8,
+    /// Stable authoring GUID string from the ModelInstance descriptor, when present.
+    pub stable_guid: Option<String>,
     /// Per-LOD extent in metres from the prototype's `VisualProto.lods`.
     /// Last value is typically the asset's "draw distance" cap; engine
     /// LOD-switches the mesh by camera distance against these values.
@@ -460,9 +461,10 @@ pub struct MapModelInstance {
     /// webview v1 doesn't apply them visually yet.
     pub model_dyes: Vec<crate::models::merged_models::ModelDye>,
     /// Count of `materialInstances[]` overrides on this instance. v1
-    /// surfaces the count only; the 0x70-stride MaterialInstancePrototype
-    /// records aren't decoded yet (needs material.rs stride adjustment).
+    /// keeps the raw source count for quick diagnostics.
     pub material_instance_count: u8,
+    /// Decoded 0x70-stride `MaterialInstancePrototype` overrides.
+    pub material_instances: Vec<crate::models::material::MaterialPrototype>,
 }
 
 /// Complete decoded map scene, format-agnostic.
@@ -568,8 +570,7 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
     // Cache: MFM full path → Option<(texture index, alpha state from MFM)>.
     // The alpha state is per-MFM (independent of texture sharing — two prims
     // pointing at the same MFM share both their texture AND their alpha mode).
-    let mut texture_cache: HashMap<String, Option<(usize, texture::MfmAlphaState)>> =
-        HashMap::new();
+    let mut texture_cache: HashMap<String, Option<(usize, texture::MfmAlphaState)>> = HashMap::new();
 
     // Build path_id → model index map for instance lookups.
     let path_to_model: HashMap<u64, usize> = merged.models.iter().enumerate().map(|(i, r)| (r.path_id, i)).collect();
@@ -633,7 +634,18 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         // pre-multiplying vertex positions by 15× was a bug specific to
         // map content — for LNR landmasses (scale=11.16), it inflated
         // the rendered geometry from ~558m to ~8500m world-space.
-        let primitives = match collect_primitives(vp, geometry, db, self_id_index.as_ref(), lod_entry, false, None, false) {
+        let static_nodes = merged.skeletons.get(record.skeleton_proto_index as usize).map(|s| &s.nodes);
+        let primitives = match collect_primitives(
+            vp,
+            geometry,
+            db,
+            self_id_index.as_ref(),
+            lod_entry,
+            false,
+            None,
+            static_nodes,
+            false,
+        ) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("Warning: model[{model_idx}]: {e}");
@@ -692,11 +704,8 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
 
     // Per-prototype LOD extent arrays: cached once per model to avoid
     // re-cloning per-instance. lods.iter().map(|l| l.extent).collect().
-    let model_lod_extents: Vec<Vec<f32>> = merged
-        .models
-        .iter()
-        .map(|r| r.visual_proto.lods.iter().map(|l| l.extent).collect())
-        .collect();
+    let model_lod_extents: Vec<Vec<f32>> =
+        merged.models.iter().map(|r| r.visual_proto.lods.iter().map(|l| l.extent).collect()).collect();
 
     // Build model instances from space.bin transforms.
     let mut model_instances: Vec<MapModelInstance> = Vec::new();
@@ -713,13 +722,21 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
 
             model_instances.push(MapModelInstance {
                 mesh_range: range.clone(),
-                transform: inst.transform.0,
+                // Conjugate the raw BigWorld (left-handed) world matrix with
+                // S = diag(1,1,-1,1) so it positions the Z-negated
+                // (right-handed) glTF geometry correctly. Without this, a
+                // left-handed matrix drives right-handed meshes/terrain — a
+                // yaw-dependent orientation error (~2× the authored yaw) plus
+                // a Z-axis position mirror. Mirrors the ship/accessory path.
+                transform: negate_z_transform(inst.transform.0),
                 asset_name: asset_names[model_idx].clone(),
                 is_landscape: inst.is_landscape,
                 min_quality_level: inst.min_quality_level,
+                stable_guid: inst.stable_guid.clone(),
                 lod_extents: model_lod_extents[model_idx].clone(),
                 model_dyes: inst.model_dyes.clone(),
                 material_instance_count: inst.material_instance_count,
+                material_instances: inst.material_instances.clone(),
             });
         }
     } else {
@@ -734,9 +751,11 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                 asset_name: asset_names[model_idx].clone(),
                 is_landscape: false,
                 min_quality_level: 0,
+                stable_guid: None,
                 lod_extents: model_lod_extents[model_idx].clone(),
                 model_dyes: Vec::new(),
                 material_instance_count: 0,
+                material_instances: Vec::new(),
             });
         }
     }
@@ -1086,15 +1105,10 @@ fn generate_water_mesh(cfg: &WaterConfig<'_>) -> MapMesh {
 /// }
 /// ```
 fn build_instance_extras(inst: &MapModelInstance) -> json::extras::Extras {
-    // Dyes emit as `[[matter_id, replaces_id], ...]`; treat each u32 as
-    // an opaque identifier (consumers can interpret as MurmurHash3 or
-    // ASCII per the source format). Skip the field entirely when empty
-    // to keep extras compact on the 95%+ of instances without dyes.
-    let dyes: Vec<[u32; 2]> = inst
-        .model_dyes
-        .iter()
-        .map(|d| [d.matter_id, d.replaces_id])
-        .collect();
+    // Dyes emit as `[[matter_id, replaces_id], ...]`; treat each u32 as an
+    // opaque identifier until a consumer joins it to the prototype dye tables.
+    // Skip the field entirely when empty to keep extras compact.
+    let dyes: Vec<[u32; 2]> = inst.model_dyes.iter().map(|d| [d.matter_id, d.replaces_id]).collect();
     let mut value = serde_json::json!({
         "is_landscape": inst.is_landscape,
         "min_quality_level": inst.min_quality_level,
@@ -1103,8 +1117,14 @@ fn build_instance_extras(inst: &MapModelInstance) -> json::extras::Extras {
     if !dyes.is_empty() {
         value["dyes"] = serde_json::json!(dyes);
     }
+    if let Some(stable_guid) = &inst.stable_guid {
+        value["stable_guid"] = serde_json::json!(stable_guid);
+    }
     if inst.material_instance_count > 0 {
         value["material_instance_count"] = serde_json::json!(inst.material_instance_count);
+    }
+    if !inst.material_instances.is_empty() {
+        value["material_instances"] = serde_json::json!(inst.material_instances);
     }
     // RawValue serialization is infallible for a Value that's already
     // valid JSON (which a serde_json::Value always is).
@@ -1131,7 +1151,9 @@ fn build_scene_extras(
         .map(|l| {
             serde_json::json!({
                 "type": "point",
-                "position": l.world_position,
+                // Z-negate to match glTF right-handed space; the parser keeps
+                // world_position in raw BigWorld (left-handed) coordinates.
+                "position": [l.world_position[0], l.world_position[1], -l.world_position[2]],
                 "color": l.color,
                 "radius": l.radius,
                 "min_quality": l.min_quality,
@@ -1331,8 +1353,20 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
         scene_nodes.push(node);
     }
 
-    // Export vegetation instances (one node per instance, sharing cached meshes).
+    // Export vegetation as glTF-native GPU instancing. The forest layer can
+    // contain hundreds of thousands of trees; serializing one node per tree
+    // makes full-density exports unusable and was the main reason the webview
+    // defaulted to sparse vegetation.
+    if !scene.vegetation_instances.is_empty()
+        && !root.extensions_used.iter().any(|ext| ext == "EXT_mesh_gpu_instancing")
+    {
+        root.extensions_used.push("EXT_mesh_gpu_instancing".to_string());
+    }
     for (mesh_idx, positions) in &scene.vegetation_instances {
+        if positions.is_empty() {
+            continue;
+        }
+
         let gltf_mesh = if let Some(&cached) = gltf_mesh_cache.get(mesh_idx) {
             cached
         } else {
@@ -1342,15 +1376,31 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
             m
         };
 
-        for (i, pos) in positions.iter().enumerate() {
-            let node = root.push(json::Node {
-                mesh: Some(gltf_mesh),
-                name: Some(format!("Tree_{mesh_idx}_{i}")),
-                translation: Some(*pos),
-                ..Default::default()
-            });
-            scene_nodes.push(node);
-        }
+        let translation_accessor =
+            append_vec3_accessor(&mut root, &mut bin_data, positions, Some(format!("Tree_{mesh_idx}_translations")));
+
+        let mut attributes = serde_json::Map::new();
+        attributes.insert("TRANSLATION".to_string(), serde_json::json!(translation_accessor.value()));
+
+        let mut instancing = serde_json::Map::new();
+        instancing.insert("attributes".to_string(), serde_json::Value::Object(attributes));
+
+        let mut others = serde_json::Map::new();
+        others.insert("EXT_mesh_gpu_instancing".to_string(), serde_json::Value::Object(instancing));
+
+        let node = root.push(json::Node {
+            mesh: Some(gltf_mesh),
+            name: Some(format!("Tree_{mesh_idx}_instances")),
+            extensions: Some(json::extensions::scene::Node { others, ..Default::default() }),
+            extras: serde_json::value::to_raw_value(&serde_json::json!({
+                "vegetation_species_mesh": mesh_idx,
+                "instance_count": positions.len(),
+            }))
+            .ok()
+            .map(Box::from),
+            ..Default::default()
+        });
+        scene_nodes.push(node);
     }
 
     // Finalize GLB.
@@ -1376,12 +1426,8 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
     // `gltf.scene.userData`; the webview drives THREE.FogExp2 +
     // PerspectiveCamera.far from this.
     let scene_extras = build_scene_extras(&scene.bounds, scene.fog.as_ref(), &scene.point_lights);
-    let gltf_scene = root.push(json::Scene {
-        nodes: scene_nodes,
-        name: None,
-        extensions: Default::default(),
-        extras: scene_extras,
-    });
+    let gltf_scene =
+        root.push(json::Scene { nodes: scene_nodes, name: None, extensions: Default::default(), extras: scene_extras });
     root.scene = Some(gltf_scene);
 
     let json_string =
@@ -1613,9 +1659,7 @@ fn build_map_mesh_primitive(
             } else {
                 (Valid(json::material::AlphaMode::Opaque), None)
             };
-            let double_sided = mesh.double_sided
-                || mesh.alpha_cutoff.is_some()
-                || mesh.alpha_blend;
+            let double_sided = mesh.double_sided || mesh.alpha_cutoff.is_some() || mesh.alpha_blend;
             // Map materials are environmental geometry (terrain, buildings,
             // foliage cards) — non-metal, rough. glTF defaults (metallic=1,
             // roughness=1) treat the base color as F0 specular reflectance,
@@ -1717,7 +1761,6 @@ pub fn export_merged_models_glb(
     // Build path_id → model index map for instance lookups.
     let path_to_model: HashMap<u64, usize> = merged.models.iter().enumerate().map(|(i, r)| (r.path_id, i)).collect();
 
-
     // Build one mesh per prototype, lazily (only when referenced by an instance).
     // Cache: model_index → glTF Mesh index.
     let mut mesh_cache: HashMap<usize, json::Index<json::Mesh>> = HashMap::new();
@@ -1736,7 +1779,18 @@ pub fn export_merged_models_glb(
 
         let lod_entry = &vp.lods[lod];
         // apply_metric_scale=false: see build_map_scene caller for rationale.
-        let primitives = match collect_primitives(vp, geometry, db, self_id_index.as_ref(), lod_entry, false, None, false) {
+        let static_nodes = merged.skeletons.get(record.skeleton_proto_index as usize).map(|s| &s.nodes);
+        let primitives = match collect_primitives(
+            vp,
+            geometry,
+            db,
+            self_id_index.as_ref(),
+            lod_entry,
+            false,
+            None,
+            static_nodes,
+            false,
+        ) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("Warning: model[{model_idx}]: {e}");
@@ -1753,7 +1807,8 @@ pub fn export_merged_models_glb(
         let mut local_tex_out = TextureOutput::Embedded;
         let mut gltf_primitives = Vec::new();
         for prim in &primitives {
-            let gltf_prim = add_primitive_to_root(root, bin_data, &mut local_tex_out, prim, &empty_textures, mat_cache)?;
+            let gltf_prim =
+                add_primitive_to_root(root, bin_data, &mut local_tex_out, prim, &empty_textures, mat_cache)?;
             gltf_primitives.push(gltf_prim);
         }
 
@@ -1977,12 +2032,7 @@ pub fn export_geometry_raw(geometry: &MergedGeometry, writer: &mut impl Write) -
         let mut verts = unpack_vertices(vert_slice, stride, &format);
         scale_positions_to_metres(&mut verts.positions);
 
-        let tangents = super::tangents::compute_mikkt_tangents(
-            &verts.positions,
-            &verts.normals,
-            &verts.uvs,
-            &indices,
-        );
+        let tangents = super::tangents::compute_mikkt_tangents(&verts.positions, &verts.normals, &verts.uvs, &indices);
 
         // Build a DecodedPrimitive for reuse with add_primitive_to_root.
         // Diagnostic dump path — never carries skin data.
@@ -2004,7 +2054,14 @@ pub fn export_geometry_raw(geometry: &MergedGeometry, writer: &mut impl Write) -
         let empty_textures = TextureSet::empty();
         let mut mat_cache = MaterialCache::new();
         let mut local_tex_out = TextureOutput::Embedded;
-        let gltf_prim = add_primitive_to_root(&mut root, &mut bin_data, &mut local_tex_out, &prim, &empty_textures, &mut mat_cache)?;
+        let gltf_prim = add_primitive_to_root(
+            &mut root,
+            &mut bin_data,
+            &mut local_tex_out,
+            &prim,
+            &empty_textures,
+            &mut mat_cache,
+        )?;
         gltf_primitives.push(gltf_prim);
     }
 
@@ -2109,9 +2166,7 @@ fn collect_all_render_set_primitives(
             continue;
         }
 
-        match decode_render_set_primitive(
-            visual, geometry, db, self_id_index, rs, barrel_pitch,
-        ) {
+        match decode_render_set_primitive(visual, geometry, db, self_id_index, rs, barrel_pitch) {
             Ok(Some(prim)) => result.push((rs_name, prim)),
             Ok(None) => {}
             Err(e) => return Err(e),
@@ -2227,9 +2282,8 @@ fn decode_render_set_primitive(
     // leave them inward-facing. THIS is the `--all-render-sets` decoder used by
     // the accessory library + per-asset export-model (`batch_export_model`
     // passes `all_render_sets=true`), so the gate is load-bearing here.
-    let zmirror_skin = db
-        .and_then(|db| visual.find_any_blendbone_local_matrix(&db.strings))
-        .is_some_and(|m| mat3_det(&m) < 0.0);
+    let zmirror_skin =
+        db.and_then(|db| visual.find_any_blendbone_local_matrix(&db.strings)).is_some_and(|m| mat3_det(&m) < 0.0);
     if !(zmirror_skin && rs.skinned) {
         flip_triangle_winding(&mut indices);
     }
@@ -2266,12 +2320,7 @@ fn decode_render_set_primitive(
         (None, None)
     };
 
-    let tangents = super::tangents::compute_mikkt_tangents(
-        &verts.positions,
-        &verts.normals,
-        &verts.uvs,
-        &indices,
-    );
+    let tangents = super::tangents::compute_mikkt_tangents(&verts.positions, &verts.normals, &verts.uvs, &indices);
     // Skin data is only meaningful when the render set declares itself
     // skinned. iiiww data on a static render set is treated as noise.
     // When `barrel_pitch` is set the export bakes the rotation into the
@@ -2312,6 +2361,7 @@ fn collect_primitives(
     lod: &crate::models::visual::Lod,
     damaged: bool,
     barrel_pitch: Option<&BarrelPitch>,
+    static_nodes: Option<&VisualNodes>,
     // When `true`, multiply vertex positions by `NATIVE_TO_METRES`. Ship
     // exports want this (vertex positions in models.geometry are in native
     // BigWorld units that need conversion). Map exports do NOT — map
@@ -2337,9 +2387,8 @@ fn collect_primitives(
     // placement. This is the deterministic, producer-side replacement for the
     // downstream geometric winding-audit heuristic, and keys off the SAME det
     // bit the Y180 bone-frame bake uses (see `emit_bone_node_tree`).
-    let zmirror_skin = db
-        .and_then(|db| visual.find_any_blendbone_local_matrix(&db.strings))
-        .is_some_and(|m| mat3_det(&m) < 0.0);
+    let zmirror_skin =
+        db.and_then(|db| visual.find_any_blendbone_local_matrix(&db.strings)).is_some_and(|m| mat3_det(&m) < 0.0);
 
     for &rs_name_id in &lod.render_set_names {
         // Find the render set with this name_id.
@@ -2470,6 +2519,15 @@ fn collect_primitives(
         if let Some(bp) = barrel_pitch {
             apply_barrel_pitch(&mut verts.positions, &mut verts.normals, vert_slice, stride, &format, bp);
         }
+        if let Some(node_matrix) = static_render_set_world_matrix(static_nodes, rs) {
+            // Map-local static prototypes can bind each unskinned render set
+            // to a shared skeleton node. The instance matrix places the
+            // prototype root; this node matrix places the individual part
+            // inside that prototype. Without this bake, all parts collapse
+            // around the root and create dense local overlaps.
+            let gltf_node_matrix = negate_z_transform(node_matrix);
+            transform_positions_normals(&mut verts.positions, &mut verts.normals, &gltf_node_matrix);
+        }
         if apply_metric_scale {
             scale_positions_to_metres(&mut verts.positions);
         }
@@ -2497,12 +2555,7 @@ fn collect_primitives(
             (None, None)
         };
 
-        let tangents = super::tangents::compute_mikkt_tangents(
-            &verts.positions,
-            &verts.normals,
-            &verts.uvs,
-            &indices,
-        );
+        let tangents = super::tangents::compute_mikkt_tangents(&verts.positions, &verts.normals, &verts.uvs, &indices);
         // The LOD-filtered path bakes barrel pitch into vertex positions
         // before this point (see `apply_barrel_pitch` above). Treat the
         // mesh as static — emitting skin data alongside baked positions
@@ -2530,6 +2583,62 @@ fn collect_primitives(
     }
 
     Ok(result)
+}
+
+fn static_render_set_world_matrix(
+    nodes: Option<&VisualNodes>,
+    rs: &crate::models::visual::RenderSet,
+) -> Option<[f32; 16]> {
+    if rs.skinned || rs.node_name_ids.len() != 1 {
+        return None;
+    }
+    let nodes = nodes?;
+    let node_name_id = rs.node_name_ids[0];
+    let map_index = nodes.name_map_name_ids.iter().position(|&name_id| name_id == node_name_id)?;
+    let node_idx = *nodes.name_map_node_ids.get(map_index)?;
+    visual_nodes_world_matrix(nodes, node_idx)
+}
+
+fn visual_nodes_world_matrix(nodes: &VisualNodes, node_idx: u16) -> Option<[f32; 16]> {
+    let count = nodes.matrices.len();
+    let mut current = node_idx as usize;
+    if current >= count {
+        return None;
+    }
+    let mut world = nodes.matrices[current].0;
+    for _ in 0..count {
+        let parent = *nodes.parent_ids.get(current)?;
+        if parent == 0xFFFF || parent as usize >= count {
+            return Some(world);
+        }
+        world = mat4_mul_col(&nodes.matrices[parent as usize].0, &world);
+        current = parent as usize;
+    }
+    None
+}
+
+fn transform_positions_normals(positions: &mut [[f32; 3]], normals: &mut [[f32; 3]], matrix: &[f32; 16]) {
+    for p in positions.iter_mut() {
+        let [x, y, z] = *p;
+        *p = [
+            matrix[0] * x + matrix[4] * y + matrix[8] * z + matrix[12],
+            matrix[1] * x + matrix[5] * y + matrix[9] * z + matrix[13],
+            matrix[2] * x + matrix[6] * y + matrix[10] * z + matrix[14],
+        ];
+    }
+    for n in normals.iter_mut() {
+        let [x, y, z] = *n;
+        let transformed = [
+            matrix[0] * x + matrix[4] * y + matrix[8] * z,
+            matrix[1] * x + matrix[5] * y + matrix[9] * z,
+            matrix[2] * x + matrix[6] * y + matrix[10] * z,
+        ];
+        let len = (transformed[0] * transformed[0] + transformed[1] * transformed[1] + transformed[2] * transformed[2])
+            .sqrt();
+        if len > 0.0 {
+            *n = [transformed[0] / len, transformed[1] / len, transformed[2] / len];
+        }
+    }
 }
 
 struct UnpackedVertices {
@@ -2740,38 +2849,51 @@ fn mat4_mul_col(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
 /// failure mode for callers).
 fn invert_mat4_col(m: &[f32; 16]) -> [f32; 16] {
     let mut inv = [0.0f32; 16];
-    inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15]
-        + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
-    inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15]
-        - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
-    inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15]
-        + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
-    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14]
-        - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
-    inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15]
-        - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
-    inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15]
-        + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
-    inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15]
-        - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
-    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14]
-        + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
-    inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15]
-        + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
-    inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15]
-        - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
-    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15]
-        + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
-    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14]
-        - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
-    inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11]
-        - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
-    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11]
-        + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
-    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11]
-        - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
-    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10]
-        + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+    inv[0] =
+        m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11]
+            - m[13] * m[7] * m[10];
+    inv[4] =
+        -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11]
+            + m[12] * m[7] * m[10];
+    inv[8] =
+        m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11]
+            - m[12] * m[7] * m[9];
+    inv[12] =
+        -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10]
+            + m[12] * m[6] * m[9];
+    inv[1] =
+        -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11]
+            + m[13] * m[3] * m[10];
+    inv[5] =
+        m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11]
+            - m[12] * m[3] * m[10];
+    inv[9] =
+        -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11]
+            + m[12] * m[3] * m[9];
+    inv[13] =
+        m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10]
+            - m[12] * m[2] * m[9];
+    inv[2] =
+        m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7]
+            - m[13] * m[3] * m[6];
+    inv[6] =
+        -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7]
+            + m[12] * m[3] * m[6];
+    inv[10] =
+        m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7]
+            - m[12] * m[3] * m[5];
+    inv[14] =
+        -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6]
+            + m[12] * m[2] * m[5];
+    inv[3] =
+        -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7]
+            + m[9] * m[3] * m[6];
+    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7]
+        - m[8] * m[3] * m[6];
+    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7]
+        + m[8] * m[3] * m[5];
+    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6]
+        - m[8] * m[2] * m[5];
 
     let det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
     if det.abs() < 1e-12 {
@@ -2808,8 +2930,7 @@ const RIG_Y180: [f32; 16] = [
 /// Negative ⇒ the node bakes a Z-mirror (`col2.z < 0`), WG's convention
 /// for "this turret was authored mirrored".
 fn mat3_det(m: &[f32; 16]) -> f32 {
-    m[0] * (m[5] * m[10] - m[6] * m[9]) - m[4] * (m[1] * m[10] - m[2] * m[9])
-        + m[8] * (m[1] * m[6] - m[2] * m[5])
+    m[0] * (m[5] * m[10] - m[6] * m[9]) - m[4] * (m[1] * m[10] - m[2] * m[9]) + m[8] * (m[1] * m[6] - m[2] * m[5])
 }
 
 /// Per-export bone tree state: glTF node indices and matrices indexed by
@@ -2843,11 +2964,7 @@ struct SkinTree {
 /// The returned bone nodes are NOT yet attached to the scene. Callers
 /// add the roots (parent == 0xFFFF) to `scene_nodes` once they know
 /// any skin actually needs them.
-fn emit_bone_node_tree(
-    root: &mut json::Root,
-    visual: &VisualPrototype,
-    db: &PrototypeDatabase<'_>,
-) -> SkinTree {
+fn emit_bone_node_tree(root: &mut json::Root, visual: &VisualPrototype, db: &PrototypeDatabase<'_>) -> SkinTree {
     let nodes = &visual.nodes;
     let count = nodes.matrices.len();
 
@@ -2881,11 +2998,8 @@ fn emit_bone_node_tree(
     //    have stable indices to point at.
     let mut bone_node_idx: Vec<json::Index<json::Node>> = Vec::with_capacity(count);
     for i in 0..count {
-        let idx = root.push(json::Node {
-            name: name_by_node[i].clone(),
-            matrix: Some(local_mats[i]),
-            ..Default::default()
-        });
+        let idx =
+            root.push(json::Node { name: name_by_node[i].clone(), matrix: Some(local_mats[i]), ..Default::default() });
         bone_node_idx.push(idx);
     }
 
@@ -2928,10 +3042,8 @@ fn emit_bone_node_tree(
     // is still identity at bind. Deterministic + idempotent across
     // re-exports (recomputed from the visual; never reads a prior GLB). The
     // `BoneFrameFixY180` node name is the marker consumers can detect.
-    let has_muzzle = name_by_node
-        .iter()
-        .flatten()
-        .any(|n| n.starts_with("HP_gunFire") && n.as_str() != "HP_gunFireEffect");
+    let has_muzzle =
+        name_by_node.iter().flatten().any(|n| n.starts_with("HP_gunFire") && n.as_str() != "HP_gunFireEffect");
     let blendbone_det = visual.find_node_local_matrix("Rotate_Y_BlendBone", &db.strings).map(|m| mat3_det(&m));
     let bake_y180 = has_muzzle && matches!(blendbone_det, Some(d) if d < 0.0);
 
@@ -2955,13 +3067,7 @@ fn emit_bone_node_tree(
         (None, raw_roots)
     };
 
-    SkinTree {
-        bone_node_idx,
-        local_mats,
-        parents: nodes.parent_ids.clone(),
-        root_premul,
-        scene_roots,
-    }
+    SkinTree { bone_node_idx, local_mats, parents: nodes.parent_ids.clone(), root_premul, scene_roots }
 }
 
 /// World matrix at bind pose for a given visual node: chain locals from
@@ -3027,10 +3133,8 @@ fn emit_skin_for_palette(
     name: Option<String>,
 ) -> json::Index<json::Skin> {
     let visual_indices = resolve_palette_to_visual_indices(visual, palette);
-    let joint_nodes: Vec<json::Index<json::Node>> = visual_indices
-        .iter()
-        .map(|&vidx| skin_tree.bone_node_idx[vidx as usize])
-        .collect();
+    let joint_nodes: Vec<json::Index<json::Node>> =
+        visual_indices.iter().map(|&vidx| skin_tree.bone_node_idx[vidx as usize]).collect();
 
     // Build IBM accessor: one Mat4 per joint, inverse of world matrix
     // at bind pose. Three.js / Unity / Blender all expect this.
@@ -3164,11 +3268,7 @@ impl TextureOutput {
     pub fn external(dir: impl Into<std::path::PathBuf>, uri_prefix: impl Into<String>) -> Self {
         let dir = dir.into();
         let _ = std::fs::create_dir_all(&dir);
-        Self::External {
-            dir,
-            uri_prefix: uri_prefix.into(),
-            written: std::collections::HashSet::new(),
-        }
+        Self::External { dir, uri_prefix: uri_prefix.into(), written: std::collections::HashSet::new() }
     }
 }
 
@@ -3345,6 +3445,7 @@ fn embed_png_texture(
             tex_coord: Some(0),
             extras: Default::default(),
         }),
+        ..Default::default()
     });
 
     json::texture::Info { index: texture, tex_coord: 0, extensions: tex_transform_ext, extras: Default::default() }
@@ -3380,34 +3481,13 @@ fn create_textured_material(
     let base_info = embed_png_texture(root, bin_data, tex_out, albedo_png, image_name.clone(), uv_transform);
 
     let normal_info = normal_png.map(|png| {
-        embed_png_texture(
-            root,
-            bin_data,
-            tex_out,
-            png,
-            image_name.as_deref().map(|s| format!("{s}_n")),
-            uv_transform,
-        )
+        embed_png_texture(root, bin_data, tex_out, png, image_name.as_deref().map(|s| format!("{s}_n")), uv_transform)
     });
     let mr_info = metallic_roughness_png.map(|png| {
-        embed_png_texture(
-            root,
-            bin_data,
-            tex_out,
-            png,
-            image_name.as_deref().map(|s| format!("{s}_mg")),
-            uv_transform,
-        )
+        embed_png_texture(root, bin_data, tex_out, png, image_name.as_deref().map(|s| format!("{s}_mg")), uv_transform)
     });
     let ao_info = occlusion_png.map(|png| {
-        embed_png_texture(
-            root,
-            bin_data,
-            tex_out,
-            png,
-            image_name.as_deref().map(|s| format!("{s}_ao")),
-            uv_transform,
-        )
+        embed_png_texture(root, bin_data, tex_out, png, image_name.as_deref().map(|s| format!("{s}_ao")), uv_transform)
     });
 
     let normal_tex = normal_info.map(|info| json::material::NormalTexture {
@@ -3868,7 +3948,10 @@ fn add_primitive_to_root(
         material: Some(cached.default_mat),
         mode: Valid(json::mesh::Mode::Triangles),
         targets: None,
-        extensions: Some(json::extensions::mesh::Primitive { khr_materials_variants: prim_variants_ext }),
+        extensions: Some(json::extensions::mesh::Primitive {
+            khr_materials_variants: prim_variants_ext,
+            ..Default::default()
+        }),
         extras: Default::default(),
     })
 }
@@ -4118,7 +4201,7 @@ fn add_variants_extension(root: &mut json::Root, texture_set: &TextureSet) {
         .collect();
 
     let ext = json::extensions::root::KhrMaterialsVariants { variants };
-    root.extensions = Some(json::extensions::root::Root { khr_materials_variants: Some(ext) });
+    root.extensions = Some(json::extensions::root::Root { khr_materials_variants: Some(ext), ..Default::default() });
 
     root.extensions_used.push("KHR_materials_variants".to_string());
 
@@ -4131,6 +4214,49 @@ fn pad_to_4(data: &mut Vec<u8>) {
     while !data.len().is_multiple_of(4) {
         data.push(0);
     }
+}
+
+fn append_vec3_accessor(
+    root: &mut json::Root,
+    bin_data: &mut Vec<u8>,
+    values: &[[f32; 3]],
+    name: Option<String>,
+) -> json::Index<json::Accessor> {
+    let (min, max) = bounding_coords(values);
+    let byte_offset = bin_data.len();
+    for value in values {
+        bin_data.extend_from_slice(&value[0].to_le_bytes());
+        bin_data.extend_from_slice(&value[1].to_le_bytes());
+        bin_data.extend_from_slice(&value[2].to_le_bytes());
+    }
+    pad_to_4(bin_data);
+    let byte_length = bin_data.len() - byte_offset;
+
+    let bv = root.push(json::buffer::View {
+        buffer: json::Index::new(0),
+        byte_length: USize64::from(byte_length),
+        byte_offset: Some(USize64::from(byte_offset)),
+        byte_stride: None,
+        target: Some(Valid(json::buffer::Target::ArrayBuffer)),
+        name: None,
+        extensions: Default::default(),
+        extras: Default::default(),
+    });
+
+    root.push(json::Accessor {
+        buffer_view: Some(bv),
+        byte_offset: Some(USize64(0)),
+        count: USize64::from(values.len()),
+        component_type: Valid(json::accessor::GenericComponentType(json::accessor::ComponentType::F32)),
+        type_: Valid(json::accessor::Type::Vec3),
+        min: Some(json::Value::from(min.to_vec())),
+        max: Some(json::Value::from(max.to_vec())),
+        name,
+        normalized: false,
+        sparse: None,
+        extensions: Default::default(),
+        extras: Default::default(),
+    })
 }
 
 fn bounding_coords(points: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
@@ -5461,6 +5587,7 @@ pub fn export_ship_glb(
             lod_entry,
             damaged,
             sub.barrel_pitch.as_ref(),
+            None,
             true, // ship export: apply NATIVE_TO_METRES to vertex positions
         )?;
 
@@ -5471,7 +5598,8 @@ pub fn export_ship_glb(
 
         let mut gltf_primitives = Vec::new();
         for prim in &primitives {
-            let gltf_prim = add_primitive_to_root(&mut root, &mut bin_data, tex_out, prim, texture_set, &mut mat_cache)?;
+            let gltf_prim =
+                add_primitive_to_root(&mut root, &mut bin_data, tex_out, prim, texture_set, &mut mat_cache)?;
             gltf_primitives.push(gltf_prim);
         }
 
@@ -5539,12 +5667,8 @@ pub fn export_ship_glb(
             extensions: Default::default(),
             extras: Default::default(),
         });
-        let node = root.push(json::Node {
-            mesh: Some(mesh),
-            name: Some(hb.name.clone()),
-            matrix: None,
-            ..Default::default()
-        });
+        let node =
+            root.push(json::Node { mesh: Some(mesh), name: Some(hb.name.clone()), matrix: None, ..Default::default() });
         hitbox_nodes.push(node);
     }
     if !hitbox_nodes.is_empty() {

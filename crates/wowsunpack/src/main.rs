@@ -461,7 +461,7 @@ enum Commands {
 
         /// Vegetation grid cell size in meters for decimation. One tree per species
         /// per cell is kept. Larger values = fewer trees. 0 = no decimation.
-        #[arg(long, default_value = "20")]
+        #[arg(long, default_value = "0")]
         vegetation_density: f32,
 
         /// Skip loading model textures
@@ -1092,7 +1092,8 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
                                 child_path.as_str()
                             };
 
-                            let out_path = out_dir.join(relative.trim_start_matches('/').replace('/', std::path::MAIN_SEPARATOR_STR));
+                            let out_path = out_dir
+                                .join(relative.trim_start_matches('/').replace('/', std::path::MAIN_SEPARATOR_STR));
                             if let Some(parent) = out_path.parent() {
                                 fs::create_dir_all(parent)?;
                             }
@@ -1419,7 +1420,21 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
             let file_data = read_file_data(&file, no_vfs, vfs.as_ref())?;
             run_geometry(&file_data, &file.to_string_lossy(), decode)?;
         }
-        Commands::ExportModel { file, output, lod, no_textures, damaged, all_render_sets, textures_dir, textures_uri_prefix, raw_dds_dir, material_mappings_json, skel_ext_candidates_json, list_textures, no_vfs } => {
+        Commands::ExportModel {
+            file,
+            output,
+            lod,
+            no_textures,
+            damaged,
+            all_render_sets,
+            textures_dir,
+            textures_uri_prefix,
+            raw_dds_dir,
+            material_mappings_json,
+            skel_ext_candidates_json,
+            list_textures,
+            no_vfs,
+        } => {
             run_export_model(&ExportModelParams {
                 file: &file,
                 output: &output,
@@ -1443,7 +1458,25 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
             };
             run_batch_export_model(&manifest, keep_going, vfs)?;
         }
-        Commands::ExportShip { name, output, lod, list_upgrades, hull, no_textures, damaged, all_render_sets, accessories, placements_json, skel_ext_candidates_json, textures_dir, textures_uri_prefix, raw_dds_dir, material_mappings_json, list_textures, debug } => {
+        Commands::ExportShip {
+            name,
+            output,
+            lod,
+            list_upgrades,
+            hull,
+            no_textures,
+            damaged,
+            all_render_sets,
+            accessories,
+            placements_json,
+            skel_ext_candidates_json,
+            textures_dir,
+            textures_uri_prefix,
+            raw_dds_dir,
+            material_mappings_json,
+            list_textures,
+            debug,
+        } => {
             let Some(vfs) = &vfs else {
                 bail!("VFS required for export-ship. Use --game-dir to specify a game install.");
             };
@@ -1504,30 +1537,14 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
                 bail!("VFS required for armor inspection. Use --game-dir to specify a game install.");
             };
 
-            run_armor(
-                vfs,
-                &name,
-                &game_dir,
-                game_version,
-                hull.as_deref(),
-                json.as_deref(),
-                vehicle.as_deref(),
-            )?;
+            run_armor(vfs, &name, &game_dir, game_version, hull.as_deref(), json.as_deref(), vehicle.as_deref())?;
         }
         Commands::Ammo { name, vehicle, hull, json } => {
             let Some(vfs) = &vfs else {
                 bail!("VFS required for ammo inspection. Use --game-dir to specify a game install.");
             };
 
-            run_ammo(
-                vfs,
-                &name,
-                &game_dir,
-                game_version,
-                hull.as_deref(),
-                json.as_deref(),
-                vehicle.as_deref(),
-            )?;
+            run_ammo(vfs, &name, &game_dir, game_version, hull.as_deref(), json.as_deref(), vehicle.as_deref())?;
         }
         Commands::IngestShip {
             name,
@@ -1605,22 +1622,16 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
                 bail!("input path is not a directory: {}", input.display());
             }
             let result = if recursive {
-                wowsunpack::export::texture::swizzle_dir_recursive(
-                    &input, out_dir.as_deref(),
-                )
+                wowsunpack::export::texture::swizzle_dir_recursive(&input, out_dir.as_deref())
             } else {
-                wowsunpack::export::texture::swizzle_dir(
-                    &input, out_dir.as_deref(),
-                )
+                wowsunpack::export::texture::swizzle_dir(&input, out_dir.as_deref())
             };
             match result {
                 Ok((processed, written)) => {
                     println!(
                         "swizzle-dir: processed {processed} WG-pack source file(s), \
                          wrote {written} conformant sibling(s){}",
-                        if let Some(o) = &out_dir {
-                            format!(" → {}", o.display())
-                        } else { String::new() }
+                        if let Some(o) = &out_dir { format!(" → {}", o.display()) } else { String::new() }
                     );
                 }
                 Err(e) => bail!("swizzle-dir failed: {e:?}"),
@@ -1989,28 +2000,44 @@ struct ExportModelParams<'a> {
 
 fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
     let ExportModelParams {
-        file, output, lod, no_textures, damaged, all_render_sets,
-        textures_dir, textures_uri_prefix, raw_dds_dir, material_mappings_json,
+        file,
+        output,
+        lod,
+        no_textures,
+        damaged,
+        all_render_sets,
+        textures_dir,
+        textures_uri_prefix,
+        raw_dds_dir,
+        material_mappings_json,
         skel_ext_candidates_json,
-        list_textures, no_vfs, vfs,
+        list_textures,
+        no_vfs,
+        vfs,
     } = *params;
     use wowsunpack::models::assets_bin;
 
     // 1. Load assets.bin (if available via VFS). Stored in a locally-owned
     //    Vec<u8> so the PrototypeDatabase can borrow from it.
-    let assets_bin_data: Option<Vec<u8>> = if let Some(vfs) = vfs {
-        load_assets_bin(vfs).ok()
-    } else {
-        None
-    };
+    let assets_bin_data: Option<Vec<u8>> = if let Some(vfs) = vfs { load_assets_bin(vfs).ok() } else { None };
     let db = assets_bin_data.as_deref().map(assets_bin::parse_assets_bin).transpose()?;
 
     export_one_model(
-        file, output, lod, no_textures, damaged, all_render_sets,
-        textures_dir, textures_uri_prefix, raw_dds_dir, material_mappings_json,
+        file,
+        output,
+        lod,
+        no_textures,
+        damaged,
+        all_render_sets,
+        textures_dir,
+        textures_uri_prefix,
+        raw_dds_dir,
+        material_mappings_json,
         skel_ext_candidates_json,
         list_textures,
-        no_vfs, vfs, db.as_ref(),
+        no_vfs,
+        vfs,
+        db.as_ref(),
         /* verbose: */ true,
     )
 }
@@ -2128,43 +2155,48 @@ fn export_one_model(
         let texture_set = if load_textures {
             let mfm_infos = collect_mfm_info(vp, db);
             let tex_set = build_texture_set(&mfm_infos, vfs, db, raw_dds_dir);
-            if no_textures {
-                gltf_export::TextureSet::empty()
-            } else {
-                tex_set
-            }
+            if no_textures { gltf_export::TextureSet::empty() } else { tex_set }
         } else {
             gltf_export::TextureSet::empty()
         };
 
         let mut tex_out = match textures_dir {
-            Some(dir) => gltf_export::TextureOutput::external(
-                dir,
-                textures_uri_prefix.unwrap_or("textures/"),
-            ),
+            Some(dir) => gltf_export::TextureOutput::external(dir, textures_uri_prefix.unwrap_or("textures/")),
             None => gltf_export::TextureOutput::Embedded,
         };
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent).ok();
         }
         let mut out_file = std::fs::File::create(output).context("Failed to create output file")?;
-        gltf_export::export_glb(vp, &geom, db, lod, &texture_set, damaged, all_render_sets, &mut tex_out, &mut out_file)
-            .context("Failed to export GLB")?;
+        gltf_export::export_glb(
+            vp,
+            &geom,
+            db,
+            lod,
+            &texture_set,
+            damaged,
+            all_render_sets,
+            &mut tex_out,
+            &mut out_file,
+        )
+        .context("Failed to export GLB")?;
 
         // Material mappings JSON — per-material → per-slot stem table.
         // Sub-model name defaults to the geometry stem (which equals the
         // .model dir name in WG content layout).
         if let Some(mm_path) = material_mappings_json {
-            let geom_stem = file
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            let geom_stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             let visual_path_str = visual_suffix.as_deref().unwrap_or("");
             if let Some(parent) = mm_path.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
             wowsunpack::export::ship::write_model_material_mappings_json(
-                vp, db, &file_str, visual_path_str, &geom_stem, mm_path,
+                vp,
+                db,
+                &file_str,
+                visual_path_str,
+                &geom_stem,
+                mm_path,
             )?;
             if verbose {
                 println!("  material mappings: {}", mm_path.display());
@@ -2185,14 +2217,9 @@ fn export_one_model(
         // form `/AGM034_16in50_Mk7/` matches the sibling skel_ext under
         // `content/gameplay/usa/gun/main/AGM034_16in50_Mk7/...`.
         if let Some(sx_path) = skel_ext_candidates_json {
-            let geom_stem = file
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            let geom_stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             let self_id_index = db.build_self_id_index();
-            let paths = wowsunpack::export::ship::find_skel_ext_paths(
-                db, &self_id_index, &geom_stem,
-            );
+            let paths = wowsunpack::export::ship::find_skel_ext_paths(db, &self_id_index, &geom_stem);
             let files = wowsunpack::export::ship::load_skel_ext_files(vfs, &paths)?;
             if let Some(parent) = sx_path.parent() {
                 std::fs::create_dir_all(parent).ok();
@@ -2207,10 +2234,7 @@ fn export_one_model(
             // for the full derivation.
             wowsunpack::export::ship::write_skel_ext_candidates_json(
                 &files,
-                &wowsunpack::export::ship::SkelExtSubject::Model {
-                    stem: &geom_stem,
-                    display_name: None,
-                },
+                &wowsunpack::export::ship::SkelExtSubject::Model { stem: &geom_stem, display_name: None },
                 sx_path,
                 Some((vp, &db.strings)),
             )?;
@@ -2218,10 +2242,12 @@ fn export_one_model(
                 if files.is_empty() {
                     println!("  skel_ext candidates: {} (empty — no sibling .skel_ext)", sx_path.display());
                 } else {
-                    println!("  skel_ext candidates: {} ({} segment file{})",
+                    println!(
+                        "  skel_ext candidates: {} ({} segment file{})",
                         sx_path.display(),
                         files.len(),
-                        if files.len() == 1 { "" } else { "s" });
+                        if files.len() == 1 { "" } else { "s" }
+                    );
                 }
             }
         }
@@ -2289,13 +2315,7 @@ struct BatchManifest {
 
 impl Default for BatchSharedOptions {
     fn default() -> Self {
-        Self {
-            all_render_sets: false,
-            no_textures: false,
-            damaged: false,
-            lod: 0,
-            textures_uri_prefix: None,
-        }
+        Self { all_render_sets: false, no_textures: false, damaged: false, lod: 0, textures_uri_prefix: None }
     }
 }
 
@@ -2308,14 +2328,10 @@ fn run_batch_export_model(manifest_path: &Path, keep_going: bool, vfs: &VfsPath)
     // Parse manifest.
     let manifest_text = std::fs::read_to_string(manifest_path)
         .context_with(|| format!("Failed to read manifest: {}", manifest_path.display()))?;
-    let manifest: BatchManifest = serde_json::from_str(&manifest_text)
-        .map_err(|e| rootcause::report!("Failed to parse manifest JSON: {e}"))?;
+    let manifest: BatchManifest =
+        serde_json::from_str(&manifest_text).map_err(|e| rootcause::report!("Failed to parse manifest JSON: {e}"))?;
 
-    println!(
-        "batch-export-model: {} items from {}",
-        manifest.items.len(),
-        manifest_path.display()
-    );
+    println!("batch-export-model: {} items from {}", manifest.items.len(), manifest_path.display());
 
     // Load + parse assets.bin once — this is the dominant cost we're amortizing.
     let t_bin = Instant::now();
@@ -2352,7 +2368,8 @@ fn run_batch_export_model(manifest_path: &Path, keep_going: bool, vfs: &VfsPath)
             /* verbose: */ false,
         );
 
-        let label = item.geometry
+        let label = item
+            .geometry
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| item.geometry.display().to_string());
@@ -2448,11 +2465,7 @@ fn parse_space_fog(xml: &str) -> Option<gltf_export::SpaceFog> {
     let vec4 = |tag: &str| -> Option<[f32; 4]> {
         let node = doc.descendants().find(|n| n.has_tag_name(tag))?;
         let value = node.descendants().find(|n| n.has_tag_name("value"))?;
-        let parts: Vec<f32> = value
-            .text()?
-            .split_whitespace()
-            .filter_map(|s| s.parse().ok())
-            .collect();
+        let parts: Vec<f32> = value.text()?.split_whitespace().filter_map(|s| s.parse().ok()).collect();
         if parts.len() < 4 { None } else { Some([parts[0], parts[1], parts[2], parts[3]]) }
     };
 
@@ -2597,15 +2610,10 @@ fn run_export_map(
     // + terrain enabled; fog is unconditionally useful for the consumer.
     let uber_xml: Option<String> = {
         let uber_path = space_file(space_dir, "space.ubersettings", no_vfs);
-        read_file_data(&uber_path, no_vfs, vfs)
-            .ok()
-            .map(|d| String::from_utf8_lossy(&d).into_owned())
+        read_file_data(&uber_path, no_vfs, vfs).ok().map(|d| String::from_utf8_lossy(&d).into_owned())
     };
-    let lightmap_path = if !no_textures && !no_terrain {
-        uber_xml.as_deref().and_then(parse_lightmap_path)
-    } else {
-        None
-    };
+    let lightmap_path =
+        if !no_textures && !no_terrain { uber_xml.as_deref().and_then(parse_lightmap_path) } else { None };
     let fog = uber_xml.as_deref().and_then(parse_space_fog);
     if let Some(f) = &fog {
         eprintln!(
@@ -2839,9 +2847,7 @@ fn run_export_ship(
         accessory_mode,
         placements_json_path: placements_json.map(|p| p.to_path_buf()),
         textures_dir: textures_dir.map(|p| p.to_path_buf()),
-        textures_uri_prefix: textures_uri_prefix
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "textures/".to_string()),
+        textures_uri_prefix: textures_uri_prefix.map(|s| s.to_string()).unwrap_or_else(|| "textures/".to_string()),
         raw_dds_dir: raw_dds_dir.map(|p| p.to_path_buf()),
         material_mappings_json_path: material_mappings_json.map(|p| p.to_path_buf()),
         ..Default::default()
@@ -2962,9 +2968,7 @@ fn run_ingest_ship(
         accessory_mode,
         placements_json_path: placements_json.map(|p| p.to_path_buf()),
         textures_dir: textures_dir.map(|p| p.to_path_buf()),
-        textures_uri_prefix: textures_uri_prefix
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "textures/".to_string()),
+        textures_uri_prefix: textures_uri_prefix.map(|s| s.to_string()).unwrap_or_else(|| "textures/".to_string()),
         raw_dds_dir: raw_dds_dir.map(|p| p.to_path_buf()),
         material_mappings_json_path: material_mappings_json.map(|p| p.to_path_buf()),
         ..Default::default()
@@ -3329,10 +3333,7 @@ fn run_armor(
 /// sidecar consumption. Shape mirrors the `armor.*` section documented in
 /// `tools/toolkit_integration/ARCHITECTURE.md` §"Primary: sidecar
 /// `armor.materials_table`".
-fn write_armor_materials_json(
-    ctx: &wowsunpack::export::ship::ShipModelContext,
-    path: &Path,
-) -> Result<(), Report> {
+fn write_armor_materials_json(ctx: &wowsunpack::export::ship::ShipModelContext, path: &Path) -> Result<(), Report> {
     use serde_json::json;
     use wowsunpack::export::gltf_export::collision_material_name;
     use wowsunpack::export::gltf_export::zone_from_material_name;
@@ -3378,10 +3379,8 @@ fn write_armor_materials_json(
                 // (geometry doesn't partition per-triangle by layer at this
                 // aggregation level; the per-vertex _MATERIAL_ID attribute is
                 // what gives runtime hit resolution its layer precision).
-                let total_thickness = armor_map
-                    .and_then(|m| m.get(&mat_id))
-                    .map(|layers| layers.values().sum::<f32>())
-                    .unwrap_or(0.0);
+                let total_thickness =
+                    armor_map.and_then(|m| m.get(&mat_id)).map(|layers| layers.values().sum::<f32>()).unwrap_or(0.0);
 
                 let acc = zones.entry(zone).or_default();
                 acc.plate_count += 1;
@@ -3416,8 +3415,7 @@ fn write_armor_materials_json(
         // `layers.iter().sum()` on an empty iterator yields `-0.0`, which
         // serialises as "-0.0" — ugly for sidecar diffs. Collapse to +0.0.
         let thickness_mm: f32 = if layers.is_empty() { 0.0 } else { layers.iter().sum() };
-        let zones_list: Vec<String> =
-            mat_to_zones.get(mat_id).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+        let zones_list: Vec<String> = mat_to_zones.get(mat_id).map(|s| s.iter().cloned().collect()).unwrap_or_default();
 
         materials_table.insert(
             mat_id.to_string(),
@@ -3452,24 +3450,17 @@ fn write_armor_materials_json(
         // Quantise thickness to micrometres for the map key so float equality
         // is well-defined; thickness is always positive finite mm so this is
         // safe and round-trip exact for the values we ever see.
-        let mut by_thickness: std::collections::HashMap<u32, (f32, usize)> =
-            std::collections::HashMap::new();
+        let mut by_thickness: std::collections::HashMap<u32, (f32, usize)> = std::collections::HashMap::new();
         for (&mat_id, &count) in &acc.mat_counts {
-            let total = armor_map
-                .and_then(|m| m.get(&mat_id))
-                .map(|layers| layers.values().sum::<f32>())
-                .unwrap_or(0.0);
+            let total =
+                armor_map.and_then(|m| m.get(&mat_id)).map(|layers| layers.values().sum::<f32>()).unwrap_or(0.0);
             let key = (total * 1000.0).round() as u32;
             let entry = by_thickness.entry(key).or_insert((total, 0));
             entry.1 += count;
         }
         let default_thickness_mm = by_thickness
             .values()
-            .max_by(|a, b| {
-                a.1.cmp(&b.1).then_with(|| {
-                    a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-                })
-            })
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)))
             .map(|(t, _)| *t)
             .unwrap_or(0.0);
 
@@ -3497,8 +3488,7 @@ fn write_armor_materials_json(
         "hidden_zones":    hidden_zones,
     });
 
-    let file =
-        std::fs::File::create(path).context_with(|| format!("Failed to create {}", path.display()))?;
+    let file = std::fs::File::create(path).context_with(|| format!("Failed to create {}", path.display()))?;
     let mut writer = std::io::BufWriter::new(file);
     serde_json::to_writer_pretty(&mut writer, &manifest)
         .map_err(|e| rootcause::report!("Failed to serialize armor JSON: {e}"))?;
@@ -3583,9 +3573,8 @@ fn emit_ammo_json(
             .cloned()
             .ok_or_else(|| rootcause::report!("No Vehicle found for ship '{}'.", info.model_dir))?
     };
-    let vehicle: &Vehicle = param
-        .vehicle()
-        .ok_or_else(|| rootcause::report!("No Vehicle component for ship '{}'.", info.model_dir))?;
+    let vehicle: &Vehicle =
+        param.vehicle().ok_or_else(|| rootcause::report!("No Vehicle component for ship '{}'.", info.model_dir))?;
 
     let config_data = vehicle.config_data().ok_or_else(|| {
         rootcause::report!(
@@ -3714,11 +3703,7 @@ fn emit_ammo_json(
     });
 
     // Stdout summary regardless of --json (matches `armor` UX).
-    println!(
-        "Ship: {} ({})",
-        info.display_name.as_deref().unwrap_or("?"),
-        info.model_dir
-    );
+    println!("Ship: {} ({})", info.display_name.as_deref().unwrap_or("?"), info.model_dir);
     println!("Shells: {}", manifest["shells"].as_object().map(|m| m.len()).unwrap_or(0));
     if let Some(m) = main_battery_m {
         println!("  Main battery range: {:.0} m", m);
@@ -3753,8 +3738,7 @@ fn emit_ammo_json(
     }
 
     if let Some(path) = json_path {
-        let file = std::fs::File::create(path)
-            .context_with(|| format!("Failed to create {}", path.display()))?;
+        let file = std::fs::File::create(path).context_with(|| format!("Failed to create {}", path.display()))?;
         let mut writer = std::io::BufWriter::new(file);
         serde_json::to_writer_pretty(&mut writer, &manifest)
             .map_err(|e| rootcause::report!("Failed to serialize ammo JSON: {e}"))?;
@@ -3790,8 +3774,8 @@ fn main() -> Result<(), Report> {
 /// plain-text mode and exists today for parity with sibling commands.
 fn handle_capabilities() -> Result<(), Report> {
     let caps = capabilities::build();
-    let rendered = serde_json::to_string_pretty(&caps)
-        .map_err(|e| rootcause::report!("Failed to serialize capabilities: {e}"))?;
+    let rendered =
+        serde_json::to_string_pretty(&caps).map_err(|e| rootcause::report!("Failed to serialize capabilities: {e}"))?;
     println!("{rendered}");
     Ok(())
 }
@@ -3799,7 +3783,13 @@ fn handle_capabilities() -> Result<(), Report> {
 /// DIAGNOSTIC: dump local + composed-world matrices for a list of bone
 /// names (or every node) from a `.visual`. Used to verify rest-pose
 /// offsets that skel_ext consumers must compose.
-fn run_dump_bones(vfs: &VfsPath, file: &Path, bones: &[String], all: bool, json_out: Option<&Path>) -> Result<(), Report> {
+fn run_dump_bones(
+    vfs: &VfsPath,
+    file: &Path,
+    bones: &[String],
+    all: bool,
+    json_out: Option<&Path>,
+) -> Result<(), Report> {
     use wowsunpack::models::assets_bin;
     use wowsunpack::models::visual;
 
@@ -3817,33 +3807,24 @@ fn run_dump_bones(vfs: &VfsPath, file: &Path, bones: &[String], all: bool, json_
     let self_id_index = db.build_self_id_index();
     let (vis_location, vis_full_path) = db.resolve_path(&visual_suffix, &self_id_index)?;
     if vis_location.blob_index != 1 {
-        bail!(
-            "Path {} resolved to blob {} (not VisualPrototype blob 1)",
-            visual_suffix,
-            vis_location.blob_index
-        );
+        bail!("Path {} resolved to blob {} (not VisualPrototype blob 1)", visual_suffix, vis_location.blob_index);
     }
-    let vis_data = db
-        .get_prototype_data(vis_location, visual::VISUAL_ITEM_SIZE)
-        .context("Failed to get visual prototype data")?;
+    let vis_data =
+        db.get_prototype_data(vis_location, visual::VISUAL_ITEM_SIZE).context("Failed to get visual prototype data")?;
     let vp = visual::parse_visual(vis_data).context("Failed to parse VisualPrototype")?;
 
     let strings = &db.strings;
 
     // Resolve names of every node up-front so we can print bone trees.
-    let names: Vec<String> = vp.nodes.name_ids.iter().map(|&id|
-        strings.get_string_by_id(id).unwrap_or("<unknown>").to_string()
-    ).collect();
+    let names: Vec<String> =
+        vp.nodes.name_ids.iter().map(|&id| strings.get_string_by_id(id).unwrap_or("<unknown>").to_string()).collect();
 
     // JSON output path: structured, machine-consumable. Used by
     // tools/ship/turret_autorig.py (replaces the legacy
     // gamemodels3d.com hardpoint-tree walker). Suppresses the
     // human-readable stdout to keep capture simple.
     if let Some(json_path) = json_out {
-        let asset_id = vis_full_path
-            .rsplit('/').next()
-            .and_then(|f| f.strip_suffix(".visual"))
-            .unwrap_or("");
+        let asset_id = vis_full_path.rsplit('/').next().and_then(|f| f.strip_suffix(".visual")).unwrap_or("");
         let mut nodes_json = Vec::with_capacity(names.len());
         for (i, name) in names.iter().enumerate() {
             let parent = vp.nodes.parent_ids[i];
@@ -3853,10 +3834,7 @@ fn run_dump_bones(vfs: &VfsPath, file: &Path, bones: &[String], all: bool, json_
                 if parent == 0xFFFF || (parent as usize) >= names.len() {
                     (serde_json::Value::Null, serde_json::Value::Null)
                 } else {
-                    (
-                        serde_json::Value::from(parent as u64),
-                        serde_json::Value::from(names[parent as usize].clone()),
-                    )
+                    (serde_json::Value::from(parent as u64), serde_json::Value::from(names[parent as usize].clone()))
                 };
             nodes_json.push(serde_json::json!({
                 "idx": i,
@@ -3876,12 +3854,10 @@ fn run_dump_bones(vfs: &VfsPath, file: &Path, bones: &[String], all: bool, json_
         });
         if let Some(parent) = json_path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .context("creating parent dir for --json output")?;
+                std::fs::create_dir_all(parent).context("creating parent dir for --json output")?;
             }
         }
-        std::fs::write(json_path, serde_json::to_string_pretty(&doc)?)
-            .context("writing --json output")?;
+        std::fs::write(json_path, serde_json::to_string_pretty(&doc)?).context("writing --json output")?;
         println!("dump-bones: wrote {} ({} nodes)", json_path.display(), names.len());
         return Ok(());
     }
@@ -3901,7 +3877,7 @@ fn run_dump_bones(vfs: &VfsPath, file: &Path, bones: &[String], all: bool, json_
         println!("  --- node[{}] \"{}\" (parent: {}) ---", i, name, parent_name);
         println!("  local (column-major, last col = translation):");
         for col in 0..4 {
-            let row: Vec<String> = (0..4).map(|r| format!("{:>10.5}", local[col*4 + r])).collect();
+            let row: Vec<String> = (0..4).map(|r| format!("{:>10.5}", local[col * 4 + r])).collect();
             println!("    [col {}] {}", col, row.join("  "));
         }
         println!("  composed-to-root translation: ({:.5}, {:.5}, {:.5})", world[12], world[13], world[14]);
@@ -3915,13 +3891,7 @@ fn run_dump_bones(vfs: &VfsPath, file: &Path, bones: &[String], all: bool, json_
     }
 
     let target_bones: Vec<String> = if bones.is_empty() {
-        vec![
-            "Scene Root".into(),
-            "Root".into(),
-            "Rotate_Y".into(),
-            "Rotate_Y_BlendBone".into(),
-            "Rotate_X".into(),
-        ]
+        vec!["Scene Root".into(), "Root".into(), "Rotate_Y".into(), "Rotate_Y_BlendBone".into(), "Rotate_X".into()]
     } else {
         bones.to_vec()
     };

@@ -227,9 +227,7 @@ pub fn find_skel_ext_paths(
         let full_path = db.reconstruct_path(i, self_id_index);
         if full_path.contains(&needle) {
             let stem_with_ext = entry.name.as_str();
-            let stem = stem_with_ext
-                .strip_suffix(".skel_ext")
-                .unwrap_or(stem_with_ext);
+            let stem = stem_with_ext.strip_suffix(".skel_ext").unwrap_or(stem_with_ext);
             let prefix = format!("{model_dir}_");
             let segment = stem.strip_prefix(&prefix).unwrap_or(stem).to_string();
             result.push((segment, full_path));
@@ -245,10 +243,7 @@ pub fn find_skel_ext_paths(
 /// warning to stderr and are skipped — the caller gets a possibly-shorter
 /// vec rather than a hard failure. This matches the existing `export-ship`
 /// behaviour where one bad segment shouldn't doom the whole export.
-pub fn load_skel_ext_files(
-    vfs: &VfsPath,
-    skel_ext_paths: &[(String, String)],
-) -> Result<Vec<OwnedSkelExt>, Report> {
+pub fn load_skel_ext_files(vfs: &VfsPath, skel_ext_paths: &[(String, String)]) -> Result<Vec<OwnedSkelExt>, Report> {
     let mut out = Vec::new();
     for (segment, vfs_path) in skel_ext_paths {
         let vfs_joined = match vfs.join(vfs_path) {
@@ -270,11 +265,7 @@ pub fn load_skel_ext_files(
             eprintln!("Warning: failed to read skel_ext '{vfs_path}': {e}");
             continue;
         }
-        out.push(OwnedSkelExt {
-            segment: segment.clone(),
-            vfs_path: vfs_path.clone(),
-            bytes,
-        });
+        out.push(OwnedSkelExt { segment: segment.clone(), vfs_path: vfs_path.clone(), bytes });
     }
     Ok(out)
 }
@@ -415,12 +406,8 @@ pub fn write_skel_ext_candidates_json(
 
     for (segment, pl) in &global_placements {
         let p = pl.position();
-        let key = (
-            pl.p0_hash,
-            (p[0] * 100.0).round() as i64,
-            (p[1] * 100.0).round() as i64,
-            (p[2] * 100.0).round() as i64,
-        );
+        let key =
+            (pl.p0_hash, (p[0] * 100.0).round() as i64, (p[1] * 100.0).round() as i64, (p[2] * 100.0).round() as i64);
         if !seen.insert(key) {
             continue;
         }
@@ -569,10 +556,12 @@ pub fn write_skel_ext_candidates_json(
     let unresolved_json: Vec<serde_json::Value> = unresolved_vec
         .iter()
         .take(16)
-        .map(|(hash, count)| json!({
-            "p1_hash": format!("0x{:08X}", hash),
-            "count":   count,
-        }))
+        .map(|(hash, count)| {
+            json!({
+                "p1_hash": format!("0x{:08X}", hash),
+                "count":   count,
+            })
+        })
         .collect();
 
     let manifest = json!({
@@ -917,9 +906,9 @@ impl ShipAssets {
             .game_param_by_name(vehicle_id)
             .or_else(|| self.metadata.game_param_by_index(vehicle_id))
             .ok_or_else(|| rootcause::report!("--vehicle {:?} not found in GameParams", vehicle_id))?;
-        let vehicle = param.vehicle().ok_or_else(|| {
-            rootcause::report!("GameParams entry {:?} has no Vehicle component", vehicle_id)
-        })?;
+        let vehicle = param
+            .vehicle()
+            .ok_or_else(|| rootcause::report!("GameParams entry {:?} has no Vehicle component", vehicle_id))?;
         self.load_ship_from_vehicle(vehicle, options)
     }
 
@@ -1286,10 +1275,7 @@ impl ShipAssets {
 
     /// Load `.skel_ext` bytes for each segment path. Method form —
     /// delegates to the free [`load_skel_ext_files`] for re-use.
-    fn load_skel_ext_files(
-        &self,
-        skel_ext_paths: &[(String, String)],
-    ) -> Result<Vec<OwnedSkelExt>, Report> {
+    fn load_skel_ext_files(&self, skel_ext_paths: &[(String, String)]) -> Result<Vec<OwnedSkelExt>, Report> {
         load_skel_ext_files(&self.vfs, skel_ext_paths)
     }
 
@@ -1386,27 +1372,26 @@ impl ShipAssets {
             // `parent_section` is the hull section that owns the (parent) HP —
             // for direct HPs that's the section the HP node lives in; for
             // compound HPs we inherit it from the parent hull HP.
-            let (hull_transform, child_hp_transform, parent_section) =
-                if let Some(&xform) = hp_transforms.get(mi.hp_name()) {
-                    (xform, None, hp_section.get(mi.hp_name()).cloned())
-                } else {
-                    match resolve_compound_hp(
-                        mi.hp_name(),
-                        &hp_transforms,
-                        &hp_to_model_path,
-                        &turret_model_index,
-                        &turret_models,
-                        &db.strings,
-                    ) {
-                        Some((parent_hp, parent_xform, child)) => {
-                            (parent_xform, child, hp_section.get(parent_hp).cloned())
-                        }
-                        None => {
-                            eprintln!("Warning: could not resolve hardpoint '{}'", mi.hp_name());
-                            continue;
-                        }
+            let (hull_transform, child_hp_transform, parent_section) = if let Some(&xform) =
+                hp_transforms.get(mi.hp_name())
+            {
+                (xform, None, hp_section.get(mi.hp_name()).cloned())
+            } else {
+                match resolve_compound_hp(
+                    mi.hp_name(),
+                    &hp_transforms,
+                    &hp_to_model_path,
+                    &turret_model_index,
+                    &turret_models,
+                    &db.strings,
+                ) {
+                    Some((parent_hp, parent_xform, child)) => (parent_xform, child, hp_section.get(parent_hp).cloned()),
+                    None => {
+                        eprintln!("Warning: could not resolve hardpoint '{}'", mi.hp_name());
+                        continue;
                     }
-                };
+                }
+            };
             let hp_transform = match child_hp_transform {
                 None => hull_transform,
                 Some(child_xform) => mat4_mul_col_major(&hull_transform, &child_xform),
@@ -1859,8 +1844,7 @@ impl ShipModelContext {
             let turret = &self.turret_models[mount.turret_model_index];
             let asset_id = turret.name.clone();
             let counter = asset_counts.entry(asset_id.clone()).or_insert(0);
-            let ship_stem =
-                self.info.display_name.as_deref().unwrap_or(self.info.model_dir.as_str()).to_string();
+            let ship_stem = self.info.display_name.as_deref().unwrap_or(self.info.model_dir.as_str()).to_string();
             let instance_id = format!("{}_{}_{:02}", ship_stem, asset_id, *counter);
             *counter += 1;
 
@@ -2014,12 +1998,7 @@ impl ShipModelContext {
         // (skel_ext_resolve.py for ship-side, hull decoratives) on
         // the same path. Asset-side placements (export-model) take
         // the schema_version=2 path with the asset's own visual.
-        write_skel_ext_candidates_json(
-            &self.skel_ext_files,
-            &SkelExtSubject::Ship(&self.info),
-            path,
-            None,
-        )
+        write_skel_ext_candidates_json(&self.skel_ext_files, &SkelExtSubject::Ship(&self.info), path, None)
     }
 
     /// Write a JSON manifest of every hull material → texture stem mapping.
@@ -2084,9 +2063,7 @@ impl ShipModelContext {
 
         let mut material_entries: Vec<serde_json::Value> = Vec::new();
         for sub in &self.hull_parts {
-            let entries = build_material_entries_for_visual(
-                &sub.visual, &db, &self_id_index, &sub.name,
-            );
+            let entries = build_material_entries_for_visual(&sub.visual, &db, &self_id_index, &sub.name);
             material_entries.extend(entries);
         }
 
@@ -2190,12 +2167,7 @@ impl ShipModelContext {
             for sub in &sub_models {
                 all_mfm_infos.extend(collect_mfm_info(sub.visual, &db));
             }
-            let mut tex_set = build_texture_set(
-                &all_mfm_infos,
-                &self.vfs,
-                &db,
-                self.options.raw_dds_dir.as_deref(),
-            );
+            let mut tex_set = build_texture_set(&all_mfm_infos, &self.vfs, &db, self.options.raw_dds_dir.as_deref());
             let per_ship_count = tex_set.camo_schemes.len();
 
             // Merge material-based camo textures (mat_Steel, mat_Yamato_KoF, etc.).
@@ -2279,11 +2251,7 @@ impl ShipModelContext {
         // DDS dump is a side effect of `build_texture_set`. If the caller
         // only asked for DDS (not glTF-embedded textures), discard the
         // loaded TextureSet so nothing lands in the GLB.
-        let texture_set = if self.options.textures {
-            texture_set
-        } else {
-            TextureSet::empty()
-        };
+        let texture_set = if self.options.textures { texture_set } else { TextureSet::empty() };
 
         // Collect armor meshes from hull AND turret geometries with thickness data.
         let armor_map = self.armor_map.as_ref();
@@ -2686,12 +2654,8 @@ pub fn write_model_material_mappings_json(
         "materials": entries,
     });
 
-    let file = std::fs::File::create(out_path).context_with(|| {
-        format!(
-            "Failed to create model material mappings JSON at {}",
-            out_path.display()
-        )
-    })?;
+    let file = std::fs::File::create(out_path)
+        .context_with(|| format!("Failed to create model material mappings JSON at {}", out_path.display()))?;
     serde_json::to_writer_pretty(std::io::BufWriter::new(file), &manifest)
         .map_err(|e| rootcause::report!("Failed to serialize model material mappings JSON: {e}"))?;
     Ok(())
@@ -2726,11 +2690,7 @@ pub fn collect_mfm_info(visual: &VisualPrototype, db: &PrototypeDatabase<'_>) ->
 
         if seen.insert(stem.to_string()) {
             let full_path = db.reconstruct_path(path_idx, &self_id_index);
-            result.push(MfmInfo {
-                stem: stem.to_string(),
-                full_path,
-                material_mfm_path_id: rs.material_mfm_path_id,
-            });
+            result.push(MfmInfo { stem: stem.to_string(), full_path, material_mfm_path_id: rs.material_mfm_path_id });
         }
     }
 
@@ -2789,10 +2749,8 @@ pub fn build_texture_set(
 
         // Load PBR auxiliary channels (normal / MG / AO) via MFM property lookup.
         if info.material_mfm_path_id != 0 {
-            let channels = texture::load_pbr_channels(
-                vfs, db, &self_id_index, info.material_mfm_path_id,
-                raw_dds_dumper.as_mut(),
-            );
+            let channels =
+                texture::load_pbr_channels(vfs, db, &self_id_index, info.material_mfm_path_id, raw_dds_dumper.as_mut());
             if let Some(png) = channels.normal {
                 normal_base.insert(info.stem.clone(), png);
             }
@@ -2997,9 +2955,7 @@ fn mat4_rotation_inverse(m: &[f32; 16]) -> [f32; 16] {
 /// consumers (decomposition into PRS yields a negative scale axis, which
 /// flips face winding under default culling).
 fn mat3_determinant(m: &[f32; 16]) -> f32 {
-    m[0] * (m[5] * m[10] - m[6] * m[9])
-        - m[4] * (m[1] * m[10] - m[2] * m[9])
-        + m[8] * (m[1] * m[6] - m[2] * m[5])
+    m[0] * (m[5] * m[10] - m[6] * m[9]) - m[4] * (m[1] * m[10] - m[2] * m[9]) + m[8] * (m[1] * m[6] - m[2] * m[5])
 }
 
 /// Convert an improper rotation (`det < 0`) to a proper rotation by
@@ -3025,20 +2981,14 @@ fn ensure_proper_rotation(m: [f32; 16]) -> [f32; 16] {
 /// Identity 4x4 column-major matrix — translation (0,0,0), no rotation.
 /// Used as the fallback transform for a mount whose hardpoint couldn't be
 /// resolved (the mount is still emitted so downstream logic sees the asset_id).
-const IDENTITY_4X4: [f32; 16] =
-    [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+const IDENTITY_4X4: [f32; 16] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
 
 /// 180° rotation around the Y axis, column-major. Equivalent to
 /// `diag(-1, 1, -1, 1)` in 4x4 form. Post-multiplied onto skel_ext
 /// placements (schema_version=2 emit) so consumers don't need a
 /// per-asset facing flip — see `write_skel_ext_candidates_json` for
 /// the motivation.
-const RY_180_4X4: [f32; 16] = [
-    -1.0, 0.0, 0.0, 0.0,
-     0.0, 1.0, 0.0, 0.0,
-     0.0, 0.0,-1.0, 0.0,
-     0.0, 0.0, 0.0, 1.0,
-];
+const RY_180_4X4: [f32; 16] = [-1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
 
 /// Extract `(scope, category, subcategory)` from a mount's GameParams model path.
 ///
@@ -3120,9 +3070,7 @@ fn format_rfc3339_utc(time: SystemTime) -> String {
 /// GameParams-side string (``"Destroyer"`` / ``"Battleship"`` / ``"Cruiser"``
 /// / ``"AirCarrier"`` / ``"Submarine"``); downstream consumers map that to
 /// their preferred short form.
-fn ship_identity_from_param(
-    param: Option<&crate::game_params::types::Param>,
-) -> (String, String, u32) {
+fn ship_identity_from_param(param: Option<&crate::game_params::types::Param>) -> (String, String, u32) {
     let Some(param) = param else {
         return (String::new(), String::new(), 0);
     };

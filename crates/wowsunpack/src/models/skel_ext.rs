@@ -212,14 +212,7 @@ pub fn parse_records(buf: &[u8]) -> Vec<SkelExtRecord> {
             && (p2 as usize) < size;
 
         if valid {
-            recs.push(SkelExtRecord {
-                file_offset: off as u64,
-                type_: t,
-                count: c,
-                p0,
-                p1,
-                p2,
-            });
+            recs.push(SkelExtRecord { file_offset: off as u64, type_: t, count: c, p0, p1, p2 });
         }
         off += RECORD_STRIDE;
     }
@@ -298,10 +291,7 @@ pub fn parse_skel_ext(buf: &[u8]) -> Result<Vec<SkelExtPlacement>, SkelExtError>
 
         // Bounds-check each array. If any would overflow the buffer, skip
         // the whole record (better to drop questionable data than panic).
-        if p0_off + c * 4 > buf.len()
-            || p1_off + c * 4 > buf.len()
-            || p2_off + c * MATRIX_SIZE > buf.len()
-        {
+        if p0_off + c * 4 > buf.len() || p1_off + c * 4 > buf.len() || p2_off + c * MATRIX_SIZE > buf.len() {
             continue;
         }
 
@@ -374,11 +364,8 @@ pub fn dedupe_by_position(placements: &[SkelExtPlacement], quantum_m: f32) -> Ve
     let mut out = Vec::new();
     for pl in placements {
         let p = pl.position();
-        let key = (
-            (p[0] / quantum_m).round() as i64,
-            (p[1] / quantum_m).round() as i64,
-            (p[2] / quantum_m).round() as i64,
-        );
+        let key =
+            ((p[0] / quantum_m).round() as i64, (p[1] / quantum_m).round() as i64, (p[2] / quantum_m).round() as i64);
         if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(key) {
             e.insert(out.len());
             out.push(pl.clone());
@@ -397,10 +384,7 @@ mod tests {
 
     #[test]
     fn empty_buffer_errors() {
-        assert!(matches!(
-            parse_skel_ext(&[]),
-            Err(SkelExtError::TooShort { .. })
-        ));
+        assert!(matches!(parse_skel_ext(&[]), Err(SkelExtError::TooShort { .. })));
     }
 
     #[test]
@@ -414,9 +398,7 @@ mod tests {
     #[test]
     fn is_affine_rejects_bad_bottom_row() {
         // Column-major: row 3 is at indices 3, 7, 11, 15.
-        let identity = [
-            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-        ];
+        let identity = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
         assert!(is_affine(&identity));
         let mut bad = identity;
         bad[15] = 0.5; // row 3 col 3 should be 1.0
@@ -428,9 +410,7 @@ mod tests {
 
     #[test]
     fn negate_z_transform_is_involution_on_rotation_free() {
-        let m = [
-            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 2.0, 3.0, 1.0,
-        ];
+        let m = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 2.0, 3.0, 1.0];
         let flipped = negate_z_transform(m);
         assert_eq!(flipped[14], -3.0);
         assert_eq!(flipped[10], 1.0); // col 2 row 2: -(-1) = 1 (from -m[8]=-0, -m[9]=-0, m[10]=1)
@@ -439,9 +419,7 @@ mod tests {
 
     #[test]
     fn to_metric_scales_translation() {
-        let m = [
-            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 2.0, 3.0, 1.0,
-        ];
+        let m = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 2.0, 3.0, 1.0];
         let metric = to_metric_glft(m);
         assert_eq!(metric[12], 15.0);
         assert_eq!(metric[13], 30.0);

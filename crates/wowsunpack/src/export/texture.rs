@@ -756,13 +756,8 @@ pub fn read_mfm_alpha_state(mat: &MaterialPrototype) -> MfmAlphaState {
     };
     // alphaMul/alphaPow are the BLEND tuning knobs WG uses for waterfalls,
     // light shafts, etc. They appear without alphaTestEnable.
-    let alpha_blend = !alpha_test
-        && (mat.get_property("alphaMul").is_some() || mat.get_property("alphaPow").is_some());
-    MfmAlphaState {
-        alpha_blend,
-        alpha_cutoff,
-        double_sided: mat.get_bool("doubleSided").unwrap_or(false),
-    }
+    let alpha_blend = !alpha_test && (mat.get_property("alphaMul").is_some() || mat.get_property("alphaPow").is_some());
+    MfmAlphaState { alpha_blend, alpha_cutoff, double_sided: mat.get_bool("doubleSided").unwrap_or(false) }
 }
 
 /// Check if a material is a TILEDLAND terrain material.
@@ -1071,11 +1066,9 @@ pub fn load_pbr_channels(
     // map — the original B is preserved on disk via the
     // `_nbmask.dd?` siblings emitted by `RawDdsDumper` (see
     // `tools/reference/shared/texture_conventions.md` §Decision).
-    let normal = load_raw("normalMap")
-        .and_then(|png| replace_normal_b_with_reconstructed_z_png(&png).ok());
+    let normal = load_raw("normalMap").and_then(|png| replace_normal_b_with_reconstructed_z_png(&png).ok());
     let occlusion = load_raw("ambientOcclusionMap");
-    let metallic_roughness = load_raw("metallicGlossMap")
-        .and_then(|png| repack_wg_mg_to_gltf_mr(&png).ok());
+    let metallic_roughness = load_raw("metallicGlossMap").and_then(|png| repack_wg_mg_to_gltf_mr(&png).ok());
     // Detail map: shared high-frequency normal atlas
     // (`ship_atlas_detail.dds`) used by 67.8% of WG ship/character/
     // accessory materials. Passes through raw — channels are standard
@@ -1095,18 +1088,15 @@ pub fn load_pbr_channels(
 /// the detail layer has no visible effect regardless of texture
 /// binding — useful as a producer-side gate to skip emitting the
 /// detail texture for materials that don't use it.
-pub fn load_detail_params(
-    db: &PrototypeDatabase<'_>,
-    mfm_path_id: u64,
-) -> Option<DetailParams> {
+pub fn load_detail_params(db: &PrototypeDatabase<'_>, mfm_path_id: u64) -> Option<DetailParams> {
     let mat = parse_mfm_from_db(db, mfm_path_id)?;
     Some(DetailParams {
         normal_influence: mat.get_float("g_detailNormalInfluence").unwrap_or(0.0),
         albedo_influence: mat.get_float("g_detailAlbedoInfluence").unwrap_or(0.0),
-        gloss_influence:  mat.get_float("g_detailGlossInfluence").unwrap_or(0.0),
-        fade_distance:    mat.get_float("g_detailFadeDistance").unwrap_or(0.0),
-        scale_u:          mat.get_float("g_detailScaleU").unwrap_or(1.0),
-        scale_v:          mat.get_float("g_detailScaleV").unwrap_or(1.0),
+        gloss_influence: mat.get_float("g_detailGlossInfluence").unwrap_or(0.0),
+        fade_distance: mat.get_float("g_detailFadeDistance").unwrap_or(0.0),
+        scale_u: mat.get_float("g_detailScaleU").unwrap_or(1.0),
+        scale_v: mat.get_float("g_detailScaleV").unwrap_or(1.0),
     })
 }
 
@@ -1206,17 +1196,13 @@ pub fn repack_wg_mg_to_gltf_mr(png_bytes: &[u8]) -> Result<Vec<u8>, Report<Textu
 ///
 /// See `tools/reference/shared/texture_conventions.md` §Normal in the
 /// pipeline repo for the full convention writeup.
-pub fn replace_normal_b_with_reconstructed_z_png(
-    png_bytes: &[u8],
-) -> Result<Vec<u8>, Report<TextureError>> {
+pub fn replace_normal_b_with_reconstructed_z_png(png_bytes: &[u8]) -> Result<Vec<u8>, Report<TextureError>> {
     use image_dds::image::ImageReader;
 
     let reader = ImageReader::new(Cursor::new(png_bytes))
         .with_guessed_format()
         .map_err(|e| Report::new(TextureError::DdsDecode(e.to_string())))?;
-    let img = reader
-        .decode()
-        .map_err(|e| Report::new(TextureError::DdsDecode(e.to_string())))?;
+    let img = reader.decode().map_err(|e| Report::new(TextureError::DdsDecode(e.to_string())))?;
     let mut rgba = img.into_rgba8();
 
     for pixel in rgba.pixels_mut() {
@@ -1233,24 +1219,16 @@ pub fn replace_normal_b_with_reconstructed_z_png(
 
     let mut out = Vec::new();
     PngEncoder::new(&mut out)
-        .write_image(
-            rgba.as_raw(),
-            rgba.width(),
-            rgba.height(),
-            ExtendedColorType::Rgba8,
-        )
+        .write_image(rgba.as_raw(), rgba.width(), rgba.height(), ExtendedColorType::Rgba8)
         .map_err(|e| Report::new(TextureError::PngEncode(e.to_string())))?;
     Ok(out)
 }
 
 /// Decode a single-mip DDS to RGBA8 (image_dds wrapper).
-fn decode_single_mip_dds(
-    dds_bytes: &[u8],
-) -> Result<image_dds::image::RgbaImage, Report<TextureError>> {
+fn decode_single_mip_dds(dds_bytes: &[u8]) -> Result<image_dds::image::RgbaImage, Report<TextureError>> {
     let dds = image_dds::ddsfile::Dds::read(&mut Cursor::new(dds_bytes))
         .map_err(|e| Report::new(TextureError::DdsParse(e.to_string())))?;
-    image_dds::image_from_dds(&dds, 0)
-        .map_err(|e| Report::new(TextureError::DdsDecode(e.to_string())))
+    image_dds::image_from_dds(&dds, 0).map_err(|e| Report::new(TextureError::DdsDecode(e.to_string())))
 }
 
 /// Encode an RGBA8 image as a single-mip DDS in the given format.
@@ -1263,8 +1241,7 @@ fn encode_single_mip_dds(
         .encode_dds(format, image_dds::Quality::Fast, image_dds::Mipmaps::Disabled)
         .map_err(|e| Report::new(TextureError::DdsEncode(e.to_string())))?;
     let mut buf = Vec::new();
-    dds.write(&mut buf)
-        .map_err(|e| Report::new(TextureError::DdsEncode(e.to_string())))?;
+    dds.write(&mut buf).map_err(|e| Report::new(TextureError::DdsEncode(e.to_string())))?;
     Ok(buf)
 }
 
@@ -1312,9 +1289,7 @@ pub fn swizzle_wg_mg_dds_to_mr(dds_bytes: &[u8]) -> Result<Vec<u8>, Report<Textu
 /// Single mip — WG splits the mip pyramid across `.dd0` / `.dd1` /
 /// `.dd2` / `.dds` files, each carrying one mip level. Callers iterate
 /// per-file.
-pub fn split_wg_mg_dds(
-    dds_bytes: &[u8],
-) -> Result<(Vec<u8> /* mr */, Vec<u8> /* camomask */), Report<TextureError>> {
+pub fn split_wg_mg_dds(dds_bytes: &[u8]) -> Result<(Vec<u8> /* mr */, Vec<u8> /* camomask */), Report<TextureError>> {
     let rgba = decode_single_mip_dds(dds_bytes)?;
     let (w, h) = (rgba.width(), rgba.height());
 
@@ -1429,18 +1404,16 @@ pub fn swizzle_dir(
     let _ = std::fs::create_dir_all(output_dir);
 
     let mut processed: usize = 0;
-    let mut written:   usize = 0;
+    let mut written: usize = 0;
 
     let entries = std::fs::read_dir(input_dir)
-        .map_err(|e| {
-            Report::new(TextureError::IoError(format!(
-                "read_dir {} failed: {e}", input_dir.display()
-            )))
-        })?;
+        .map_err(|e| Report::new(TextureError::IoError(format!("read_dir {} failed: {e}", input_dir.display()))))?;
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file() { continue; }
+        if !path.is_file() {
+            continue;
+        }
 
         let filename = match path.file_name().and_then(|n| n.to_str()) {
             Some(s) => s,
@@ -1448,10 +1421,7 @@ pub fn swizzle_dir(
         };
 
         // Identify the mip-level suffix (`.dd0` / `.dd1` / `.dd2` / `.dds`).
-        let mip_suffix = match DDS_MIP_SUFFIXES
-            .iter()
-            .find(|s| filename.to_lowercase().ends_with(*s))
-        {
+        let mip_suffix = match DDS_MIP_SUFFIXES.iter().find(|s| filename.to_lowercase().ends_with(*s)) {
             Some(s) => *s,
             None => continue,
         };
@@ -1469,29 +1439,33 @@ pub fn swizzle_dir(
         if let Some(stem) = stem_no_mip.strip_suffix("_n") {
             processed += 1;
             let normal_name = format!("{stem}_normal{mip_suffix}");
-            let mask_name   = format!("{stem}_nbmask{mip_suffix}");
-            let normal_out  = output_dir.join(&normal_name);
-            let mask_out    = output_dir.join(&mask_name);
+            let mask_name = format!("{stem}_nbmask{mip_suffix}");
+            let normal_out = output_dir.join(&normal_name);
+            let mask_out = output_dir.join(&mask_name);
             let need_normal = !normal_out.exists();
-            let need_mask   = !mask_out.exists();
-            if !need_normal && !need_mask { continue; }
+            let need_mask = !mask_out.exists();
+            if !need_normal && !need_mask {
+                continue;
+            }
             match split_wg_normal_dds(&bytes) {
                 Ok((normal_dds, mask_dds)) => {
                     if need_normal {
                         if let Err(e) = atomic_write(&normal_out, &normal_dds) {
                             eprintln!("  Warning: failed to write {}: {e}", normal_out.display());
-                        } else { written += 1; }
+                        } else {
+                            written += 1;
+                        }
                     }
                     if need_mask {
                         if let Err(e) = atomic_write(&mask_out, &mask_dds) {
                             eprintln!("  Warning: failed to write {}: {e}", mask_out.display());
-                        } else { written += 1; }
+                        } else {
+                            written += 1;
+                        }
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "  Warning: failed to split WG normal {filename}: {e:?}"
-                    );
+                    eprintln!("  Warning: failed to split WG normal {filename}: {e:?}");
                 }
             }
         } else if let Some(stem) = stem_no_mip.strip_suffix("_mg") {
@@ -1502,24 +1476,28 @@ pub fn swizzle_dir(
             let mask_out = output_dir.join(&mask_name);
             let need_mr = !mr_out.exists();
             let need_mask = !mask_out.exists();
-            if !need_mr && !need_mask { continue; }
+            if !need_mr && !need_mask {
+                continue;
+            }
             match split_wg_mg_dds(&bytes) {
                 Ok((mr_dds, mask_dds)) => {
                     if need_mr {
                         if let Err(e) = atomic_write(&mr_out, &mr_dds) {
                             eprintln!("  Warning: failed to write {}: {e}", mr_out.display());
-                        } else { written += 1; }
+                        } else {
+                            written += 1;
+                        }
                     }
                     if need_mask {
                         if let Err(e) = atomic_write(&mask_out, &mask_dds) {
                             eprintln!("  Warning: failed to write {}: {e}", mask_out.display());
-                        } else { written += 1; }
+                        } else {
+                            written += 1;
+                        }
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "  Warning: failed to split WG MG {filename}: {e:?}"
-                    );
+                    eprintln!("  Warning: failed to split WG MG {filename}: {e:?}");
                 }
             }
         }
@@ -1537,7 +1515,7 @@ pub fn swizzle_dir_recursive(
     output_dir: Option<&std::path::Path>,
 ) -> Result<(usize, usize), Report<TextureError>> {
     let mut total_processed: usize = 0;
-    let mut total_written:   usize = 0;
+    let mut total_written: usize = 0;
 
     // Stack-based walk, deterministic per filesystem order.
     let mut stack = vec![input_dir.to_path_buf()];
@@ -1552,7 +1530,9 @@ pub fn swizzle_dir_recursive(
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_dir() { stack.push(path); }
+                if path.is_dir() {
+                    stack.push(path);
+                }
             }
         }
     }
@@ -1573,8 +1553,7 @@ pub fn load_or_bake_albedo(
     self_id_index: Option<&HashMap<u64, usize>>,
     max_size: Option<u32>,
 ) -> Option<Vec<u8>> {
-    load_or_bake_albedo_with_alpha(vfs, mfm_full_path, mfm_path_id, db, self_id_index, max_size)
-        .map(|(png, _)| png)
+    load_or_bake_albedo_with_alpha(vfs, mfm_full_path, mfm_path_id, db, self_id_index, max_size).map(|(png, _)| png)
 }
 
 /// Same as [`load_or_bake_albedo`] but also returns the source MFM's alpha
@@ -1606,10 +1585,7 @@ pub fn load_or_bake_albedo_with_alpha(
         (Some(db), Some(_), p) if p != 0 => parse_mfm_from_db(db, p),
         _ => None,
     };
-    let alpha_state = parsed_mat
-        .as_ref()
-        .map(read_mfm_alpha_state)
-        .unwrap_or_default();
+    let alpha_state = parsed_mat.as_ref().map(read_mfm_alpha_state).unwrap_or_default();
 
     // Try MFM-based TILEDLAND baking first (terrain materials).
     // This must come before filename-based lookup because _od files exist for
@@ -1642,24 +1618,15 @@ mod tests {
     #[test]
     fn strip_year_token_middle() {
         // Baltimore: year sits between ship + part.
-        assert_eq!(
-            strip_year_token("ASC017_Baltimore_1944_Bow").as_deref(),
-            Some("ASC017_Baltimore_Bow"),
-        );
+        assert_eq!(strip_year_token("ASC017_Baltimore_1944_Bow").as_deref(), Some("ASC017_Baltimore_Bow"),);
         // Yamato: year between ship + part.
-        assert_eq!(
-            strip_year_token("JSB039_Yamato_1945_Hull").as_deref(),
-            Some("JSB039_Yamato_Hull"),
-        );
+        assert_eq!(strip_year_token("JSB039_Yamato_1945_Hull").as_deref(), Some("JSB039_Yamato_Hull"),);
     }
 
     #[test]
     fn strip_year_token_trailing() {
         // Year at the end of the stem (no part suffix).
-        assert_eq!(
-            strip_year_token("ASB017_Montana_1945").as_deref(),
-            Some("ASB017_Montana"),
-        );
+        assert_eq!(strip_year_token("ASB017_Montana_1945").as_deref(), Some("ASB017_Montana"),);
     }
 
     #[test]
@@ -1680,19 +1647,10 @@ mod tests {
 
     #[test]
     fn truncate_at_year_token_basic() {
-        assert_eq!(
-            truncate_at_year_token("ASC017_Baltimore_1944_Bow").as_deref(),
-            Some("ASC017_Baltimore"),
-        );
-        assert_eq!(
-            truncate_at_year_token("JSB039_Yamato_1945_Hull").as_deref(),
-            Some("JSB039_Yamato"),
-        );
+        assert_eq!(truncate_at_year_token("ASC017_Baltimore_1944_Bow").as_deref(), Some("ASC017_Baltimore"),);
+        assert_eq!(truncate_at_year_token("JSB039_Yamato_1945_Hull").as_deref(), Some("JSB039_Yamato"),);
         // Year at end: still produces the prefix.
-        assert_eq!(
-            truncate_at_year_token("JSB039_Yamato_1945").as_deref(),
-            Some("JSB039_Yamato"),
-        );
+        assert_eq!(truncate_at_year_token("JSB039_Yamato_1945").as_deref(), Some("JSB039_Yamato"),);
     }
 
     #[test]

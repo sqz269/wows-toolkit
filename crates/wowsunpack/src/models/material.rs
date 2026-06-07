@@ -42,6 +42,8 @@ use crate::data::parser_utils::WResult;
 
 /// Item size for MaterialPrototype records in the database blob.
 pub const MATERIAL_ITEM_SIZE: usize = 0x78;
+/// Item size for map `MaterialInstancePrototype` records in `space.bin`.
+pub const MATERIAL_INSTANCE_ITEM_SIZE: usize = 0x70;
 
 /// Blob index for MaterialPrototype in the assets.bin database array.
 pub const MATERIAL_BLOB_INDEX: usize = 0;
@@ -171,7 +173,7 @@ struct MaterialHeader {
     material_hash: u64,
 }
 
-fn parse_material_header(input: &mut &[u8]) -> WResult<MaterialHeader> {
+fn parse_material_header(input: &mut &[u8], has_trailing_padding: bool) -> WResult<MaterialHeader> {
     let property_count = le_u16.parse_next(input)?;
     let flags = le_u16.parse_next(input)?;
     let shader_id = le_u32.parse_next(input)?;
@@ -185,7 +187,9 @@ fn parse_material_header(input: &mut &[u8]) -> WResult<MaterialHeader> {
     }
 
     let material_hash = le_u64.parse_next(input)?;
-    let _padding = le_u64.parse_next(input)?;
+    if has_trailing_padding {
+        let _padding = le_u64.parse_next(input)?;
+    }
 
     Ok(MaterialHeader {
         property_count,
@@ -244,17 +248,25 @@ const TYPE_ELEMENT_SIZES: [usize; 9] = [1, 4, 4, 4, 8, 8, 12, 16, 64];
 /// extending to the end of the blob (so pointers can resolve into OOL data).
 /// The first `MATERIAL_ITEM_SIZE` bytes are the fixed record fields.
 pub fn parse_material(record_data: &[u8]) -> Result<MaterialPrototype, Report<MaterialError>> {
-    if record_data.len() < MATERIAL_ITEM_SIZE {
-        return Err(Report::new(MaterialError::DataTooShort {
-            offset: 0,
-            need: MATERIAL_ITEM_SIZE,
-            have: record_data.len(),
-        }));
+    parse_material_with_record_size(record_data, MATERIAL_ITEM_SIZE)
+}
+
+/// Parse a 0x70-stride map `MaterialInstancePrototype` record.
+pub fn parse_material_instance(record_data: &[u8]) -> Result<MaterialPrototype, Report<MaterialError>> {
+    parse_material_with_record_size(record_data, MATERIAL_INSTANCE_ITEM_SIZE)
+}
+
+fn parse_material_with_record_size(
+    record_data: &[u8],
+    record_size: usize,
+) -> Result<MaterialPrototype, Report<MaterialError>> {
+    if record_data.len() < record_size {
+        return Err(Report::new(MaterialError::DataTooShort { offset: 0, need: record_size, have: record_data.len() }));
     }
 
     let hdr = {
         let input = &mut &record_data[..];
-        parse_material_header(input)
+        parse_material_header(input, record_size >= MATERIAL_ITEM_SIZE)
             .map_err(|e: ErrMode<ContextError>| Report::new(MaterialError::ParseError(format!("header: {e}"))))?
     };
 

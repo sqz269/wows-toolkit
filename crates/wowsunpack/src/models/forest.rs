@@ -124,19 +124,12 @@ const CELL_OFFSET_IN_LAYER: usize = 0x10;
 /// a fixed offset (`layer_base + 0x10`) inside the 0x90-byte layer
 /// struct, and the instance buffer pointer lives at the layer base
 /// itself.
-fn read_primary_layer(
-    data: &[u8],
-    num_species: usize,
-) -> Result<(usize, usize, Vec<(usize, usize)>), ForestError> {
+fn read_primary_layer(data: &[u8], num_species: usize) -> Result<(usize, usize, Vec<(usize, usize)>), ForestError> {
     let layer_off = LAYER_BASE;
     let cell_off = layer_off + CELL_OFFSET_IN_LAYER;
     let need = cell_off + num_species * 8;
     if data.len() < need {
-        return Err(ForestError::DataTooShort {
-            offset: layer_off,
-            need,
-            have: data.len(),
-        });
+        return Err(ForestError::DataTooShort { offset: layer_off, need, have: data.len() });
     }
 
     let buf_relptr = i64::from_le_bytes(data[layer_off..layer_off + 8].try_into().unwrap());
@@ -226,8 +219,7 @@ pub fn parse_forest(file_data: &[u8]) -> Result<Forest, Report<ForestError>> {
     // per-species (start, count) table all live inside this layer; no
     // byte-grep heuristic needed. See `read_primary_layer` and the
     // module docstring for the layer layout.
-    let (instances_abs, lod0_total, species_table) =
-        read_primary_layer(file_data, num_species).map_err(Report::new)?;
+    let (instances_abs, lod0_total, species_table) = read_primary_layer(file_data, num_species).map_err(Report::new)?;
 
     // Sanity: the per-species count sums should equal Layer[0].buffer_count.
     // Diverges on malformed files; warn but trust the per-species ranges.

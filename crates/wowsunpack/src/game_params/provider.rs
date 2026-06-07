@@ -660,14 +660,7 @@ fn extract_mounts(ship_data: &BTreeMap<HashableValue, Value>, component_name: &s
                 })
                 .unwrap_or_default();
 
-            Some(MountPoint::with_armor(
-                key_str.clone(),
-                model_path,
-                mount_armor,
-                species,
-                pitch_dead_zones,
-                ammo_list,
-            ))
+            Some(MountPoint::with_armor(key_str.clone(), model_path, mount_armor, species, pitch_dead_zones, ammo_list))
         })
         .collect()
 }

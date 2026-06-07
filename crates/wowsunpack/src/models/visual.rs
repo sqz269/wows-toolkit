@@ -461,9 +461,7 @@ impl VisualPrototype {
     /// that exporter emits.
     pub fn has_muzzle_locator(&self, strings: &StringsSection<'_>) -> bool {
         self.nodes.name_map_name_ids.iter().any(|&name_id| {
-            strings
-                .get_string_by_id(name_id)
-                .is_some_and(|n| n.starts_with("HP_gunFire") && n != "HP_gunFireEffect")
+            strings.get_string_by_id(name_id).is_some_and(|n| n.starts_with("HP_gunFire") && n != "HP_gunFireEffect")
         })
     }
 
@@ -486,11 +484,7 @@ impl VisualPrototype {
     /// resolves that hash to a node index without requiring callers to
     /// know the source name string (they may not — only the hash is
     /// stored in the binary).
-    pub fn find_node_index_by_hash(
-        &self,
-        hash: u32,
-        strings: &StringsSection<'_>,
-    ) -> Option<u16> {
+    pub fn find_node_index_by_hash(&self, hash: u32, strings: &StringsSection<'_>) -> Option<u16> {
         use crate::models::material::murmur3_32;
         for (i, &name_id) in self.nodes.name_map_name_ids.iter().enumerate() {
             if let Some(resolved) = strings.get_string_by_id(name_id)
@@ -507,11 +501,7 @@ impl VisualPrototype {
     /// transform (column-major affine).
     ///
     /// Returns `None` if no node matches the hash.
-    pub fn find_composed_matrix_by_hash(
-        &self,
-        hash: u32,
-        strings: &StringsSection<'_>,
-    ) -> Option<[f32; 16]> {
+    pub fn find_composed_matrix_by_hash(&self, hash: u32, strings: &StringsSection<'_>) -> Option<[f32; 16]> {
         let node_idx = self.find_node_index_by_hash(hash, strings)?;
         let mut result = self.nodes.matrices[node_idx as usize].0;
         let mut current = node_idx;

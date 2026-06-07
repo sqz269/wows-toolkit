@@ -30,6 +30,8 @@ use crate::data::parser_utils::parse_u16_array;
 use crate::data::parser_utils::parse_u32_array;
 use crate::data::parser_utils::resolve_relptr;
 use crate::data::parser_utils::resolve_relptr_at;
+use crate::models::material::MaterialPrototype;
+use crate::models::material::parse_material_instance;
 use crate::models::model::ModelPrototype;
 use crate::models::visual::Lod;
 use crate::models::visual::RenderSet;
@@ -80,14 +82,9 @@ pub struct SkeletonProto {
 /// `matter_id` is the new texture/color to apply; `replaces_id` is the
 /// prototype slot it targets.
 ///
-/// Engine treats both fields as opaque u32 IDs. Empirically the encoding
-/// varies between maps: some carry `MurmurHash3_32` hashes (consistent
-/// with ship-side camo per `[[project_mat_camo_hybrid_shipped]]`),
-/// others store 4-byte ASCII fragments in the u32 slots directly (e.g.
-/// `0x38303134 = "4108"` followed by `0x43363244 = "D26C"`). Consumers
-/// must not assume one encoding — preserve the raw u32 and resolve
-/// downstream against whichever hash/string table the engine uses for
-/// that map.
+/// Engine treats both fields as opaque u32 IDs. Current corpus evidence
+/// matches the native hash/key path; preserve the raw u32 values and resolve
+/// them downstream against model/material dye tables before applying them.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelDye {
     pub matter_id: u32,
@@ -147,18 +144,17 @@ pub struct SpaceInstance {
     /// when the runtime quality preset is below this value; useful as a
     /// viewer-side detail filter.
     pub min_quality_level: u8,
+    /// Stable authoring GUID string at +0x40/+0x48, when present.
+    pub stable_guid: Option<String>,
     /// Per-instance `modelDyes[]` override pairs from +0x60 (relptr) /
-    /// +0x59 (u8 count). Resolved at parse time; relptr is rel-to-position
-    /// (rec_base+0x60 + i64). Visual impact varies by map — themed event
-    /// maps carry hundreds, "plain" maps (Okinawa) carry zero.
+    /// +0x59 (u8 count). Resolved at parse time; relptr is relative to the
+    /// start of the ModelInstance record. Visual impact varies by map.
     pub model_dyes: Vec<ModelDye>,
     /// Count of `materialInstances[]` override records at +0x68 (relptr)
-    /// / +0x5a (u8 count). v1 surfaces the count only; the 0x70-stride
-    /// `MaterialInstancePrototype` records carry full per-instance
-    /// material property bags (Vec4 tints, texture swaps, shader vars).
-    /// Decoding them requires reusing `models/material.rs` with a stride
-    /// adjustment — deferred to a follow-up pass.
+    /// / +0x5a (u8 count).
     pub material_instance_count: u8,
+    /// Decoded 0x70-stride `MaterialInstancePrototype` overrides.
+    pub material_instances: Vec<MaterialPrototype>,
 }
 
 /// Parsed `space.bin` instance placements + lighting.
@@ -249,8 +245,8 @@ fn parse_visual_proto_inline_fields(input: &mut &[u8]) -> WResult<VisualProtoInl
 //
 // Layout (Ghidra @ FUN_1408985c0, audit doc 2026-05-21):
 //   +0x00  16× f32   transform
-//   +0x40  u32       guidCount       — DROPPED
-//   +0x44  i64       guids relptr    — DROPPED
+//   +0x40  u64       stableGuid length
+//   +0x48  i64       stableGuid relptr
 //   +0x50  u64       resourceId      — path_id
 //   +0x58  u8        isLandscape
 //   +0x59  u8        modelDyesCount
@@ -262,16 +258,14 @@ fn parse_visual_proto_inline_fields(input: &mut &[u8]) -> WResult<VisualProtoInl
 
 /// Parse a single ModelInstance record (0x70 bytes) into a fully-resolved
 /// `SpaceInstance`. Inner relptrs at +0x60 (modelDyes) and +0x68
-/// (materialInstances) are resolved using `rec_base` as the position
-/// reference — both are rel-to-position-within-file (verified
-/// empirically on `20_NE_two_brothers/space.bin`).
-fn parse_space_instance_record(
-    file_data: &[u8],
-    rec_base: usize,
-) -> WResult<SpaceInstance> {
+/// (materialInstances) are resolved relative to the start of the 0x70-byte
+/// ModelInstance record. The stable GUID descriptor at +0x40/+0x48 resolves
+/// relative to the descriptor base (`rec_base + 0x40`).
+fn parse_space_instance_record(file_data: &[u8], rec_base: usize) -> WResult<SpaceInstance> {
     let input = &mut &file_data[rec_base..rec_base + SPACE_INSTANCE_SIZE];
     let transform = parser_utils::parse_matrix4x4(input)?;
-    let _ = take(16usize).parse_next(input)?; // +0x40..+0x50: guidCount + guids relptr
+    let stable_guid_len = le_u64.parse_next(input)?;
+    let stable_guid_relptr = le_i64.parse_next(input)?;
     let path_id = le_u64.parse_next(input)?;
     let is_landscape = le_u8.parse_next(input)? != 0;
     let model_dyes_count = le_u8.parse_next(input)?;
@@ -279,16 +273,17 @@ fn parse_space_instance_record(
     let min_quality_level = le_u8.parse_next(input)?;
     let _ = take(4usize).parse_next(input)?; // +0x5c..+0x60: pad
     let model_dyes_relptr = le_i64.parse_next(input)?;
-    let _material_instances_relptr = le_i64.parse_next(input)?;
+    let material_instances_relptr = le_i64.parse_next(input)?;
 
-    // Resolve modelDyes[]: rec_base+0x60 + relptr → start of N×8 dye records.
+    let stable_guid = read_string_descriptor(file_data, rec_base + 0x40, stable_guid_len, stable_guid_relptr);
+
+    // Resolve modelDyes[]: rec_base + relptr -> start of N x 8 dye records.
     // The relptr can legitimately be 0 (no overrides — file has padding here)
     // when count is 0; defensively guard against out-of-bounds + negative
     // resolved offsets.
     let mut model_dyes = Vec::with_capacity(model_dyes_count as usize);
     if model_dyes_count > 0 {
-        let dye_pos = rec_base + 0x60;
-        let resolved = dye_pos as i64 + model_dyes_relptr;
+        let resolved = rec_base as i64 + model_dyes_relptr;
         if resolved >= 0 {
             let start = resolved as usize;
             let need = (model_dyes_count as usize) * 8;
@@ -303,13 +298,32 @@ fn parse_space_instance_record(
         }
     }
 
+    let mut material_instances = Vec::with_capacity(material_instance_count as usize);
+    if material_instance_count > 0 {
+        let resolved = rec_base as i64 + material_instances_relptr;
+        if resolved >= 0 {
+            let start = resolved as usize;
+            let need = (material_instance_count as usize) * crate::models::material::MATERIAL_INSTANCE_ITEM_SIZE;
+            if start + need <= file_data.len() {
+                for i in 0..material_instance_count as usize {
+                    let material_offset = start + i * crate::models::material::MATERIAL_INSTANCE_ITEM_SIZE;
+                    if let Ok(material) = parse_material_instance(&file_data[material_offset..]) {
+                        material_instances.push(material);
+                    }
+                }
+            }
+        }
+    }
+
     Ok(SpaceInstance {
         transform,
         path_id,
         is_landscape,
         min_quality_level,
+        stable_guid,
         model_dyes,
         material_instance_count,
+        material_instances,
     })
 }
 
@@ -430,12 +444,9 @@ fn parse_space_header(file_data: &[u8]) -> Result<[(u32, usize); 8], Report<Merg
     let input = &mut &file_data[..SPACE_HEADER_SIZE];
     let counts: Vec<u32> = winnow::combinator::repeat(8usize, le_u32)
         .parse_next(input)
-        .map_err(|e: ErrMode<ContextError>| {
-            Report::new(MergedModelsError::ParseError(format!("space counts: {e}")))
-        })?;
-    let relptrs: Vec<i64> = winnow::combinator::repeat(8usize, le_i64)
-        .parse_next(input)
-        .map_err(|e: ErrMode<ContextError>| {
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("space counts: {e}"))))?;
+    let relptrs: Vec<i64> =
+        winnow::combinator::repeat(8usize, le_i64).parse_next(input).map_err(|e: ErrMode<ContextError>| {
             Report::new(MergedModelsError::ParseError(format!("space relptrs: {e}")))
         })?;
     let mut out = [(0u32, 0usize); 8];
@@ -444,6 +455,21 @@ fn parse_space_header(file_data: &[u8]) -> Result<[(u32, usize); 8], Report<Merg
         out[i] = (counts[i], relptrs[i].max(0) as usize);
     }
     Ok(out)
+}
+
+fn read_string_descriptor(file_data: &[u8], descriptor_base: usize, len: u64, relptr: i64) -> Option<String> {
+    if len == 0 {
+        return None;
+    }
+    let start_i64 = descriptor_base as i64 + relptr;
+    if start_i64 < 0 {
+        return None;
+    }
+    let start = start_i64 as usize;
+    let end = start.checked_add(len as usize)?;
+    let bytes = file_data.get(start..end)?;
+    let bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes);
+    Some(String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// Parse a `space.bin` file to extract model placements + point lights.
@@ -471,13 +497,9 @@ pub fn parse_space_instances(file_data: &[u8]) -> Result<SpaceInstances, Report<
         let mut out = Vec::with_capacity(instance_count as usize);
         for i in 0..instance_count as usize {
             let rec_base = instances_offset + i * SPACE_INSTANCE_SIZE;
-            let rec = parse_space_instance_record(file_data, rec_base).map_err(
-                |e: ErrMode<ContextError>| {
-                    Report::new(MergedModelsError::ParseError(format!(
-                        "space instance[{i}] @ 0x{rec_base:x}: {e}"
-                    )))
-                },
-            )?;
+            let rec = parse_space_instance_record(file_data, rec_base).map_err(|e: ErrMode<ContextError>| {
+                Report::new(MergedModelsError::ParseError(format!("space instance[{i}] @ 0x{rec_base:x}: {e}")))
+            })?;
             out.push(rec);
         }
         out
@@ -495,11 +517,9 @@ pub fn parse_space_instances(file_data: &[u8]) -> Result<SpaceInstances, Report<
             }));
         }
         let input = &mut &file_data[lights_offset..];
-        winnow::combinator::repeat(light_count as usize, parse_space_point_light_entry)
-            .parse_next(input)
-            .map_err(|e: ErrMode<ContextError>| {
-                Report::new(MergedModelsError::ParseError(format!("space point lights: {e}")))
-            })?
+        winnow::combinator::repeat(light_count as usize, parse_space_point_light_entry).parse_next(input).map_err(
+            |e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("space point lights: {e}"))),
+        )?
     };
 
     Ok(SpaceInstances { instances, point_lights })
@@ -620,10 +640,7 @@ fn parse_model_record(data: &[u8], rec: usize) -> Result<MergedModelRecord, Repo
 // not nested ModelPrototype records, so the recursive parser misinterprets
 // them. Map-rendering downstream doesn't read these fields, so leaving them
 // empty is safe.
-fn parse_inline_model_proto_header(
-    data: &[u8],
-    base: usize,
-) -> Result<ModelPrototype, Report<MergedModelsError>> {
+fn parse_inline_model_proto_header(data: &[u8], base: usize) -> Result<ModelPrototype, Report<MergedModelsError>> {
     const INLINE_MODEL_PROTO_SIZE: usize = 0x28;
     if base + INLINE_MODEL_PROTO_SIZE > data.len() {
         return Err(Report::new(MergedModelsError::DataTooShort {
@@ -859,4 +876,113 @@ fn parse_lods_merged(data: &[u8], offset: usize, count: usize) -> Result<Vec<Lod
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::material::{PropertyType, PropertyValue};
+
+    fn put_u16(data: &mut [u8], offset: usize, value: u16) {
+        data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(data: &mut [u8], offset: usize, value: u32) {
+        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64(data: &mut [u8], offset: usize, value: u64) {
+        data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_i64(data: &mut [u8], offset: usize, value: i64) {
+        data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_f32(data: &mut [u8], offset: usize, value: f32) {
+        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn parses_model_dyes_relative_to_model_instance_base() {
+        let model_offset = SPACE_HEADER_SIZE;
+        let rec1 = model_offset + SPACE_INSTANCE_SIZE;
+        let dye_offset = 0x160usize;
+        let old_wrong_offset = dye_offset + 0x60;
+
+        let mut data = vec![0u8; old_wrong_offset + 8];
+        put_u32(&mut data, 0x00, 2);
+        put_i64(&mut data, 0x20, model_offset as i64);
+
+        put_u64(&mut data, rec1 + 0x50, 0x1234_5678_90ab_cdef);
+        data[rec1 + 0x59] = 1;
+        data[rec1 + 0x5b] = 4;
+        put_i64(&mut data, rec1 + 0x60, dye_offset as i64 - rec1 as i64);
+
+        put_u32(&mut data, dye_offset, 0x46f1_b231);
+        put_u32(&mut data, dye_offset + 4, 0x955d_be29);
+        put_u32(&mut data, old_wrong_offset, 0x1111_1111);
+        put_u32(&mut data, old_wrong_offset + 4, 0x2222_2222);
+
+        let parsed = parse_space_instances(&data).expect("space instances");
+        let dye = parsed.instances[1].model_dyes[0];
+        assert_eq!(dye.matter_id, 0x46f1_b231);
+        assert_eq!(dye.replaces_id, 0x955d_be29);
+    }
+
+    #[test]
+    fn parses_stable_guid_descriptor_relative_to_descriptor_base() {
+        let model_offset = SPACE_HEADER_SIZE;
+        let rec0 = model_offset;
+        let guid_offset = 0x100usize;
+        let guid = b"2E8F86C7.4B8A6236.75A3978F.4D162DE3\0";
+
+        let mut data = vec![0u8; guid_offset + guid.len()];
+        put_u32(&mut data, 0x00, 1);
+        put_i64(&mut data, 0x20, model_offset as i64);
+
+        put_u64(&mut data, rec0 + 0x40, guid.len() as u64);
+        put_i64(&mut data, rec0 + 0x48, guid_offset as i64 - (rec0 + 0x40) as i64);
+        put_u64(&mut data, rec0 + 0x50, 0x1234_5678_90ab_cdef);
+        data[guid_offset..guid_offset + guid.len()].copy_from_slice(guid);
+
+        let parsed = parse_space_instances(&data).expect("space instances");
+        assert_eq!(parsed.instances[0].stable_guid.as_deref(), Some("2E8F86C7.4B8A6236.75A3978F.4D162DE3"));
+    }
+
+    #[test]
+    fn parses_material_instances_relative_to_model_instance_base() {
+        let model_offset = SPACE_HEADER_SIZE;
+        let rec1 = model_offset + SPACE_INSTANCE_SIZE;
+        let material_offset = 0x180usize;
+
+        let mut data = vec![0u8; 0x210];
+        put_u32(&mut data, 0x00, 2);
+        put_i64(&mut data, 0x20, model_offset as i64);
+
+        put_u64(&mut data, rec1 + 0x50, 0x1234_5678_90ab_cdef);
+        data[rec1 + 0x5a] = 1;
+        data[rec1 + 0x5b] = 4;
+        put_i64(&mut data, rec1 + 0x68, material_offset as i64 - rec1 as i64);
+
+        put_u16(&mut data, material_offset, 1);
+        put_u32(&mut data, material_offset + 0x04, 0x700);
+        put_u64(&mut data, material_offset + 0x08, 0x700);
+        put_u64(&mut data, material_offset + 0x10, 0x70);
+        put_u64(&mut data, material_offset + 0x18, 0x74);
+        put_u64(&mut data, material_offset + 0x38, 0x78);
+        put_u64(&mut data, material_offset + 0x68, 0x6a79c245);
+        put_u32(&mut data, material_offset + 0x70, 0x5acc9c8b);
+        put_u16(&mut data, material_offset + 0x74, 3);
+        put_f32(&mut data, material_offset + 0x78, 0.5);
+
+        let parsed = parse_space_instances(&data).expect("space instances");
+        let material = &parsed.instances[1].material_instances[0];
+        assert_eq!(material.shader_id, 0x700);
+        assert_eq!(material.material_hash, 0x6a79c245);
+        assert_eq!(material.properties[0].property_type, PropertyType::FloatB);
+        assert!(
+            matches!(material.properties[0].value, Some(PropertyValue::Float(v)) if (v - 0.5).abs() < f32::EPSILON)
+        );
+    }
 }
