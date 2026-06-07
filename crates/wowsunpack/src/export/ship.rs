@@ -1768,6 +1768,7 @@ impl ShipModelContext {
         // Bake base albedo textures into per-vertex colors.
         // Cache decoded images by MFM path to avoid re-loading the same texture.
         let mut texture_cache: HashMap<String, Option<image_dds::image::RgbaImage>> = HashMap::new();
+        let self_id_index = db.build_self_id_index();
 
         for mesh in &mut result {
             let mfm_path = match &mesh.mfm_path {
@@ -1778,8 +1779,14 @@ impl ShipModelContext {
                 continue;
             }
 
+            let material_mfm_path_id = mesh.material_mfm_path_id;
             let image = texture_cache.entry(mfm_path.clone()).or_insert_with(|| {
-                let dds_bytes = texture::load_base_albedo_bytes(&self.vfs, &mfm_path, None)?;
+                let dds_bytes = if material_mfm_path_id != 0 {
+                    texture::load_mfm_bound_albedo_bytes(&self.vfs, &db, &self_id_index, material_mfm_path_id, None)
+                } else {
+                    None
+                }
+                .or_else(|| texture::load_base_albedo_bytes(&self.vfs, &mfm_path, None))?;
                 let dds = image_dds::ddsfile::Dds::read(&mut Cursor::new(&dds_bytes)).ok()?;
                 image_dds::image_from_dds(&dds, 0).ok()
             });
@@ -2172,10 +2179,12 @@ impl ShipModelContext {
 
             // Merge material-based camo textures (mat_Steel, mat_Yamato_KoF, etc.).
             if !self.mat_camo_schemes.is_empty() {
-                let stems: Vec<String> = {
-                    let mut s = HashSet::new();
+                let stem_categories: Vec<(String, &'static str)> = {
+                    let mut s = HashMap::new();
                     for info in &all_mfm_infos {
-                        s.insert(info.stem.clone());
+                        s.entry(info.stem.clone()).or_insert_with(|| {
+                            camouflage::classify_material_or_part_category(Some(&info.material_identifier), &info.stem)
+                        });
                     }
                     s.into_iter().collect()
                 };
@@ -2219,16 +2228,15 @@ impl ShipModelContext {
 
                     if let Some(png) = png_bytes {
                         let mut scheme_textures = HashMap::new();
-                        for stem in &stems {
+                        for (stem, _) in &stem_categories {
                             scheme_textures.insert(stem.clone(), png.clone());
                         }
                         let scheme_idx = tex_set.camo_schemes.len();
                         tex_set.camo_schemes.push((scheme.display_name.clone(), scheme_textures));
                         if scheme.tiled {
                             // Store per-stem UV transforms for this tiled scheme.
-                            for stem in &stems {
-                                let cat = camouflage::classify_part_category(stem);
-                                if let Some(xform) = scheme.uv_transforms.get(cat) {
+                            for (stem, cat) in &stem_categories {
+                                if let Some(xform) = scheme.uv_transforms.get(*cat) {
                                     tex_set.tiled_uv_transforms.insert(
                                         (scheme_idx, stem.clone()),
                                         [xform.scale[0], xform.scale[1], xform.offset[0], xform.offset[1]],
@@ -2670,6 +2678,7 @@ pub struct MfmInfo {
     pub stem: String,
     pub full_path: String,
     pub material_mfm_path_id: u64,
+    pub material_identifier: String,
 }
 
 /// Collect MFM stems and full paths from a visual's render sets.
@@ -2690,7 +2699,14 @@ pub fn collect_mfm_info(visual: &VisualPrototype, db: &PrototypeDatabase<'_>) ->
 
         if seen.insert(stem.to_string()) {
             let full_path = db.reconstruct_path(path_idx, &self_id_index);
-            result.push(MfmInfo { stem: stem.to_string(), full_path, material_mfm_path_id: rs.material_mfm_path_id });
+            let material_identifier =
+                db.strings.get_string_by_id(rs.material_name_id).map(|s| s.to_string()).unwrap_or_default();
+            result.push(MfmInfo {
+                stem: stem.to_string(),
+                full_path,
+                material_mfm_path_id: rs.material_mfm_path_id,
+                material_identifier,
+            });
         }
     }
 
@@ -2736,7 +2752,20 @@ pub fn build_texture_set(
 
     // Load base albedo textures.
     for info in &unique_infos {
-        if let Some(dds_bytes) = texture::load_base_albedo_bytes(vfs, &info.full_path, raw_dds_dumper.as_mut()) {
+        let dds_bytes = if info.material_mfm_path_id != 0 {
+            texture::load_mfm_bound_albedo_bytes(
+                vfs,
+                db,
+                &self_id_index,
+                info.material_mfm_path_id,
+                raw_dds_dumper.as_mut(),
+            )
+        } else {
+            None
+        }
+        .or_else(|| texture::load_base_albedo_bytes(vfs, &info.full_path, raw_dds_dumper.as_mut()));
+
+        if let Some(dds_bytes) = dds_bytes {
             match texture::dds_to_png(&dds_bytes) {
                 Ok(png_bytes) => {
                     base.insert(info.stem.clone(), png_bytes);

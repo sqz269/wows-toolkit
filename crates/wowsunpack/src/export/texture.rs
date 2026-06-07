@@ -704,6 +704,47 @@ fn load_texture_by_hash(
     None
 }
 
+/// Load the authoritatively-bound albedo-like DDS from a parsed MFM.
+///
+/// Map props often use generic render-set material names (`PBSLD`,
+/// `TILEDLAND_OD_NS`) while the actual diffuse texture is only recoverable
+/// from the MFM's texture-hash property bag. Keep `ODMap` last: TILEDLAND
+/// materials normally need baking from atlas+blend data, but when that path is
+/// unavailable an authored overlay/diffuse map is still a better fallback than
+/// a white material.
+fn load_mfm_bound_albedo_bytes_from_material(
+    mat: &MaterialPrototype,
+    vfs: &vfs::VfsPath,
+    db: &PrototypeDatabase<'_>,
+    self_id_index: &HashMap<u64, usize>,
+    mut raw_dds_dumper: Option<&mut RawDdsDumper>,
+) -> Option<Vec<u8>> {
+    for property in ["diffuseMap", "g_albedoMap", "imageTexture", "ODMap"] {
+        if let Some(hash) = mat.get_texture_hash(property) {
+            if let Some(bytes) = load_texture_by_hash(vfs, db, self_id_index, hash, raw_dds_dumper.as_deref_mut()) {
+                return Some(bytes);
+            }
+        }
+    }
+    None
+}
+
+/// Load the MFM's explicitly-bound base albedo/diffuse texture.
+///
+/// This is the preferred path whenever `assets.bin` is available. Filename
+/// heuristics in [`load_base_albedo_bytes`] should be treated as a fallback
+/// for no-database contexts or older callers that only have an MFM path.
+pub fn load_mfm_bound_albedo_bytes(
+    vfs: &vfs::VfsPath,
+    db: &PrototypeDatabase<'_>,
+    self_id_index: &HashMap<u64, usize>,
+    mfm_path_id: u64,
+    raw_dds_dumper: Option<&mut RawDdsDumper>,
+) -> Option<Vec<u8>> {
+    let mat = parse_mfm_from_db(db, mfm_path_id)?;
+    load_mfm_bound_albedo_bytes_from_material(&mat, vfs, db, self_id_index, raw_dds_dumper)
+}
+
 /// Parse an MFM material from assets.bin given its selfId (material_mfm_path_id).
 ///
 /// Returns the parsed material if the MFM is found and parses successfully.
@@ -1599,7 +1640,21 @@ pub fn load_or_bake_albedo_with_alpha(
         if let Some(png) = bake_tiledland_albedo(mat, vfs, db, idx, max_size) {
             return Some((png, alpha_state));
         }
-        eprintln!("    Warning: TILEDLAND bake failed, falling back to filename lookup");
+        eprintln!("    Warning: TILEDLAND bake failed, falling back to MFM binding / filename lookup");
+    }
+
+    // Prefer the source MFM's explicit texture binding over basename guesses.
+    // This fixes map-local props whose MFM stem is not the texture stem
+    // (e.g. `OSV055.mfm` -> `diffuseMap=OSV055_Sistov_a.dds`) and TILEDLAND
+    // variants whose usable OD map is only reliable via the property hash.
+    if let Some(mat) = &parsed_mat
+        && let Some(db) = db
+        && let Some(idx) = self_id_index
+        && let Some(dds_bytes) = load_mfm_bound_albedo_bytes_from_material(mat, vfs, db, idx, None)
+    {
+        let mut png = dds_to_png_resized(&dds_bytes, max_size).ok()?;
+        force_png_opaque(&mut png);
+        return Some((png, alpha_state));
     }
 
     // Fall back to simple filename-based lookup (works for standard PBS materials).

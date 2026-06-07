@@ -4509,6 +4509,11 @@ pub struct InteractiveHullMesh {
     pub indices: Vec<u32>,
     /// Full VFS path to the .mfm material file (for texture lookup).
     pub mfm_path: Option<String>,
+    /// Raw selfId for the source MFM in assets.bin. Prefer this over
+    /// `mfm_path` for texture lookup because the MFM property bag carries
+    /// authoritative texture hashes.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub material_mfm_path_id: u64,
     /// Baked per-vertex colors from albedo texture (same length as positions, or empty for fallback).
     pub colors: Vec<[f32; 4]>,
     /// Optional world-space transform (column-major 4x4) for turret mounts.
@@ -4656,6 +4661,7 @@ pub fn collect_hull_meshes(
             uvs: verts.uvs,
             indices,
             mfm_path,
+            material_mfm_path_id: rs.material_mfm_path_id,
             colors: Vec::new(),
             transform: None,
         });

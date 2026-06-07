@@ -51,6 +51,53 @@ pub struct CamouflageEntry {
     pub ship_groups: Vec<String>,
 }
 
+fn material_identifier_category(material_identifier: &str) -> Option<&'static str> {
+    let lower = material_identifier.to_ascii_lowercase();
+    let normalized = lower.replace("deck_house", "deckhouse");
+
+    // Prefer WG's render-set material vocabulary when present. These names
+    // are closer to the engine's camo category selection than model stems.
+    if normalized.contains("deckhouse") {
+        return Some("deckhouse");
+    }
+    if normalized.contains("bulge") {
+        return Some("bulge");
+    }
+    if normalized.contains("director") {
+        return Some("director");
+    }
+    if normalized.contains("plane") {
+        return Some("plane");
+    }
+    if normalized.contains("float") {
+        return Some("float");
+    }
+    if normalized.contains("misc") {
+        return Some("misc");
+    }
+    if normalized.contains("gun") {
+        return Some("gun");
+    }
+    if normalized.contains("wire") {
+        return Some("wire");
+    }
+    if normalized.contains("hull") || normalized.contains("tile") {
+        return Some("tile");
+    }
+
+    None
+}
+
+/// Classify a material/MFM pair into a camouflage part category.
+pub fn classify_material_or_part_category(material_identifier: Option<&str>, mfm_stem: &str) -> &'static str {
+    if let Some(material_identifier) = material_identifier
+        && let Some(category) = material_identifier_category(material_identifier)
+    {
+        return category;
+    }
+    classify_part_category(mfm_stem)
+}
+
 /// Classify an MFM stem into a camouflage part category.
 ///
 /// The camouflages.xml UV section uses categories like Tile (=hull), DeckHouse,
