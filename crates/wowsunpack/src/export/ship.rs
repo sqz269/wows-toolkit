@@ -2024,10 +2024,10 @@ impl ShipModelContext {
     /// own `.mfm` (e.g. Bow.mfm vs MidFront.mfm) and may bind different
     /// texture stems.
     ///
-    /// Output shape (schema_version 1):
+    /// Output shape (schema_version 2):
     /// ```json
     /// {
-    ///   "schema_version": 1,
+    ///   "schema_version": 2,
     ///   "ship": { "model_dir": "...", "param_index": "...", ... },
     ///   "pipeline": { "toolkit_version": "...", "generated_at": "..." },
     ///   "materials": [
@@ -2049,16 +2049,27 @@ impl ShipModelContext {
     ///         "normalMap": { ... },
     ///         "metallicGlossMap": { ... },
     ///         "ambientOcclusionMap": { ... }
-    ///       }
+    ///       },
+    ///       "floats":  { "emissivePower": 0.3, "g_detailScaleU": 32.0 },
+    ///       "ints":    { "emissionAnimationMode": 1 },
+    ///       "bools":   { "doubleSided": false },
+    ///       "vectors": { "maskSpeed": [0.4, 1.0, 1.0, 1.0] }
     ///     }
     ///   ]
     /// }
     /// ```
     ///
+    /// Each property is bucketed by its decoded value type: `textures`
+    /// (resolved DDS stem/path), `floats` (FloatA/FloatB scalars),
+    /// `ints` (Int32), `bools`, and `vectors` (vec2/vec3/vec4/mat4 as
+    /// JSON float arrays — length disambiguates). v1 emitted only
+    /// `textures` + `floats`, silently dropping the rest. All sections
+    /// are always present (possibly empty); read with `.get(..)` defaults.
+    ///
     /// Texture properties whose hash doesn't resolve (rare; would
     /// indicate a stale assets.bin index) are silently skipped.
     /// Properties named only by hash (i.e. not in the toolkit's
-    /// 174-entry property name dictionary) surface with a hex slot
+    /// property name dictionary) surface with a hex slot
     /// name like `0xa1b2c3d4` so consumers don't lose data.
     #[cfg(feature = "json")]
     pub fn write_material_mappings_json(&self, path: &Path) -> Result<(), Report> {
@@ -2078,7 +2089,11 @@ impl ShipModelContext {
         let toolkit_version = env!("CARGO_PKG_VERSION");
 
         let manifest = json!({
-            "schema_version": 1,
+            // v2 (2026-06-16): per-material `ints` / `bools` / `vectors`
+            // sections added alongside `floats` / `textures` (int/bool/vector
+            // props were previously dropped). Additive — consumers read with
+            // `.get(..)` defaults, so older readers stay valid.
+            "schema_version": 2,
             "ship": {
                 "model_dir":    self.info.model_dir,
                 "display_name": self.info.display_name,
@@ -2512,7 +2527,6 @@ pub fn build_material_entries_for_visual(
     self_id_index: &HashMap<u64, usize>,
     sub_model: &str,
 ) -> Vec<serde_json::Value> {
-    use crate::models::material::PropertyType;
     use crate::models::material::PropertyValue;
     use serde_json::json;
 
@@ -2562,26 +2576,33 @@ pub fn build_material_entries_for_visual(
 
         let mut textures_obj = serde_json::Map::new();
         let mut floats_obj = serde_json::Map::new();
+        let mut ints_obj = serde_json::Map::new();
+        let mut bools_obj = serde_json::Map::new();
+        let mut vectors_obj = serde_json::Map::new();
         for prop in &mat.properties {
-            match prop.property_type {
-                PropertyType::Texture => {
-                    let hash = match &prop.value {
-                        Some(PropertyValue::Texture(h)) if *h != 0 => *h,
-                        _ => continue,
-                    };
+            // Resolved property name; falls back to the raw name-hash for
+            // properties not in the toolkit's built-in dictionary.
+            let prop_name = match prop.name {
+                Some(n) => n.to_string(),
+                None => format!("0x{:08x}", prop.name_hash),
+            };
+            // Bucket by the decoded value's type. Previously only textures
+            // and floats were surfaced; int / bool / vector params were
+            // silently dropped, losing shader-mode selectors and colour
+            // vectors (e.g. the emissive shader's `emissionAnimationMode`,
+            // `maskColor1/2`, `maskSpeed`). A null-pointer property (value
+            // `None`) carries no data and is skipped.
+            match &prop.value {
+                // Texture slots resolve the bound DDS VFS path via the hash.
+                Some(PropertyValue::Texture(h)) if *h != 0 => {
+                    let hash = *h;
                     let Some(&tex_idx) = self_id_index.get(&hash) else {
                         continue;
                     };
                     let vfs_path = db.reconstruct_path(tex_idx, self_id_index);
                     let (stem, channel) = derive_texture_stem_and_channel(&vfs_path);
-
-                    let slot_name = match prop.name {
-                        Some(n) => n.to_string(),
-                        None => format!("0x{:08x}", prop.name_hash),
-                    };
-
                     textures_obj.insert(
-                        slot_name,
+                        prop_name,
                         json!({
                             "stem":     stem,
                             "channel":  channel,
@@ -2590,20 +2611,38 @@ pub fn build_material_entries_for_visual(
                         }),
                     );
                 }
-                // Capture float scalars too — the engine reads
-                // `g_detailNormalInfluence`, `g_detailScaleU`, etc. as
-                // per-material blend params for the detail-map normal
-                // layer (PBS_ship_metallic chunk012:43-74). Downstream
-                // pipeline consumers (sidecar emit) pull these out
-                // alongside the texture references.
-                PropertyType::FloatA | PropertyType::FloatB => {
-                    if let Some(PropertyValue::Float(v)) = prop.value {
-                        let name = match prop.name {
-                            Some(n) => n.to_string(),
-                            None => format!("0x{:08x}", prop.name_hash),
-                        };
-                        floats_obj.insert(name, json!(v));
-                    }
+                // Float scalars — detail-map blend params
+                // (`g_detailNormalInfluence`, `g_detailScaleU`, … per
+                // PBS_ship_metallic chunk012:43-74) plus the emissive
+                // shader's `emissivePower` / `animEmissionPower` /
+                // `maskSmooth`.
+                Some(PropertyValue::Float(v)) => {
+                    floats_obj.insert(prop_name, json!(v));
+                }
+                // Int scalars — shader-mode selectors such as the emissive
+                // shader's `emissionAnimationMode` / `emissionColorMode`.
+                Some(PropertyValue::Int32(v)) => {
+                    ints_obj.insert(prop_name, json!(v));
+                }
+                // Bool flags (`doubleSided`, …).
+                Some(PropertyValue::Bool(v)) => {
+                    bools_obj.insert(prop_name, json!(v));
+                }
+                // Vector params serialise as JSON float arrays (the array
+                // length distinguishes vec2 / vec3 / vec4 / mat4). Covers
+                // the emissive shader's `maskColor1` / `maskColor2` /
+                // `maskSpeed` / `animScale`.
+                Some(PropertyValue::Vec2(v)) => {
+                    vectors_obj.insert(prop_name, json!(v.to_vec()));
+                }
+                Some(PropertyValue::Vec3(v)) => {
+                    vectors_obj.insert(prop_name, json!(v.to_vec()));
+                }
+                Some(PropertyValue::Vec4(v)) => {
+                    vectors_obj.insert(prop_name, json!(v.to_vec()));
+                }
+                Some(PropertyValue::Matrix4x4(v)) => {
+                    vectors_obj.insert(prop_name, json!(v.to_vec()));
                 }
                 _ => {}
             }
@@ -2619,6 +2658,9 @@ pub fn build_material_entries_for_visual(
             "skinned":             rs.skinned,
             "textures":            textures_obj,
             "floats":              floats_obj,
+            "ints":                ints_obj,
+            "bools":               bools_obj,
+            "vectors":             vectors_obj,
         }));
     }
 
@@ -2649,7 +2691,9 @@ pub fn write_model_material_mappings_json(
     let toolkit_version = env!("CARGO_PKG_VERSION");
 
     let manifest = json!({
-        "schema_version": 1,
+        // v2: see `write_material_mappings_json` — adds per-material
+        // `ints` / `bools` / `vectors` sections. Additive.
+        "schema_version": 2,
         "model": {
             "geometry_path": geometry_vfs_path,
             "visual_path":   visual_vfs_path,

@@ -390,7 +390,7 @@ pub fn murmur3_32(key: &[u8], seed: u32) -> u32 {
     h1
 }
 
-/// Build the default property name lookup table (174 known names).
+/// Build the default property name lookup table (176 known names).
 pub fn build_property_name_table() -> HashMap<u32, &'static str> {
     let names: &[&str] = &[
         "AHArray",
@@ -423,7 +423,9 @@ pub fn build_property_name_table() -> HashMap<u32, &'static str> {
         "directLightShadowMap",
         "distortMap",
         "doubleSided",
+        "emissionAnimationMode",
         "emissionColor",
+        "emissionColorMode",
         "emissivePower",
         "enableForegroundFoil",
         "enableHolographic",
@@ -676,11 +678,14 @@ mod tests {
     #[test]
     fn test_property_name_table_completeness() {
         let table = build_property_name_table();
-        // All 174 names should be present with unique hashes
-        assert_eq!(table.len(), 174);
+        // All 176 names should be present with unique hashes
+        assert_eq!(table.len(), 176);
         // Spot check a few
         assert_eq!(table[&0x820f0280], "diffuseMap");
         assert_eq!(table[&0x4858745d], "normalMap");
         assert_eq!(table[&0x0f6cd1d5], "AHArray");
+        // Emissive shader mode selectors (added 2026-06-16).
+        assert_eq!(table[&0x7456bf8d], "emissionAnimationMode");
+        assert_eq!(table[&0x6fd0fcd3], "emissionColorMode");
     }
 }
