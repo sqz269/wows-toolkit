@@ -103,6 +103,10 @@ pub fn export_glb(
     texture_set: &TextureSet,
     damaged: bool,
     all_render_sets: bool,
+    // Per-mount splash-box AABBs from the model's sibling `.splash` (secondary
+    // / AA / torpedo per-gun hit volumes). Emitted as a "Hitboxes" group, like
+    // the hull export. Empty for the ~most accessories that ship no `.splash`.
+    hitboxes: &[Hitbox],
     tex_out: &mut TextureOutput,
     writer: &mut impl Write,
 ) -> Result<(), Report<ExportError>> {
@@ -288,6 +292,41 @@ pub fn export_glb(
             // bake a `BoneFrameFixY180` wrapper above the bones; the muzzle + visual
             // live in it, so this scene-root Armor sibling needs the same RIG_Y180 or
             // it renders 180° about Y off the turret. `None` for non-baked turrets.
+            matrix: armor_y180,
+            ..Default::default()
+        });
+        scene_nodes.push(parent);
+    }
+
+    // Hitboxes: per-mount splash-box AABBs (the model's sibling `.splash`)
+    // emitted as named cube meshes under a "Hitboxes" group — mirroring the
+    // hull export and the "Armor" group above. Like Armor, the accessory has no
+    // ship/HP context, so the raw box names (the engine's SplashMeshGun gives
+    // them a `_<gunID>` suffix) are preserved verbatim; the consumer joins boxes
+    // → mount by the placement's hp_name/asset_id. Shares the Armor group's
+    // RIG_Y180 frame so it tracks Z-mirror guns. No-op when `hitboxes` is empty.
+    let mut hitbox_nodes: Vec<json::Index<json::Node>> = Vec::new();
+    for hb in hitboxes {
+        let gltf_prim = add_hitbox_primitive_to_root(&mut root, &mut bin_data, hb)?;
+        let mesh = root.push(json::Mesh {
+            primitives: vec![gltf_prim],
+            weights: None,
+            name: Some(hb.name.clone()),
+            extensions: Default::default(),
+            extras: Default::default(),
+        });
+        let node = root.push(json::Node {
+            mesh: Some(mesh),
+            name: Some(hb.name.clone()),
+            matrix: None,
+            ..Default::default()
+        });
+        hitbox_nodes.push(node);
+    }
+    if !hitbox_nodes.is_empty() {
+        let parent = root.push(json::Node {
+            children: Some(hitbox_nodes),
+            name: Some("Hitboxes".to_string()),
             matrix: armor_y180,
             ..Default::default()
         });

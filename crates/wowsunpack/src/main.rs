@@ -2168,6 +2168,20 @@ fn export_one_model(
             std::fs::create_dir_all(parent).ok();
         }
         let mut out_file = std::fs::File::create(output).context("Failed to create output file")?;
+
+        // Per-mount splash hitboxes: the model's sibling `.splash` (if any)
+        // carries named AABBs — the secondary/AA/torpedo per-gun hit volumes the
+        // engine loads via SplashMeshGun. Main-turret barbette boxes live in the
+        // hull `.splash` instead, so this is empty for most accessories. Optional:
+        // a missing or unparseable `.splash` yields no Hitboxes group (no error).
+        let hitboxes: Vec<gltf_export::Hitbox> = file_str
+            .strip_suffix(".geometry")
+            .map(|stem| format!("{stem}.splash"))
+            .and_then(|sp| read_file_data(Path::new(&sp), no_vfs, Some(vfs)).ok())
+            .and_then(|bytes| geometry::parse_splash_file(&bytes).ok())
+            .map(|boxes| boxes.iter().map(gltf_export::hitbox_from_splash).collect())
+            .unwrap_or_default();
+
         gltf_export::export_glb(
             vp,
             &geom,
@@ -2176,6 +2190,7 @@ fn export_one_model(
             &texture_set,
             damaged,
             all_render_sets,
+            &hitboxes,
             &mut tex_out,
             &mut out_file,
         )
