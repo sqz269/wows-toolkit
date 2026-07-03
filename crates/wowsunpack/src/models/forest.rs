@@ -37,9 +37,14 @@
 //! root parser `FUN_140fe2240` → per-layer parser `FUN_140fe24c0`. Layer
 //! label strings live at `.rdata` `0x14251c690ff`.
 //!
-//! We parse only the highest-detail **LOD 0** instances (Layer[0] = Primary).
-//! Underwater layers are decoded by the engine but typically absent on
-//! battle maps; the file shape supports them via Layer[2..4].
+//! All four layers parse with the identical record shape (verified across
+//! all 70 non-empty corpus files + the engine's literal 4-name loop; see
+//! reference/maps/grounding_2026_07_03/vegetation_tint_layers.md).
+//! Semantics: Primary/PrimaryRare = above-water (y >= 0); Underwater/
+//! UnderwaterRare = algae (y <= 0). "Rare" layers are decimated
+//! far-density companions of their base layer (an exact copy on small
+//! maps, ~45-55% thinned on large) — consumers should draw base OR rare
+//! per distance, never both additively.
 
 use rootcause::Report;
 use thiserror::Error;
@@ -74,13 +79,16 @@ pub struct ForestInstance {
     pub z: f32,
 }
 
-/// Parsed `forest.bin` file (LOD 0 only).
+/// Layer names in file order (engine-fixed).
+pub const LAYER_NAMES: [&str; 4] = ["Primary", "PrimaryRare", "Underwater", "UnderwaterRare"];
+
+/// Parsed `forest.bin` file — all four placement layers.
 #[derive(Debug)]
 pub struct Forest {
-    /// SpeedTree species asset paths (`.stsdk` files).
+    /// SpeedTree species asset paths (`.stsdk` files), shared by all layers.
     pub species: Vec<String>,
-    /// LOD 0 vegetation instances with species assignment.
-    pub instances: Vec<ForestInstance>,
+    /// Per-layer vegetation instances, indexed per [`LAYER_NAMES`].
+    pub layers: [Vec<ForestInstance>; 4],
 }
 
 /// Parse a single string table entry: `(u64 len, i64 relptr)`.
@@ -106,17 +114,16 @@ fn parse_raw_instance(input: &mut &[u8]) -> WResult<RawInstance> {
 }
 
 // Layer offsets in the file (4 layers, 0x90 bytes each, starting at 0x10).
-// Layer[0] = "Primary" = LOD-0 above-water placements (what we consume here).
 // Cell[0] inside each layer holds the per-species (u32 start, u32 count) table.
 const LAYER_BASE: usize = 0x10;
-const _LAYER_STRIDE: usize = 0x90;
+const LAYER_STRIDE: usize = 0x90;
 const CELL_OFFSET_IN_LAYER: usize = 0x10;
 
-/// Read Layer[0] ("Primary") from the engine-defined fixed offset.
+/// Read one layer struct from its engine-defined fixed offset.
 ///
 /// Returns `(instance_data_abs_offset, instance_count, per_species_ranges)`.
 ///
-/// The previous implementation byte-grepped for a
+/// The original implementation byte-grepped for a
 /// `(num_species, 0, num_species, 1)` marker, which failed on 70/70
 /// non-empty corpus files (the marker hits a false positive in 1/82 and
 /// never matches the real table location). Engine ground truth from
@@ -124,8 +131,12 @@ const CELL_OFFSET_IN_LAYER: usize = 0x10;
 /// a fixed offset (`layer_base + 0x10`) inside the 0x90-byte layer
 /// struct, and the instance buffer pointer lives at the layer base
 /// itself.
-fn read_primary_layer(data: &[u8], num_species: usize) -> Result<(usize, usize, Vec<(usize, usize)>), ForestError> {
-    let layer_off = LAYER_BASE;
+fn read_layer(
+    data: &[u8],
+    layer_idx: usize,
+    num_species: usize,
+) -> Result<(usize, usize, Vec<(usize, usize)>), ForestError> {
+    let layer_off = LAYER_BASE + layer_idx * LAYER_STRIDE;
     let cell_off = layer_off + CELL_OFFSET_IN_LAYER;
     let need = cell_off + num_species * 8;
     if data.len() < need {
@@ -153,10 +164,63 @@ fn read_primary_layer(data: &[u8], num_species: usize) -> Result<(usize, usize, 
     Ok((buf_abs, buf_count, ranges))
 }
 
-/// Parse a `forest.bin` file.
-///
-/// Returns only LOD 0 (highest detail) instances, with species indices assigned
-/// from the per-species instance table in the file header.
+/// Parse one layer's instances using its per-species (start, count) table.
+fn parse_layer_instances(
+    file_data: &[u8],
+    layer_idx: usize,
+    num_species: usize,
+) -> Result<Vec<ForestInstance>, Report<ForestError>> {
+    let (instances_abs, layer_total, species_table) =
+        read_layer(file_data, layer_idx, num_species).map_err(Report::new)?;
+    if layer_total == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Sanity: the per-species count sums should equal the layer's
+    // buffer_count. Diverges on malformed files; warn but trust the ranges.
+    let sum: usize = species_table.iter().map(|(_, c)| *c).sum();
+    if sum != layer_total {
+        eprintln!(
+            "Warning: forest.bin layer {} per-species sum ({sum}) != layer count ({layer_total}); using per-species ranges",
+            LAYER_NAMES[layer_idx],
+        );
+    }
+
+    let bytes_needed = layer_total * INSTANCE_SIZE;
+    if instances_abs + bytes_needed > file_data.len() {
+        return Err(Report::new(ForestError::DataTooShort {
+            offset: instances_abs,
+            need: bytes_needed,
+            have: file_data.len().saturating_sub(instances_abs),
+        }));
+    }
+    let input = &mut &file_data[instances_abs..instances_abs + bytes_needed];
+    let raw_instances: Vec<RawInstance> = repeat(layer_total, parse_raw_instance)
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(ForestError::ParseError(format!("{e}"))))?;
+
+    let mut instances = Vec::with_capacity(layer_total);
+    for (sp_idx, &(start, count)) in species_table.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let end = start + count;
+        if end > raw_instances.len() {
+            eprintln!(
+                "Warning: forest layer {} species {sp_idx} range {start}..{end} exceeds instance count {}",
+                LAYER_NAMES[layer_idx],
+                raw_instances.len(),
+            );
+            continue;
+        }
+        for raw in &raw_instances[start..end] {
+            instances.push(ForestInstance { species_index: sp_idx, x: raw.x, y: raw.y, z: raw.z });
+        }
+    }
+    Ok(instances)
+}
+
+/// Parse a `forest.bin` file — species table + all four placement layers.
 pub fn parse_forest(file_data: &[u8]) -> Result<Forest, Report<ForestError>> {
     if file_data.len() < 32 {
         return Err(Report::new(ForestError::DataTooShort { offset: 0, need: 32, have: file_data.len() }));
@@ -174,7 +238,7 @@ pub fn parse_forest(file_data: &[u8]) -> Result<Forest, Report<ForestError>> {
         as usize;
 
     if num_species == 0 {
-        return Ok(Forest { species: Vec::new(), instances: Vec::new() });
+        return Ok(Forest { species: Vec::new(), layers: Default::default() });
     }
     if num_species > 1000 {
         return Err(Report::new(ForestError::ParseError(format!("unreasonable species count: {num_species}"))));
@@ -214,57 +278,15 @@ pub fn parse_forest(file_data: &[u8]) -> Result<Forest, Report<ForestError>> {
         species.push(name);
     }
 
-    // Read Layer[0] (Primary = LOD-0 above-water) directly from its
-    // fixed engine-defined offset. The instance buffer pointer + count +
-    // per-species (start, count) table all live inside this layer; no
-    // byte-grep heuristic needed. See `read_primary_layer` and the
-    // module docstring for the layer layout.
-    let (instances_abs, lod0_total, species_table) = read_primary_layer(file_data, num_species).map_err(Report::new)?;
+    // Read all four layers from their fixed engine-defined offsets. Each
+    // layer carries its own instance buffer pointer + count + per-species
+    // (start, count) table; no byte-grep heuristic needed.
+    let layers = [
+        parse_layer_instances(file_data, 0, num_species)?,
+        parse_layer_instances(file_data, 1, num_species)?,
+        parse_layer_instances(file_data, 2, num_species)?,
+        parse_layer_instances(file_data, 3, num_species)?,
+    ];
 
-    // Sanity: the per-species count sums should equal Layer[0].buffer_count.
-    // Diverges on malformed files; warn but trust the per-species ranges.
-    let sum: usize = species_table.iter().map(|(_, c)| *c).sum();
-    if sum != lod0_total {
-        eprintln!(
-            "Warning: forest.bin per-species sum ({sum}) != layer count ({lod0_total}); using per-species ranges"
-        );
-    }
-
-    // Parse raw instance data for Layer[0].
-    let bytes_needed = lod0_total * INSTANCE_SIZE;
-    if lod0_total == 0 {
-        return Ok(Forest { species, instances: Vec::new() });
-    }
-    if instances_abs + bytes_needed > file_data.len() {
-        return Err(Report::new(ForestError::DataTooShort {
-            offset: instances_abs,
-            need: bytes_needed,
-            have: file_data.len().saturating_sub(instances_abs),
-        }));
-    }
-    let input = &mut &file_data[instances_abs..instances_abs + bytes_needed];
-    let raw_instances: Vec<RawInstance> = repeat(lod0_total, parse_raw_instance)
-        .parse_next(input)
-        .map_err(|e: ErrMode<ContextError>| Report::new(ForestError::ParseError(format!("{e}"))))?;
-
-    // Build output instances using the per-species (start, count) table.
-    let mut instances = Vec::with_capacity(lod0_total);
-    for (sp_idx, &(start, count)) in species_table.iter().enumerate() {
-        if count == 0 {
-            continue;
-        }
-        let end = start + count;
-        if end > raw_instances.len() {
-            eprintln!(
-                "Warning: forest species {sp_idx} range {start}..{end} exceeds instance count {}",
-                raw_instances.len()
-            );
-            continue;
-        }
-        for raw in &raw_instances[start..end] {
-            instances.push(ForestInstance { species_index: sp_idx, x: raw.x, y: raw.y, z: raw.z });
-        }
-    }
-
-    Ok(Forest { species, instances })
+    Ok(Forest { species, layers })
 }

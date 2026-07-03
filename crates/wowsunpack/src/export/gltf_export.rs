@@ -647,7 +647,7 @@ pub struct MapScene {
     pub fog: Option<SpaceFog>,
     /// GPU-instanced vegetation: `(mesh_idx, positions)` per species.
     /// Exported as `EXT_mesh_gpu_instancing` nodes (one node per species).
-    pub vegetation_instances: Vec<(usize, Vec<[f32; 3]>)>,
+    pub vegetation_instances: Vec<(usize, usize, Vec<[f32; 3]>)>,
     /// Engine ObstacleInstance placements from `space.bin`'s obstacles[] sub-array.
     pub obstacles: Vec<MapObstacleInstance>,
     /// Engine ParticleInstance placements from `space.bin`'s particles[] sub-array.
@@ -676,6 +676,10 @@ pub struct MapScene {
     /// the `weathers` scene-extras array. First entry = the unnamed
     /// base/default block.
     pub weathers: Option<serde_json::Value>,
+    /// Index into [`MapScene::textures`] of the decoded vegetation tint map,
+    /// referenced by the `vegetation_tint` scene extras. Texture order is
+    /// preserved into the GLB, so this equals the glTF texture index.
+    pub vegetation_tint_texture: Option<usize>,
 }
 
 /// Shoreline signed-distance-field sidecar description.
@@ -724,11 +728,15 @@ pub struct VegetationSpecies {
     pub albedo_png: Option<Vec<u8>>,
 }
 
-/// Vegetation data: species meshes + positioned instances.
+/// Vegetation data: species meshes + positioned instances per forest layer.
 pub struct VegetationData {
     pub species: Vec<VegetationSpecies>,
-    /// `(species_index, world_position [x, y, z])` per instance.
-    pub instances: Vec<(usize, [f32; 3])>,
+    /// Per-layer `(species_index, world_position [x, y, z])` instances,
+    /// indexed per [`crate::models::forest::LAYER_NAMES`] (Primary /
+    /// PrimaryRare / Underwater / UnderwaterRare). "Rare" layers are
+    /// far-density companions of their base layer — consumers draw base OR
+    /// rare per distance, never both additively.
+    pub layers: [Vec<(usize, [f32; 3])>; 4],
 }
 
 /// Build a complete map scene from parsed data.
@@ -753,6 +761,11 @@ pub struct BuildMapSceneParams<'a> {
     pub vegetation_density: f32,
     pub shoreline: Option<ShorelineData>,
     pub weathers: Option<serde_json::Value>,
+    /// Decoded `forest_tintmap.dds` as PNG (RGB = per-location vegetation
+    /// tint multiplied into SpeedTree albedo; A = terrain-correlated AO
+    /// term). `None` when the map's ubersettings binds `<forestTintMap>`
+    /// to null (vegetation renders untinted).
+    pub vegetation_tint_png: Option<Vec<u8>>,
 }
 
 pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Report<ExportError>> {
@@ -771,6 +784,7 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         vegetation_density,
         ref shoreline,
         ref weathers,
+        ref vegetation_tint_png,
     } = *params;
     let self_id_index = db.map(|db| db.build_self_id_index());
 
@@ -919,7 +933,8 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
 
     // Build model instances from space.bin transforms.
     let mut model_instances: Vec<MapModelInstance> = Vec::new();
-    let mut vegetation_instances: Vec<(usize, Vec<[f32; 3]>)> = Vec::new();
+    // `(mesh_idx, forest_layer_idx, positions)` per species×layer group.
+    let mut vegetation_instances: Vec<(usize, usize, Vec<[f32; 3]>)> = Vec::new();
     // Dye application: tint materials dedup by tint .mfm selfId. Baking goes
     // through the SAME texture_cache as regular primitives, so a tint .mfm
     // that some undyed model already uses shares its texture.
@@ -1133,52 +1148,66 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
             species_mesh_ranges.push(Some(mesh_idx));
         }
 
-        // Group instances by species, with optional grid-based decimation.
+        // Group instances by (layer, species), with optional grid-based
+        // decimation (applied independently per layer — decimating Primary
+        // against PrimaryRare cells would punch holes in both).
         let num_species = veg.species.len();
-        let mut per_species: Vec<Vec<[f32; 3]>> = vec![Vec::new(); num_species];
         let mut kept = 0usize;
+        let mut total = 0usize;
 
-        if vegetation_density > 0.0 {
-            let inv_cell = 1.0 / vegetation_density;
-            let mut occupied: HashSet<(usize, i32, i32)> = HashSet::new();
-            for &(sp_idx, [x, y, z]) in &veg.instances {
-                if species_mesh_ranges.get(sp_idx).and_then(|v| *v).is_none() {
-                    continue;
+        for (layer_idx, layer) in veg.layers.iter().enumerate() {
+            total += layer.len();
+            let mut per_species: Vec<Vec<[f32; 3]>> = vec![Vec::new(); num_species];
+            if vegetation_density > 0.0 {
+                let inv_cell = 1.0 / vegetation_density;
+                let mut occupied: HashSet<(usize, i32, i32)> = HashSet::new();
+                for &(sp_idx, [x, y, z]) in layer {
+                    if species_mesh_ranges.get(sp_idx).and_then(|v| *v).is_none() {
+                        continue;
+                    }
+                    let cx = (x * inv_cell).floor() as i32;
+                    let cz = (z * inv_cell).floor() as i32;
+                    if !occupied.insert((sp_idx, cx, cz)) {
+                        continue;
+                    }
+                    per_species[sp_idx].push([x, y, -z]);
+                    kept += 1;
                 }
-                let cx = (x * inv_cell).floor() as i32;
-                let cz = (z * inv_cell).floor() as i32;
-                if !occupied.insert((sp_idx, cx, cz)) {
-                    continue;
+            } else {
+                for &(sp_idx, [x, y, z]) in layer {
+                    if species_mesh_ranges.get(sp_idx).and_then(|v| *v).is_none() {
+                        continue;
+                    }
+                    per_species[sp_idx].push([x, y, -z]);
+                    kept += 1;
                 }
-                per_species[sp_idx].push([x, y, -z]);
-                kept += 1;
             }
-        } else {
-            for &(sp_idx, [x, y, z]) in &veg.instances {
-                if species_mesh_ranges.get(sp_idx).and_then(|v| *v).is_none() {
-                    continue;
-                }
-                per_species[sp_idx].push([x, y, -z]);
-                kept += 1;
-            }
-        }
 
-        // Collect into vegetation_instances (mesh_idx, positions) per species.
-        for (sp_idx, positions) in per_species.into_iter().enumerate() {
-            if positions.is_empty() {
-                continue;
-            }
-            if let Some(Some(mesh_idx)) = species_mesh_ranges.get(sp_idx) {
-                vegetation_instances.push((*mesh_idx, positions));
+            for (sp_idx, positions) in per_species.into_iter().enumerate() {
+                if positions.is_empty() {
+                    continue;
+                }
+                if let Some(Some(mesh_idx)) = species_mesh_ranges.get(sp_idx) {
+                    vegetation_instances.push((*mesh_idx, layer_idx, positions));
+                }
             }
         }
 
         eprintln!(
-            "  Vegetation: {} species, {} instances (kept {kept}, cell {vegetation_density}m)",
+            "  Vegetation: {} species, {total} instances across {} layers (kept {kept}, cell {vegetation_density}m)",
             veg.species.len(),
-            veg.instances.len(),
+            veg.layers.iter().filter(|l| !l.is_empty()).count(),
         );
     }
+
+    // Embed the vegetation tint map as a plain texture (no material
+    // references it; the `vegetation_tint` scene extras name it by index
+    // and consumers sample it per instance at world XZ).
+    let vegetation_tint_texture = vegetation_tint_png.as_ref().map(|png| {
+        let idx = textures.len();
+        textures.push(png.clone());
+        idx
+    });
 
     let tex_tried = texture_cache.len();
     let tex_loaded = textures.len();
@@ -1361,6 +1390,7 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         dyed_materials,
         shoreline: shoreline.clone(),
         weathers: weathers.clone(),
+        vegetation_tint_texture,
     })
 }
 
@@ -1642,6 +1672,7 @@ fn build_scene_extras(
     user_objects: &[crate::models::merged_models::SpaceUserObject],
     shoreline: Option<&ShorelineData>,
     weathers: Option<&serde_json::Value>,
+    vegetation_tint_texture: Option<usize>,
 ) -> json::extras::Extras {
     let obstacles: Vec<_> = obstacles
         .iter()
@@ -1824,10 +1855,20 @@ fn build_scene_extras(
             "params": s.params.iter().cloned().collect::<std::collections::BTreeMap<String, f32>>(),
         })),
         // Per-weather-preset environment blocks (fog/wind/sun/sun_disk/
-        // sky_dome/pbs/spherical_harmonics/hdr_environment), first = base.
-        // The legacy top-level `fog` above stays as the base block's fog
-        // for backward compatibility.
+        // sky_dome/pbs/spherical_harmonics/hdr_environment/forest), first =
+        // base. The legacy top-level `fog` above stays as the base block's
+        // fog for backward compatibility.
         "weathers": weathers,
+        // Vegetation tint map (glTF texture index; RGB tint × SpeedTree
+        // albedo, A = AO term whose exact shader math is still open).
+        // World-XZ mapping over `bounds`: u = (x−min_x)/span_x,
+        // v = (max_z−z)/span_z (minimap/North-up frame, same as the
+        // shoreline SDF; medium confidence — grounded visually on
+        // s06_Atoll's tint-blob constellation).
+        "vegetation_tint": vegetation_tint_texture.map(|t| serde_json::json!({
+            "texture": t,
+            "v_origin": "max_z",
+        })),
     });
     serde_json::value::to_raw_value(&value).ok().map(Box::from)
 }
@@ -2233,10 +2274,11 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
     {
         root.extensions_used.push("EXT_mesh_gpu_instancing".to_string());
     }
-    for (mesh_idx, positions) in &scene.vegetation_instances {
+    for (mesh_idx, layer_idx, positions) in &scene.vegetation_instances {
         if positions.is_empty() {
             continue;
         }
+        let layer_name = crate::models::forest::LAYER_NAMES.get(*layer_idx).copied().unwrap_or("Unknown");
 
         let gltf_mesh = if let Some(&cached) = gltf_mesh_cache.get(mesh_idx) {
             cached
@@ -2247,8 +2289,12 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
             m
         };
 
-        let translation_accessor =
-            append_vec3_accessor(&mut root, &mut bin_data, positions, Some(format!("Tree_{mesh_idx}_translations")));
+        let translation_accessor = append_vec3_accessor(
+            &mut root,
+            &mut bin_data,
+            positions,
+            Some(format!("Tree_{mesh_idx}_{layer_name}_translations")),
+        );
 
         let mut attributes = serde_json::Map::new();
         attributes.insert("TRANSLATION".to_string(), serde_json::json!(translation_accessor.value()));
@@ -2259,12 +2305,16 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
         let mut others = serde_json::Map::new();
         others.insert("EXT_mesh_gpu_instancing".to_string(), serde_json::Value::Object(instancing));
 
+        // `vegetation_layer` semantics: Primary/Underwater = full-density
+        // base sets; *Rare = the engine's decimated far-density companions.
+        // Consumers should draw base OR rare per distance, never both.
         let node = root.push(json::Node {
             mesh: Some(gltf_mesh),
-            name: Some(format!("Tree_{mesh_idx}_instances")),
+            name: Some(format!("Tree_{mesh_idx}_{layer_name}_instances")),
             extensions: Some(json::extensions::scene::Node { others, ..Default::default() }),
             extras: serde_json::value::to_raw_value(&serde_json::json!({
                 "vegetation_species_mesh": mesh_idx,
+                "vegetation_layer": layer_name,
                 "instance_count": positions.len(),
             }))
             .ok()
@@ -2307,6 +2357,7 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
         &scene.user_objects,
         scene.shoreline.as_ref(),
         scene.weathers.as_ref(),
+        scene.vegetation_tint_texture,
     );
     let gltf_scene = root.push(json::Scene {
         nodes: scene_nodes,

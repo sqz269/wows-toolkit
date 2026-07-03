@@ -2702,6 +2702,7 @@ fn parse_weather_blocks(xml: &str) -> Option<serde_json::Value> {
             ("pbs", "PBS"),
             ("spherical_harmonics", "SphericalHarmonics"),
             ("hdr_environment", "Environment"),
+            ("forest", "Forest"),
         ] {
             if let Some(node) = section(tag) {
                 let map = leaves(node);
@@ -2713,6 +2714,16 @@ fn parse_weather_blocks(xml: &str) -> Option<serde_json::Value> {
         weathers.push(Value::Object(obj));
     }
     if weathers.is_empty() { None } else { Some(Value::Array(weathers)) }
+}
+
+/// Parse the `<forestTintMap>` binding from `space.ubersettings`
+/// (`<General><settings>`). Returns `None` when unset or authored "null".
+fn parse_forest_tint_map_path(xml: &str) -> Option<String> {
+    let doc = roxmltree::Document::parse(xml).ok()?;
+    let node = doc.descendants().find(|n| n.has_tag_name("forestTintMap"))?;
+    let value = node.descendants().find(|n| n.has_tag_name("value"))?;
+    let path = value.text()?.trim();
+    if path.is_empty() || path == "null" { None } else { Some(path.to_string()) }
 }
 
 /// Parse the `<Shoreline>` block scalars from `space.ubersettings` XML
@@ -2978,11 +2989,12 @@ fn run_export_map(
         match read_file_data(&forest_path, no_vfs, vfs) {
             Ok(data) => match forest::parse_forest(&data) {
                 Ok(forest_data) => {
-                    println!(
-                        "  Forest: {} species, {} instances",
-                        forest_data.species.len(),
-                        forest_data.instances.len()
-                    );
+                    let layer_counts: Vec<String> = forest::LAYER_NAMES
+                        .iter()
+                        .zip(forest_data.layers.iter())
+                        .map(|(n, l)| format!("{n}={}", l.len()))
+                        .collect();
+                    println!("  Forest: {} species, layers: {}", forest_data.species.len(), layer_counts.join(" "));
 
                     let mut species_list = Vec::new();
                     for species_path in &forest_data.species {
@@ -3028,13 +3040,11 @@ fn run_export_map(
                         }
                     }
 
-                    let instances: Vec<(usize, [f32; 3])> = forest_data
-                        .instances
-                        .iter()
-                        .map(|inst| (inst.species_index, [inst.x, inst.y, inst.z]))
-                        .collect();
+                    let layers: [Vec<(usize, [f32; 3])>; 4] = forest_data.layers.map(|layer| {
+                        layer.iter().map(|inst| (inst.species_index, [inst.x, inst.y, inst.z])).collect()
+                    });
 
-                    Some(gltf_export::VegetationData { species: species_list, instances })
+                    Some(gltf_export::VegetationData { species: species_list, layers })
                 }
                 Err(e) => {
                     eprintln!("Warning: could not parse forest.bin: {e}");
@@ -3096,6 +3106,32 @@ fn run_export_map(
         Some(gltf_export::ShorelineData { dist_file, dir_file, width: w, height: h, params })
     })();
 
+    // 8c. Vegetation tint map: binding authority is ubersettings
+    // <forestTintMap> (a path, or "null" on ~10 maps whose vegetation
+    // renders untinted) — NOT file presence. Decode to PNG and embed; the
+    // `vegetation_tint` scene extras name it by texture index.
+    let vegetation_tint_png: Option<Vec<u8>> = if !no_textures && !no_vegetation {
+        uber_xml
+            .as_deref()
+            .and_then(parse_forest_tint_map_path)
+            .and_then(|path| {
+                let leaf = path.rsplit('/').next().unwrap_or(&path).to_string();
+                read_file_data(&space_file(space_dir, &leaf, no_vfs), no_vfs, vfs).ok()
+            })
+            .and_then(|dds| match texture::dds_to_png(&dds) {
+                Ok(png) => {
+                    println!("  Vegetation tint map decoded");
+                    Some(png)
+                }
+                Err(e) => {
+                    eprintln!("Warning: forest_tintmap decode failed: {e}");
+                    None
+                }
+            })
+    } else {
+        None
+    };
+
     // 9. Build the format-agnostic MapScene.
     let vfs_for_textures = if no_textures { None } else { vfs };
     let scene = gltf_export::build_map_scene(&gltf_export::BuildMapSceneParams {
@@ -3113,6 +3149,7 @@ fn run_export_map(
         vegetation_density,
         shoreline,
         weathers: uber_xml.as_deref().and_then(parse_weather_blocks),
+        vegetation_tint_png,
     })
     .context("Failed to build map scene")?;
 
