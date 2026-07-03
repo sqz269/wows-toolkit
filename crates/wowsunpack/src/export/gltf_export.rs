@@ -430,8 +430,15 @@ pub struct TerrainConfig<'a> {
     /// Sea level height. Terrain vertices below this are clamped; fully
     /// submerged cells are culled to avoid ugly seabed through translucent water.
     pub sea_level: f32,
-    /// VFS path to the lightmap shadow DDS, if available (e.g. from space.ubersettings).
-    pub lightmap_path: Option<String>,
+    /// Raw `lightmap_shadow.dds` bytes (the deduplicated 16×16-block lightmap
+    /// atlas), when available.
+    pub lightmap_shadow_dds: Option<Vec<u8>>,
+    /// Raw `lightMapIndirection.dds` bytes (BGRA8 page table: R/G = atlas
+    /// block XY, one pixel per space block), when available.
+    pub lightmap_indirection_dds: Option<Vec<u8>>,
+    /// Output texels per lightmap block edge for the baked shading texture
+    /// (1..=16; block = 3.125 m). 4 ≈ 0.78 m/texel.
+    pub lightmap_texels_per_block: u32,
 }
 
 /// Configuration for water plane generation.
@@ -659,6 +666,41 @@ pub struct MapScene {
     /// Tint materials baked for per-instance dye application, referenced by
     /// [`MapModelInstance::dyes_resolved`].
     pub dyed_materials: Vec<MapDyedMaterial>,
+    /// Shoreline SDF sidecar metadata (files written next to the GLB by the
+    /// export driver), when the map ships the `sdf_dist.dds`/`sdf_dir.dds`
+    /// pair. `None` for the 55/82 maps that never baked it.
+    pub shoreline: Option<ShorelineData>,
+    /// Per-weather-preset environment blocks parsed from
+    /// `space.ubersettings` (fog, wind, sun, sun disk, sky dome asset paths,
+    /// PBS cubemapsPath + packed SH, HDR environment), emitted verbatim as
+    /// the `weathers` scene-extras array. First entry = the unnamed
+    /// base/default block.
+    pub weathers: Option<serde_json::Value>,
+}
+
+/// Shoreline signed-distance-field sidecar description.
+///
+/// The engine's `shoreline_gen.fx` pass (gated on `IsSpaceSdfExists`) samples
+/// the pair at each water texel's world XZ to fade + orient shore foam and
+/// shore-wave deformation. See
+/// `reference/maps/grounding_2026_07_03/shoreline_sdf.md` for the byte-level
+/// grounding (formats, registration proof, calibration fit).
+#[derive(Clone)]
+pub struct ShorelineData {
+    /// Grayscale PNG filename (relative to the GLB) for the decoded
+    /// `sdf_dist.dds`: unsigned distance to shore, 0 on land, non-linear
+    /// texel-space encoding (`texels ≈ (value / 42.6)^4.17`).
+    pub dist_file: String,
+    /// Grayscale PNG filename for `sdf_dir.dds`: bearing toward the nearest
+    /// shore, `theta = value / 255 * 2π`, texture-space direction
+    /// `(sin θ, −cos θ)` in (u, v) points toward land. 0 on land.
+    pub dir_file: String,
+    pub width: u32,
+    pub height: u32,
+    /// `<Shoreline>` block scalars from `space.ubersettings` `<Sea>` (base
+    /// weather block), authored order — 1:1 with the `shoreline*` shader
+    /// constants (`maxShoreDist` is in metres).
+    pub params: Vec<(String, f32)>,
 }
 
 /// Cache key for deduplicating map materials by visual parameters.
@@ -709,6 +751,8 @@ pub struct BuildMapSceneParams<'a> {
     pub max_texture_size: Option<u32>,
     pub vegetation: Option<&'a VegetationData>,
     pub vegetation_density: f32,
+    pub shoreline: Option<ShorelineData>,
+    pub weathers: Option<serde_json::Value>,
 }
 
 pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Report<ExportError>> {
@@ -725,6 +769,8 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         max_texture_size,
         vegetation,
         vegetation_density,
+        ref shoreline,
+        ref weathers,
     } = *params;
     let self_id_index = db.map(|db| db.build_self_id_index());
 
@@ -1020,22 +1066,35 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         }
     }
 
-    // Generate terrain mesh. We DON'T use `lightmap_shadow.dds` as the
-    // terrain albedo — empirically (Okinawa, verified by both
-    // `image_dds` and Pillow) the RGB channels of that DDS decode to
-    // striped non-albedo noise (likely a packed cascade-shadow / detail-
-    // blend mask the engine combines with separate tiled detail textures
-    // from `terrain.bin`'s RLE region). Feeding that through the GLB as
-    // a baseColorTexture produces a yellow/orange/red checkerboard
-    // pattern that doesn't resemble any real terrain.
-    //
-    // Until terrain.bin RLE detail decoding lands (audit doc § "Terrain
-    // detail RLE"), the terrain mesh renders with the default
-    // `generate_terrain_mesh` brown color. The lightmap *could* be
-    // usefully consumed as a luminance multiplier once we have a real
-    // albedo to multiply against — leaving the path in place behind a
-    // comment so a future pass knows the file exists.
-    let terrain = env.terrain.as_ref().map(generate_terrain_mesh);
+    // Generate terrain mesh, with the baked lightmap as its shading
+    // texture. `lightmap_shadow.dds` is a deduplicated 16×16-block atlas —
+    // NOT a spatial image (raw viewing yields "striped noise") — that
+    // de-atlases through `lightMapIndirection.dds` into a spatial sun-
+    // shadow / sky-AO map (grounding_2026_07_03/terrain_detail_stack.md;
+    // reconstruction registers pixel-perfect to minimap.png). WoWS ships
+    // no terrain splat/detail-texture system: the engine shades terrain
+    // with exactly this baked lightmap over a base material, so baking
+    // R(sun)×G(sky) over the flat base color reproduces the engine model.
+    let terrain = env.terrain.as_ref().map(|cfg| {
+        let mut mesh = generate_terrain_mesh(cfg);
+        if let (Some(shadow), Some(indirection)) = (&cfg.lightmap_shadow_dds, &cfg.lightmap_indirection_dds) {
+            // Terrain UV rows run min_z→max_z; the indirection's rows run
+            // the opposite way (its reconstruction matches minimap.png,
+            // which is flipped vs the raw heightmap row order) → flip.
+            match texture::bake_terrain_lightmap(shadow, indirection, cfg.lightmap_texels_per_block, true) {
+                Ok(png) => {
+                    let idx = textures.len();
+                    textures.push(png);
+                    mesh.albedo_texture = Some(idx);
+                    // Keep the earthy base tint: the textured material path
+                    // multiplies baseColorFactor × the grayscale bake.
+                    eprintln!("  Terrain lightmap baked ({}x per block)", cfg.lightmap_texels_per_block.clamp(1, 16));
+                }
+                Err(e) => eprintln!("Warning: terrain lightmap bake failed: {e}"),
+            }
+        }
+        mesh
+    });
 
     // Generate water plane.
     let water = env.water.as_ref().map(generate_water_mesh);
@@ -1300,6 +1359,8 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         probes,
         user_objects,
         dyed_materials,
+        shoreline: shoreline.clone(),
+        weathers: weathers.clone(),
     })
 }
 
@@ -1579,6 +1640,8 @@ fn build_scene_extras(
     point_lights: &[crate::models::merged_models::SpacePointLight],
     probes: &[crate::models::merged_models::SpaceProbe],
     user_objects: &[crate::models::merged_models::SpaceUserObject],
+    shoreline: Option<&ShorelineData>,
+    weathers: Option<&serde_json::Value>,
 ) -> json::extras::Extras {
     let obstacles: Vec<_> = obstacles
         .iter()
@@ -1743,6 +1806,28 @@ fn build_scene_extras(
         "lights": lights,
         "probes": probes,
         "user_objects": user_objects,
+        // Shoreline SDF sidecar: PNG pair written next to the GLB. Sampling
+        // contract (see ShorelineData docs + the grounding doc):
+        //   u = (worldX - min_x) / (max_x - min_x)
+        //   v = (max_z - worldZ) / (max_z - min_z)   [row 0 = max_z, i.e.
+        //       minimap / North-up orientation, flipped vs terrain rows]
+        //   dist texels ≈ (value / 42.6)^4.17, texel = span / width metres
+        //   dir theta = value / 255 * 2π; (sin θ, −cos θ) in (u,v) → toward shore
+        "shoreline": shoreline.map(|s| serde_json::json!({
+            "dist_file": s.dist_file,
+            "dir_file": s.dir_file,
+            "width": s.width,
+            "height": s.height,
+            "v_origin": "max_z",
+            "dist_value_to_texels": { "scale": 42.6, "exponent": 4.17 },
+            "dir_encoding": "theta = value/255*2pi; (sin,−cos) in (u,v) points toward shore; 0 on land",
+            "params": s.params.iter().cloned().collect::<std::collections::BTreeMap<String, f32>>(),
+        })),
+        // Per-weather-preset environment blocks (fog/wind/sun/sun_disk/
+        // sky_dome/pbs/spherical_harmonics/hdr_environment), first = base.
+        // The legacy top-level `fog` above stays as the base block's fog
+        // for backward compatibility.
+        "weathers": weathers,
     });
     serde_json::value::to_raw_value(&value).ok().map(Box::from)
 }
@@ -2220,6 +2305,8 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
         &scene.point_lights,
         &scene.probes,
         &scene.user_objects,
+        scene.shoreline.as_ref(),
+        scene.weathers.as_ref(),
     );
     let gltf_scene = root.push(json::Scene {
         nodes: scene_nodes,
@@ -2515,7 +2602,11 @@ fn get_or_create_map_material(
                         extensions: Default::default(),
                         extras: Default::default(),
                     }),
-                    base_color_factor: json::material::PbrBaseColorFactor([1.0, 1.0, 1.0, 1.0]),
+                    // The factor multiplies the texture — [1,1,1,1] for
+                    // regular textured prims; the terrain bake passes its
+                    // earthy base tint here so tint × grayscale lightmap
+                    // shades the mesh.
+                    base_color_factor: json::material::PbrBaseColorFactor(base_color),
                     metallic_factor: json::material::StrengthFactor(0.0),
                     roughness_factor: json::material::StrengthFactor(1.0),
                     ..Default::default()

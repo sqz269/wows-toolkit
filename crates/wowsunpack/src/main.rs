@@ -481,6 +481,12 @@ enum Commands {
         #[arg(long)]
         max_texture_size: Option<u32>,
 
+        /// Baked terrain-lightmap density: output texels per 3.125 m lightmap
+        /// block edge (1..=16). 4 ≈ 0.78 m/texel; 16 = full atlas fidelity
+        /// (very large on battle maps).
+        #[arg(long, default_value = "4")]
+        lightmap_density: u32,
+
         /// Write a map-level collision manifest sidecar.
         ///
         /// The manifest includes obstacle placements, collision-model table
@@ -1533,6 +1539,7 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
             vegetation_density,
             no_textures,
             max_texture_size,
+            lightmap_density,
             collision_manifest_json,
         } => {
             run_export_map(
@@ -1548,6 +1555,7 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
                 vegetation_density,
                 no_textures,
                 max_texture_size,
+                lightmap_density,
                 collision_manifest_json.as_deref(),
             )?;
         }
@@ -2636,13 +2644,99 @@ fn parse_space_bounds(xml: &str) -> Option<gltf_export::SpaceBounds> {
     })
 }
 
-/// Extract the lightmap shadow DDS path from space.ubersettings XML.
-fn parse_lightmap_path(xml: &str) -> Option<String> {
+/// Parse every `<Weather>` block from `space.ubersettings` into a JSON array
+/// for scene extras.
+///
+/// Weather blocks are keyed by their `user_name` attribute (weather PRESET
+/// names — Cloudy / Evening / Storm / …, matched by the `_Name` suffix of
+/// `weathers*.xml` `<param>` entries); the first block carries no attribute
+/// and is the base/default. Counts are variable (3–6 per map) — the older
+/// "4 fog blocks = morning/noon/evening/night" reading was wrong. Each block
+/// carries its own Fog, Wind, Sun, SunDisk, SkyDome, PBS (IBL cubemapsPath +
+/// packed SH), and HDR Environment sections. See
+/// reference/maps/grounding_2026_07_03/weather_sky_tod.md.
+fn parse_weather_blocks(xml: &str) -> Option<serde_json::Value> {
+    use serde_json::Value;
     let doc = roxmltree::Document::parse(xml).ok()?;
-    let node = doc.descendants().find(|n| n.has_tag_name("lightMapShadow"))?;
-    let value = node.descendants().find(|n| n.has_tag_name("value"))?;
-    let path = value.text()?.trim();
-    if path.is_empty() || path == "null" { None } else { Some(path.to_string()) }
+
+    // Collect a section's leaf `<key><value>` pairs (inside its <settings>
+    // child when present). Values parse as f32 / [f32; N] / raw string.
+    fn leaves(node: roxmltree::Node) -> serde_json::Map<String, Value> {
+        let mut out = serde_json::Map::new();
+        let scope = node.children().find(|c| c.has_tag_name("settings")).unwrap_or(node);
+        for child in scope.children().filter(|c| c.is_element()) {
+            let Some(value) = child.children().find(|n| n.has_tag_name("value")) else {
+                continue;
+            };
+            let Some(text) = value.text() else {
+                continue;
+            };
+            let text = text.trim();
+            if text.is_empty() || text == "null" {
+                continue;
+            }
+            let parts: Vec<&str> = text.split_whitespace().collect();
+            let nums: Vec<f32> = parts.iter().filter_map(|s| s.parse().ok()).collect();
+            let v = if !nums.is_empty() && nums.len() == parts.len() {
+                if nums.len() == 1 { serde_json::json!(nums[0]) } else { serde_json::json!(nums) }
+            } else {
+                serde_json::json!(text)
+            };
+            out.insert(child.tag_name().name().to_string(), v);
+        }
+        out
+    }
+
+    let mut weathers = Vec::new();
+    for w in doc.descendants().filter(|n| n.has_tag_name("Weather")) {
+        let name = w.attribute("user_name").unwrap_or("Default").to_string();
+        let mut obj = serde_json::Map::new();
+        obj.insert("name".to_string(), serde_json::json!(name));
+        let section = |tag: &str| w.descendants().find(|n| n.has_tag_name(tag));
+        for (key, tag) in [
+            ("fog", "Fog"),
+            ("wind", "Wind"),
+            ("sun", "Sun"),
+            ("sun_disk", "SunDisk"),
+            ("sky_dome", "SkyDome"),
+            ("pbs", "PBS"),
+            ("spherical_harmonics", "SphericalHarmonics"),
+            ("hdr_environment", "Environment"),
+        ] {
+            if let Some(node) = section(tag) {
+                let map = leaves(node);
+                if !map.is_empty() {
+                    obj.insert(key.to_string(), Value::Object(map));
+                }
+            }
+        }
+        weathers.push(Value::Object(obj));
+    }
+    if weathers.is_empty() { None } else { Some(Value::Array(weathers)) }
+}
+
+/// Parse the `<Shoreline>` block scalars from `space.ubersettings` XML
+/// (base weather block — the first `<Shoreline>` in document order). These
+/// map 1:1 onto the engine's `shoreline*` shader constants; `maxShoreDist`
+/// is in metres.
+fn parse_shoreline_params(xml: &str) -> Vec<(String, f32)> {
+    let Ok(doc) = roxmltree::Document::parse(xml) else {
+        return Vec::new();
+    };
+    let Some(block) = doc.descendants().find(|n| n.has_tag_name("Shoreline")) else {
+        return Vec::new();
+    };
+    let scope = block.children().find(|c| c.has_tag_name("settings")).unwrap_or(block);
+    let mut params = Vec::new();
+    for child in scope.children().filter(|c| c.is_element()) {
+        let Some(value) = child.children().find(|n| n.has_tag_name("value")) else {
+            continue;
+        };
+        if let Some(v) = value.text().and_then(|t| t.trim().parse::<f32>().ok()) {
+            params.push((child.tag_name().name().to_string(), v));
+        }
+    }
+    params
 }
 
 /// Parse atmospheric fog + farPlane from space.ubersettings XML.
@@ -2693,6 +2787,7 @@ fn run_export_map(
     vegetation_density: f32,
     no_textures: bool,
     max_texture_size: Option<u32>,
+    lightmap_density: u32,
     collision_manifest_json: Option<&Path>,
 ) -> Result<(), Report> {
     use wowsunpack::export::gltf_export;
@@ -2814,8 +2909,21 @@ fn run_export_map(
         let uber_path = space_file(space_dir, "space.ubersettings", no_vfs);
         read_file_data(&uber_path, no_vfs, vfs).ok().map(|d| String::from_utf8_lossy(&d).into_owned())
     };
-    let lightmap_path =
-        if !no_textures && !no_terrain { uber_xml.as_deref().and_then(parse_lightmap_path) } else { None };
+    // The lightmap is shipped as a per-map pair: the dedup block atlas
+    // (`lightmap_shadow.dds`) + its page table (`lightMapIndirection.dds`).
+    // Both live in the space dir; ubersettings also names them, but the
+    // filenames are fixed in practice — load directly.
+    let (lightmap_shadow_dds, lightmap_indirection_dds) = if !no_textures && !no_terrain {
+        let shadow = read_file_data(&space_file(space_dir, "lightmap_shadow.dds", no_vfs), no_vfs, vfs).ok();
+        let indirection =
+            read_file_data(&space_file(space_dir, "lightMapIndirection.dds", no_vfs), no_vfs, vfs).ok();
+        if shadow.is_none() || indirection.is_none() {
+            eprintln!("  Terrain lightmap pair not found; terrain renders untextured.");
+        }
+        (shadow, indirection)
+    } else {
+        (None, None)
+    };
     let fog = uber_xml.as_deref().and_then(parse_space_fog);
     if let Some(f) = &fog {
         eprintln!(
@@ -2857,7 +2965,9 @@ fn run_export_map(
         bounds: &bounds,
         step: terrain_step,
         sea_level,
-        lightmap_path: lightmap_path.clone(),
+        lightmap_shadow_dds: lightmap_shadow_dds.clone(),
+        lightmap_indirection_dds: lightmap_indirection_dds.clone(),
+        lightmap_texels_per_block: lightmap_density,
     });
     let water_cfg = if !no_water { Some(gltf_export::WaterConfig { bounds: &bounds, sea_level }) } else { None };
     let env = gltf_export::MapEnvironment { terrain: terrain_cfg, water: water_cfg };
@@ -2940,6 +3050,52 @@ fn run_export_map(
         None
     };
 
+    // 8b. Shoreline SDF pair: decode to grayscale PNG sidecars next to the
+    // GLB + emit sampling metadata in scene extras. Shipped on 27/82 maps
+    // (one map capitalizes the filenames); the engine gates its shore-foam
+    // pass on the pair's presence, so absence is normal.
+    let shoreline: Option<gltf_export::ShorelineData> = (|| {
+        let load_either = |lower: &str, upper: &str| {
+            read_file_data(&space_file(space_dir, lower, no_vfs), no_vfs, vfs)
+                .or_else(|_| read_file_data(&space_file(space_dir, upper, no_vfs), no_vfs, vfs))
+                .ok()
+        };
+        let dist_dds = load_either("sdf_dist.dds", "Sdf_dist.dds")?;
+        let dir_dds = load_either("sdf_dir.dds", "Sdf_dir.dds")?;
+        let (dist_png, w, h) = match texture::dds_to_gray_png(&dist_dds) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Warning: sdf_dist decode failed: {e}");
+                return None;
+            }
+        };
+        let (dir_png, dw, dh) = match texture::dds_to_gray_png(&dir_dds) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Warning: sdf_dir decode failed: {e}");
+                return None;
+            }
+        };
+        if (dw, dh) != (w, h) {
+            eprintln!("Warning: sdf pair dimension mismatch ({w}x{h} vs {dw}x{dh}); skipping");
+            return None;
+        }
+        let out_dir = output.parent().unwrap_or_else(|| Path::new("."));
+        let dist_file = "sdf_dist.png".to_string();
+        let dir_file = "sdf_dir.png".to_string();
+        if let Err(e) = std::fs::write(out_dir.join(&dist_file), &dist_png) {
+            eprintln!("Warning: failed to write {dist_file}: {e}");
+            return None;
+        }
+        if let Err(e) = std::fs::write(out_dir.join(&dir_file), &dir_png) {
+            eprintln!("Warning: failed to write {dir_file}: {e}");
+            return None;
+        }
+        let params = uber_xml.as_deref().map(parse_shoreline_params).unwrap_or_default();
+        println!("  Shoreline SDF: {w}x{h} pair decoded ({} params)", params.len());
+        Some(gltf_export::ShorelineData { dist_file, dir_file, width: w, height: h, params })
+    })();
+
     // 9. Build the format-agnostic MapScene.
     let vfs_for_textures = if no_textures { None } else { vfs };
     let scene = gltf_export::build_map_scene(&gltf_export::BuildMapSceneParams {
@@ -2955,6 +3111,8 @@ fn run_export_map(
         max_texture_size,
         vegetation: vegetation_data.as_ref(),
         vegetation_density,
+        shoreline,
+        weathers: uber_xml.as_deref().and_then(parse_weather_blocks),
     })
     .context("Failed to build map scene")?;
 

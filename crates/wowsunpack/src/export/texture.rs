@@ -135,6 +135,116 @@ pub fn dds_to_png_resized(dds_bytes: &[u8], max_size: Option<u32>) -> Result<Vec
     Ok(png_buf)
 }
 
+/// Bake the terrain lightmap into a spatial shading texture (PNG).
+///
+/// `lightmap_shadow.dds` is a DEDUPLICATED block atlas (16×16 texels per
+/// block), not a spatial image; `lightMapIndirection.dds` (uncompressed
+/// BGRA8, one pixel per space block) carries the de-atlas page table:
+/// R = atlas block X, G = atlas block Y. Reconstruction registers to the
+/// world with no flip relative to the indirection's row order (row → world
+/// Z, col → world X; verified against minimap.png — see
+/// reference/maps/grounding_2026_07_03/terrain_detail_stack.md).
+///
+/// Channel model (corroborated, exact shader math still open): R = sun
+/// visibility, G = sky visibility / AO. We bake `R×G` as a grayscale
+/// brightness multiplier. The value is a LINEAR light factor, so it's
+/// sRGB-encoded before writing since glTF samples baseColorTexture as sRGB.
+///
+/// `texels_per_block` (1..=16) picks output density: 16 = full atlas
+/// fidelity (huge — 9216² on Okinawa), 4 = 0.78 m/texel (default), 1 =
+/// one texel per 3.125 m block.
+///
+/// `flip_rows` flips the indirection row order into the terrain-UV frame
+/// (terrain rows run min_z→max_z; the indirection rows run the opposite
+/// way — see the grounding doc's registration section).
+pub fn bake_terrain_lightmap(
+    shadow_dds: &[u8],
+    indirection_dds: &[u8],
+    texels_per_block: u32,
+    flip_rows: bool,
+) -> Result<Vec<u8>, Report<TextureError>> {
+    let d = texels_per_block.clamp(1, 16);
+
+    let shadow = image_dds::ddsfile::Dds::read(&mut Cursor::new(shadow_dds))
+        .map_err(|e| Report::new(TextureError::DdsParse(format!("lightmap_shadow: {e}"))))?;
+    let shadow =
+        image_dds::image_from_dds(&shadow, 0).map_err(|e| Report::new(TextureError::DdsDecode(e.to_string())))?;
+    let indirection = image_dds::ddsfile::Dds::read(&mut Cursor::new(indirection_dds))
+        .map_err(|e| Report::new(TextureError::DdsParse(format!("lightMapIndirection: {e}"))))?;
+    let indirection = image_dds::image_from_dds(&indirection, 0)
+        .map_err(|e| Report::new(TextureError::DdsDecode(e.to_string())))?;
+
+    let blocks_x = indirection.width();
+    let blocks_y = indirection.height();
+    let atlas_blocks_x = shadow.width() / 16;
+    let atlas_blocks_y = shadow.height() / 16;
+    if blocks_x == 0 || blocks_y == 0 || atlas_blocks_x == 0 || atlas_blocks_y == 0 {
+        return Err(Report::new(TextureError::DdsDecode("degenerate lightmap dimensions".to_string())));
+    }
+
+    let out_w = blocks_x * d;
+    let out_h = blocks_y * d;
+    let shadow_raw = shadow.as_raw();
+    let ind_raw = indirection.as_raw();
+    let mut out = vec![0u8; (out_w * out_h * 4) as usize];
+
+    for by in 0..blocks_y {
+        let src_by = if flip_rows { blocks_y - 1 - by } else { by };
+        for bx in 0..blocks_x {
+            let ind_i = ((src_by * blocks_x + bx) * 4) as usize;
+            let ax = (ind_raw[ind_i] as u32).min(atlas_blocks_x - 1);
+            let ay = (ind_raw[ind_i + 1] as u32).min(atlas_blocks_y - 1);
+            for j in 0..d {
+                // Nearest-texel sample within the 16×16 atlas block.
+                let ty = (((j as f32 + 0.5) * 16.0 / d as f32) as u32).min(15);
+                for i in 0..d {
+                    let tx = (((i as f32 + 0.5) * 16.0 / d as f32) as u32).min(15);
+                    let si = (((ay * 16 + ty) * shadow.width() + ax * 16 + tx) * 4) as usize;
+                    let sun = shadow_raw[si] as f32 / 255.0;
+                    let sky = shadow_raw[si + 1] as f32 / 255.0;
+                    let linear = sun * sky;
+                    // linear → sRGB so the sRGB-decoded sample equals `linear`.
+                    let srgb = if linear <= 0.003_130_8 {
+                        linear * 12.92
+                    } else {
+                        1.055 * linear.powf(1.0 / 2.4) - 0.055
+                    };
+                    let v = (srgb * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                    let oi = (((by * d + j) * out_w + bx * d + i) * 4) as usize;
+                    out[oi] = v;
+                    out[oi + 1] = v;
+                    out[oi + 2] = v;
+                    out[oi + 3] = 255;
+                }
+            }
+        }
+    }
+
+    let mut png_buf = Vec::new();
+    PngEncoder::new(&mut png_buf)
+        .write_image(&out, out_w, out_h, ExtendedColorType::Rgba8)
+        .map_err(|e| Report::new(TextureError::PngEncode(e.to_string())))?;
+    Ok(png_buf)
+}
+
+/// Decode a single-channel DDS (BC4 / BC7-grayscale / R8) to an 8-bit
+/// grayscale PNG, returning `(png_bytes, width, height)`. Only the R channel
+/// of the decode is kept — the shoreline SDF pair stores one scalar per
+/// texel regardless of its on-disk container format.
+pub fn dds_to_gray_png(dds_bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), Report<TextureError>> {
+    let dds = image_dds::ddsfile::Dds::read(&mut Cursor::new(dds_bytes))
+        .map_err(|e| Report::new(TextureError::DdsParse(e.to_string())))?;
+    let rgba =
+        image_dds::image_from_dds(&dds, 0).map_err(|e| Report::new(TextureError::DdsDecode(e.to_string())))?;
+    let (w, h) = (rgba.width(), rgba.height());
+    let gray: Vec<u8> = rgba.as_raw().chunks_exact(4).map(|px| px[0]).collect();
+    let mut png_buf = Vec::new();
+    PngEncoder::new(&mut png_buf)
+        .write_image(&gray, w, h, ExtendedColorType::L8)
+        .map_err(|e| Report::new(TextureError::PngEncode(e.to_string())))?;
+    Ok((png_buf, w, h))
+}
+
 /// Decode DDS bytes to PNG bytes (RGBA8).
 pub fn dds_to_png(dds_bytes: &[u8]) -> Result<Vec<u8>, Report<TextureError>> {
     let dds = image_dds::ddsfile::Dds::read(&mut Cursor::new(dds_bytes))
