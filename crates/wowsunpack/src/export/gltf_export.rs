@@ -68,6 +68,8 @@ struct DecodedPrimitive {
     tangents: Vec<[f32; 4]>,
     indices: Vec<u32>,
     material_name: String,
+    /// Render-set material name string id — the dye-targeting key.
+    material_name_id: u32,
     /// MFM stem for texture lookup (e.g. "JSB039_Yamato_1945_Hull").
     mfm_stem: Option<String>,
     /// Full VFS path to the .mfm file (e.g. "content/location/.../textures/LBC001.mfm").
@@ -466,6 +468,11 @@ pub struct MapMesh {
     pub alpha_cutoff: Option<f32>,
     /// Double-sided face culling (alpha-cut foliage cards need this).
     pub double_sided: bool,
+    /// Render-set material name string id (`rs.material_name_id`). Dye
+    /// targeting compares this against `DyeEntry.replaces_id` to find the
+    /// primitives a dye re-skins. `0` for synthetic meshes (terrain, water,
+    /// vegetation).
+    pub material_name_id: u32,
 }
 
 /// A positioned model instance in the map.
@@ -508,6 +515,46 @@ pub struct MapModelInstance {
     pub material_instance_count: u8,
     /// Decoded 0x70-stride `MaterialInstancePrototype` overrides.
     pub material_instances: Vec<crate::models::material::MaterialPrototype>,
+    /// Dye pairs resolved against the prototype dye table: each entry names
+    /// the tint material baked into [`MapScene::dyed_materials`] and the
+    /// instance parts it re-skins. Empty when the instance has no dyes or
+    /// none resolved.
+    pub dyes_resolved: Vec<ResolvedDye>,
+}
+
+/// A per-instance dye selection resolved end-to-end: instance pair →
+/// prototype `DyeEntry` → tint material.
+pub struct ResolvedDye {
+    /// Matter (dye slot) string id from the instance pair.
+    pub matter_id: u32,
+    /// Selected tint name string id (the instance pair's second u32).
+    pub tint_name_id: u32,
+    /// The prototype dye's target material name id — primitives whose
+    /// render-set `material_name_id` equals this get re-skinned.
+    pub replaces_material_id: u32,
+    /// Indices within the instance's `mesh_range` (part order, matching the
+    /// exported `_part_{j}` child order) that the dye applies to.
+    pub target_parts: Vec<u32>,
+    /// Index into [`MapScene::dyed_materials`].
+    pub dyed_material: usize,
+}
+
+/// A tint material baked for dye application, shared across instances that
+/// select the same tint. Exported as an (unreferenced-by-primitives) glTF
+/// material; per-instance `dyes_resolved` extras name its material index.
+pub struct MapDyedMaterial {
+    /// Human-readable name (tint .mfm stem).
+    pub name: String,
+    /// Index into [`MapScene::textures`] for the albedo texture, if any.
+    pub albedo_texture: Option<usize>,
+    /// Base color factor (used when no texture). RGBA linear.
+    pub base_color: [f32; 4],
+    /// Alpha blending mode: false = opaque, true = blend.
+    pub alpha_blend: bool,
+    /// Alpha cutoff for mask mode.
+    pub alpha_cutoff: Option<f32>,
+    /// Double-sided face culling.
+    pub double_sided: bool,
 }
 
 /// A map-authored particle emitter anchor from `space.bin.particles[]`.
@@ -609,6 +656,9 @@ pub struct MapScene {
     pub probes: Vec<crate::models::merged_models::SpaceProbe>,
     /// Engine UserObjectInstance placements from `space.bin`'s userObjects[] sub-array.
     pub user_objects: Vec<crate::models::merged_models::SpaceUserObject>,
+    /// Tint materials baked for per-instance dye application, referenced by
+    /// [`MapModelInstance::dyes_resolved`].
+    pub dyed_materials: Vec<MapDyedMaterial>,
 }
 
 /// Cache key for deduplicating map materials by visual parameters.
@@ -809,6 +859,7 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                 alpha_blend: alpha_state.alpha_blend,
                 alpha_cutoff: alpha_state.alpha_cutoff,
                 double_sided: alpha_state.double_sided,
+                material_name_id: prim.material_name_id,
             });
         }
 
@@ -823,6 +874,12 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
     // Build model instances from space.bin transforms.
     let mut model_instances: Vec<MapModelInstance> = Vec::new();
     let mut vegetation_instances: Vec<(usize, Vec<[f32; 3]>)> = Vec::new();
+    // Dye application: tint materials dedup by tint .mfm selfId. Baking goes
+    // through the SAME texture_cache as regular primitives, so a tint .mfm
+    // that some undyed model already uses shares its texture.
+    let mut dyed_materials: Vec<MapDyedMaterial> = Vec::new();
+    let mut dyed_mat_by_selfid: HashMap<u64, Option<usize>> = HashMap::new();
+    let (mut dye_refs_total, mut dye_refs_resolved) = (0usize, 0usize);
     if let Some(space) = space {
         for inst in &space.instances {
             let Some(&model_idx) = path_to_model.get(&inst.path_id) else {
@@ -831,6 +888,88 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
             let range = &model_mesh_ranges[model_idx];
             if range.is_empty() {
                 continue;
+            }
+
+            // Resolve instance dye pairs {matter_id, tint_name_id} against the
+            // prototype dye table (models.bin inline DyeEntry records).
+            let mut dyes_resolved: Vec<ResolvedDye> = Vec::new();
+            for pair in &inst.model_dyes {
+                dye_refs_total += 1;
+                let record = &merged.models[model_idx];
+                let Some(dye) = record.model_proto.dyes.iter().find(|d| d.matter_id == pair.matter_id) else {
+                    continue;
+                };
+                let Some(tint_idx) = dye.tint_name_ids.iter().position(|&n| n == pair.replaces_id) else {
+                    continue;
+                };
+                let tint_selfid = dye.tint_material_ids[tint_idx];
+                let dyed_material = *dyed_mat_by_selfid.entry(tint_selfid).or_insert_with(|| {
+                    // selfId → full .mfm path via assets.bin, then bake albedo
+                    // + alpha state exactly like a regular primitive material.
+                    let idx_map = self_id_index.as_ref()?;
+                    let db = db?;
+                    let entry_idx = *idx_map.get(&tint_selfid)?;
+                    let mfm_path = db.reconstruct_path(entry_idx, idx_map);
+                    if mfm_path.is_empty() {
+                        return None;
+                    }
+                    let vfs = vfs?;
+                    let cache_entry = *texture_cache.entry(mfm_path.clone()).or_insert_with(|| {
+                        texture::load_or_bake_albedo_with_alpha(
+                            vfs,
+                            &mfm_path,
+                            tint_selfid,
+                            Some(db),
+                            self_id_index.as_ref(),
+                            max_texture_size,
+                        )
+                        .map(|(png_bytes, alpha_state)| {
+                            let idx = textures.len();
+                            textures.push(png_bytes);
+                            (idx, alpha_state)
+                        })
+                    });
+                    let (albedo_texture, alpha_state) = match cache_entry {
+                        Some((idx, state)) => (Some(idx), state),
+                        None => (None, texture::MfmAlphaState::default()),
+                    };
+                    let stem = mfm_path
+                        .rsplit('/')
+                        .next()
+                        .and_then(|leaf| leaf.strip_suffix(".mfm").or(Some(leaf)))
+                        .unwrap_or(&mfm_path)
+                        .to_string();
+                    let idx = dyed_materials.len();
+                    dyed_materials.push(MapDyedMaterial {
+                        name: stem,
+                        albedo_texture,
+                        base_color: [1.0, 1.0, 1.0, 1.0],
+                        alpha_blend: alpha_state.alpha_blend,
+                        alpha_cutoff: alpha_state.alpha_cutoff,
+                        double_sided: alpha_state.double_sided,
+                    });
+                    Some(idx)
+                });
+                let Some(dyed_material) = dyed_material else {
+                    continue;
+                };
+                let target_parts: Vec<u32> = range
+                    .clone()
+                    .enumerate()
+                    .filter(|&(_, mesh_idx)| model_meshes[mesh_idx].material_name_id == dye.replaces_id)
+                    .map(|(j, _)| j as u32)
+                    .collect();
+                if target_parts.is_empty() {
+                    continue;
+                }
+                dye_refs_resolved += 1;
+                dyes_resolved.push(ResolvedDye {
+                    matter_id: pair.matter_id,
+                    tint_name_id: pair.replaces_id,
+                    replaces_material_id: dye.replaces_id,
+                    target_parts,
+                    dyed_material,
+                });
             }
 
             model_instances.push(MapModelInstance {
@@ -850,7 +989,14 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                 model_dyes: inst.model_dyes.clone(),
                 material_instance_count: inst.material_instance_count,
                 material_instances: inst.material_instances.clone(),
+                dyes_resolved,
             });
+        }
+        if dye_refs_total > 0 {
+            println!(
+                "  Resolved {dye_refs_resolved}/{dye_refs_total} instance dye refs into {} baked tint material(s)",
+                dyed_materials.len(),
+            );
         }
     } else {
         // No space.bin: place each model at origin.
@@ -869,6 +1015,7 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                 model_dyes: Vec::new(),
                 material_instance_count: 0,
                 material_instances: Vec::new(),
+                dyes_resolved: Vec::new(),
             });
         }
     }
@@ -922,6 +1069,7 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                 alpha_blend: false,
                 alpha_cutoff: Some(0.5),
                 double_sided: true,
+                material_name_id: 0,
             });
             species_mesh_ranges.push(Some(mesh_idx));
         }
@@ -1151,6 +1299,7 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         point_lights,
         probes,
         user_objects,
+        dyed_materials,
     })
 }
 
@@ -1301,6 +1450,7 @@ fn generate_terrain_mesh(cfg: &TerrainConfig<'_>) -> MapMesh {
         alpha_blend: false,
         alpha_cutoff: None,
         double_sided: false,
+        material_name_id: 0,
     }
 }
 
@@ -1333,6 +1483,7 @@ fn generate_water_mesh(cfg: &WaterConfig<'_>) -> MapMesh {
         alpha_blend: true,
         alpha_cutoff: None,
         double_sided: false,
+        material_name_id: 0,
     }
 }
 
@@ -1355,9 +1506,11 @@ fn generate_water_mesh(cfg: &WaterConfig<'_>) -> MapMesh {
 ///   "lod_extents": [70.0, 160.0, 260.0, 500.0, 50000.0]
 /// }
 /// ```
-fn build_instance_extras(inst: &MapModelInstance) -> json::extras::Extras {
+fn build_instance_extras(inst: &MapModelInstance, dyed_material_indices: &[u32]) -> json::extras::Extras {
     // Dyes emit as `[[matter_id, replaces_id], ...]`; treat each u32 as an
     // opaque identifier until a consumer joins it to the prototype dye tables.
+    // (Wire name `replaces_id` kept for schema stability; semantically it is
+    // the selected tint name id — see `dyes_resolved` for the joined form.)
     // Skip the field entirely when empty to keep extras compact.
     let dyes: Vec<[u32; 2]> = inst.model_dyes.iter().map(|d| [d.matter_id, d.replaces_id]).collect();
     let mut value = serde_json::json!({
@@ -1376,6 +1529,27 @@ fn build_instance_extras(inst: &MapModelInstance) -> json::extras::Extras {
     }
     if !inst.material_instances.is_empty() {
         value["material_instances"] = serde_json::json!(inst.material_instances);
+    }
+    if !inst.dyes_resolved.is_empty() {
+        // Fully-joined dye selections: `material` is the glTF material index
+        // of the baked tint (created unreferenced-by-primitives in the same
+        // GLB); `target_parts` are 0-based part indices within this
+        // instance's mesh list (matching `_part_{j}` child order; a
+        // single-mesh instance has one part, index 0).
+        let entries: Vec<serde_json::Value> = inst
+            .dyes_resolved
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "matter_id": d.matter_id,
+                    "tint_name_id": d.tint_name_id,
+                    "replaces_material_id": d.replaces_material_id,
+                    "target_parts": d.target_parts,
+                    "material": dyed_material_indices.get(d.dyed_material),
+                })
+            })
+            .collect();
+        value["dyes_resolved"] = serde_json::json!(entries);
     }
     // RawValue serialization is infallible for a Value that's already
     // valid JSON (which a serde_json::Value always is).
@@ -1824,6 +1998,28 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
     // This deduplicates materials that share the same texture + color + blend mode.
     let mut mat_cache: MapMaterialCache = HashMap::new();
 
+    // Bake dye tint materials up front so per-instance `dyes_resolved` extras
+    // can reference them by glTF material index. No primitive references
+    // them; consumers swap them in per instance part.
+    let dyed_material_indices: Vec<u32> = scene
+        .dyed_materials
+        .iter()
+        .map(|dm| {
+            get_or_create_map_material(
+                &mut root,
+                &mut mat_cache,
+                &gltf_texture_cache,
+                &dm.name,
+                dm.albedo_texture,
+                dm.base_color,
+                dm.alpha_blend,
+                dm.alpha_cutoff,
+                dm.double_sided,
+            )
+            .value() as u32
+        })
+        .collect();
+
     // glTF mesh cache: mesh index → glTF Mesh index.
     let mut gltf_mesh_cache: HashMap<usize, json::Index<json::Mesh>> = HashMap::new();
 
@@ -1880,7 +2076,7 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
         // We emit a compact JSON object always — the cost is small
         // (a few hundred bytes per instance) and avoiding it keeps the
         // GLB self-describing without a sidecar.
-        let extras = build_instance_extras(inst);
+        let extras = build_instance_extras(inst, &dyed_material_indices);
         if instance_meshes.len() == 1 {
             let node = root.push(json::Node {
                 mesh: Some(instance_meshes[0]),
@@ -2226,21 +2422,60 @@ fn build_map_mesh_primitive(
         attributes.insert(Valid(json::mesh::Semantic::TexCoords(0)), uv);
     }
 
-    // Material: deduplicate by (texture index, base color, alpha blend, alpha
-    // cutoff, double sided). Encode base_color as [u32; 4] for HashMap key
-    // (f32 isn't Hash). `double_sided` lives in the key because two MFMs
-    // sharing the same texture+alpha may still differ on culling
-    // (foliage card = double-sided, opaque rock = single-sided).
+    let material = get_or_create_map_material(
+        root,
+        mat_cache,
+        gltf_texture_cache,
+        &mesh.name,
+        mesh.albedo_texture,
+        mesh.base_color,
+        mesh.alpha_blend,
+        mesh.alpha_cutoff,
+        mesh.double_sided,
+    );
+
+    json::mesh::Primitive {
+        attributes,
+        indices: indices_accessor,
+        material: Some(material),
+        mode: Valid(json::mesh::Mode::Triangles),
+        targets: None,
+        extensions: Default::default(),
+        extras: Default::default(),
+    }
+}
+
+/// Get or create a deduplicated map glTF material.
+///
+/// Deduplicates by (texture index, base color, alpha blend, alpha cutoff,
+/// double sided). Encodes base_color as [u32; 4] for the HashMap key
+/// (f32 isn't Hash). `double_sided` lives in the key because two MFMs
+/// sharing the same texture+alpha may still differ on culling
+/// (foliage card = double-sided, opaque rock = single-sided). Also used to
+/// bake dye tint materials, which primitives don't reference directly —
+/// per-instance `dyes_resolved` extras point at them by material index.
+#[allow(clippy::too_many_arguments)]
+fn get_or_create_map_material(
+    root: &mut json::Root,
+    mat_cache: &mut MapMaterialCache,
+    gltf_texture_cache: &HashMap<usize, json::Index<json::Texture>>,
+    name: &str,
+    albedo_texture: Option<usize>,
+    base_color: [f32; 4],
+    alpha_blend: bool,
+    alpha_cutoff: Option<f32>,
+    double_sided: bool,
+) -> json::Index<json::Material> {
     let mat_key = MapMaterialKey {
-        albedo_texture: mesh.albedo_texture,
-        base_color_bits: mesh.base_color.map(|c| c.to_bits()),
-        alpha_blend: mesh.alpha_blend,
-        alpha_cutoff_bits: mesh.alpha_cutoff.map(|c| c.to_bits()),
-        double_sided: mesh.double_sided,
+        albedo_texture,
+        base_color_bits: base_color.map(|c| c.to_bits()),
+        alpha_blend,
+        alpha_cutoff_bits: alpha_cutoff.map(|c| c.to_bits()),
+        double_sided,
     };
 
-    let material = *mat_cache.entry(mat_key).or_insert_with(|| {
-        if let Some(tex_idx) = mesh.albedo_texture
+    *mat_cache.entry(mat_key).or_insert_with(|| {
+        if let Some(tex_idx) = albedo_texture
             && let Some(&gltf_tex) = gltf_texture_cache.get(&tex_idx)
         {
             // Textured material: reference the shared glTF Texture.
@@ -2248,9 +2483,9 @@ fn build_map_mesh_primitive(
             // MASK, alpha_blend => BLEND, else OPAQUE). double_sided is
             // honoured separately: alpha-cut cards always default to
             // double-sided because they're authored as single quads.
-            let (alpha_mode, alpha_cutoff_val) = if let Some(cutoff) = mesh.alpha_cutoff {
+            let (alpha_mode, alpha_cutoff_val) = if let Some(cutoff) = alpha_cutoff {
                 (Valid(json::material::AlphaMode::Mask), Some(json::material::AlphaCutoff(cutoff)))
-            } else if mesh.alpha_blend {
+            } else if alpha_blend {
                 // WG `ship_transparent_*.fx` materials (SHIPGLASS, semi-transparent
                 // armor visualizers). Without this branch, textured-transparent
                 // meshes got AlphaMode::Opaque, which broke downstream consumers
@@ -2262,7 +2497,7 @@ fn build_map_mesh_primitive(
             } else {
                 (Valid(json::material::AlphaMode::Opaque), None)
             };
-            let double_sided = mesh.double_sided || mesh.alpha_cutoff.is_some() || mesh.alpha_blend;
+            let double_sided = double_sided || alpha_cutoff.is_some() || alpha_blend;
             // Map materials are environmental geometry (terrain, buildings,
             // foliage cards) — non-metal, rough. glTF defaults (metallic=1,
             // roughness=1) treat the base color as F0 specular reflectance,
@@ -2272,7 +2507,7 @@ fn build_map_mesh_primitive(
             // diffuse so the texture/color reads correctly under any
             // lighting setup.
             root.push(json::Material {
-                name: Some(mesh.name.clone()),
+                name: Some(name.to_string()),
                 pbr_metallic_roughness: json::material::PbrMetallicRoughness {
                     base_color_texture: Some(json::texture::Info {
                         index: gltf_tex,
@@ -2290,43 +2525,33 @@ fn build_map_mesh_primitive(
                 double_sided,
                 ..Default::default()
             })
-        } else if mesh.alpha_blend {
+        } else if alpha_blend {
             root.push(json::Material {
-                name: Some(mesh.name.clone()),
+                name: Some(name.to_string()),
                 pbr_metallic_roughness: json::material::PbrMetallicRoughness {
-                    base_color_factor: json::material::PbrBaseColorFactor(mesh.base_color),
+                    base_color_factor: json::material::PbrBaseColorFactor(base_color),
                     metallic_factor: json::material::StrengthFactor(0.0),
                     roughness_factor: json::material::StrengthFactor(1.0),
                     ..Default::default()
                 },
                 alpha_mode: Valid(json::material::AlphaMode::Blend),
-                double_sided: mesh.double_sided,
+                double_sided,
                 ..Default::default()
             })
         } else {
             root.push(json::Material {
-                name: Some(mesh.name.clone()),
+                name: Some(name.to_string()),
                 pbr_metallic_roughness: json::material::PbrMetallicRoughness {
-                    base_color_factor: json::material::PbrBaseColorFactor(mesh.base_color),
+                    base_color_factor: json::material::PbrBaseColorFactor(base_color),
                     metallic_factor: json::material::StrengthFactor(0.0),
                     roughness_factor: json::material::StrengthFactor(1.0),
                     ..Default::default()
                 },
-                double_sided: mesh.double_sided,
+                double_sided,
                 ..Default::default()
             })
         }
-    });
-
-    json::mesh::Primitive {
-        attributes,
-        indices: indices_accessor,
-        material: Some(material),
-        mode: Valid(json::mesh::Mode::Triangles),
-        targets: None,
-        extensions: Default::default(),
-        extras: Default::default(),
-    }
+    })
 }
 
 /// Export all models from a `models.bin` + `models.geometry` pair to a single GLB.
@@ -2646,6 +2871,7 @@ pub fn export_geometry_raw(geometry: &MergedGeometry, writer: &mut impl Write) -
             tangents,
             indices,
             material_name: format!("Primitive_{i}"),
+            material_name_id: 0,
             mfm_stem: None,
             mfm_full_path: None,
             mfm_path_id: 0,
@@ -2943,6 +3169,7 @@ fn decode_render_set_primitive(
         tangents,
         indices,
         material_name,
+        material_name_id: rs.material_name_id,
         mfm_stem,
         mfm_full_path,
         mfm_path_id: rs.material_mfm_path_id,
@@ -3176,6 +3403,7 @@ fn collect_primitives(
             tangents,
             indices,
             material_name,
+            material_name_id: rs.material_name_id,
             mfm_stem,
             mfm_full_path,
             mfm_path_id: rs.material_mfm_path_id,

@@ -79,8 +79,13 @@ pub struct SkeletonProto {
     pub nodes: VisualNodes,
 }
 
-/// A per-instance dye override: an 8-byte `{matter_id, replaces_id}` pair.
-/// `matter_id` is the new texture/color to apply; `replaces_id` is the
+/// A per-instance dye override: an 8-byte `{matter_id, tint_name_id}`
+/// selection pair. `matter_id` matches a prototype `DyeEntry.matter_id`;
+/// the second u32 (wire name `replaces_id` kept for extras/sidecar schema
+/// stability) matches one of that dye's `tint_name_ids`, selecting which
+/// pre-baked tint material the engine applies. Corpus-verified on
+/// 01_solomon_islands / 20_NE_two_brothers / 54_Faroe (1,025/1,025 joins).
+/// The older reading — `matter_id` is the new texture/color, `replaces_id` the
 /// prototype slot it targets.
 ///
 /// Engine treats both fields as opaque u32 IDs. Current corpus evidence
@@ -1099,8 +1104,17 @@ fn parse_model_record(data: &[u8], rec: usize) -> Result<MergedModelRecord, Repo
 // OOL arrays. See parse_model_record's call-site comment for why the regular
 // `parse_model` is unsafe here: animations in inline form are u64 selfIds,
 // not nested ModelPrototype records, so the recursive parser misinterprets
-// them. Map-rendering downstream doesn't read these fields, so leaving them
-// empty is safe.
+// them. Map-rendering downstream doesn't read skel_ext / animations, so those
+// stay empty.
+//
+// Dyes ARE parsed: the inline dye representation is byte-identical to the
+// assets.bin DyeEntry layout (0x20 header: u32 matter, u32 replaces,
+// u32 tints_count, pad4, i64 tint_names relptr, i64 tint_materials relptr;
+// array relptr based at the proto base, per-entry relptrs at the entry base).
+// Verified against 01_solomon_islands / 20_NE_two_brothers / 54_Faroe:
+// every space.bin instance dye pair {matter_id, tint_name_id} joins a
+// prototype DyeEntry (matter match) with the pair's second u32 matching one
+// of that dye's tint_name_ids.
 fn parse_inline_model_proto_header(data: &[u8], base: usize) -> Result<ModelPrototype, Report<MergedModelsError>> {
     const INLINE_MODEL_PROTO_SIZE: usize = 0x28;
     if base + INLINE_MODEL_PROTO_SIZE > data.len() {
@@ -1120,16 +1134,32 @@ fn parse_inline_model_proto_header(data: &[u8], base: usize) -> Result<ModelProt
     let misc_type = le_u8.parse_next(input).map_err(|e: ErrMode<ContextError>| {
         Report::new(MergedModelsError::ParseError(format!("inline_mp misc_type: {e}")))
     })?;
-    // animations_count, dyes_count, padding(4), 3× i64 relptrs — read & discard
-    let _ = take(2usize + 4 + 24).parse_next(input).map_err(|e: ErrMode<ContextError>| {
+    let _animations_count = le_u8.parse_next(input).map_err(|e: ErrMode<ContextError>| {
+        Report::new(MergedModelsError::ParseError(format!("inline_mp animations_count: {e}")))
+    })?;
+    let dyes_count = le_u8.parse_next(input).map_err(|e: ErrMode<ContextError>| {
+        Report::new(MergedModelsError::ParseError(format!("inline_mp dyes_count: {e}")))
+    })?;
+    // padding(4), skel_ext relptr, animations relptr — read & discard
+    let _ = take(4usize + 16).parse_next(input).map_err(|e: ErrMode<ContextError>| {
         Report::new(MergedModelsError::ParseError(format!("inline_mp tail: {e}")))
     })?;
+    let dye_relptr = le_i64.parse_next(input).map_err(|e: ErrMode<ContextError>| {
+        Report::new(MergedModelsError::ParseError(format!("inline_mp dye_relptr: {e}")))
+    })?;
+    let dyes = if dyes_count > 0 {
+        let abs = resolve_relptr(base, dye_relptr);
+        crate::models::model::parse_dye_entries(data, abs, dyes_count as usize)
+            .map_err(|e| Report::new(MergedModelsError::ParseError(format!("inline_mp dyes: {e}"))))?
+    } else {
+        Vec::new()
+    };
     Ok(ModelPrototype {
         visual_resource_id,
         misc_type,
         skel_ext_res_ids: Vec::new(),
         animations: Vec::new(),
-        dyes: Vec::new(),
+        dyes,
     })
 }
 
@@ -1343,6 +1373,47 @@ fn parse_lods_merged(data: &[u8], offset: usize, count: usize) -> Result<Vec<Lod
 mod tests {
     use super::*;
     use crate::models::material::{PropertyType, PropertyValue};
+
+    #[test]
+    fn parses_inline_model_proto_dyes() {
+        // Synthetic models.bin: header 0x18 + one 0xA8 model record. The
+        // inline proto's dye array uses the assets.bin DyeEntry layout with
+        // the array relptr based at the proto base (byte-verified on
+        // 01_solomon_islands / 20_NE_two_brothers / 54_Faroe).
+        let models_off = 0x18usize;
+        let rec = models_off;
+        let mp = rec + 0x08;
+        let dye_off = models_off + MODEL_RECORD_SIZE;
+        let names_off = dye_off + 0x20;
+        let mats_off = names_off + 0x08;
+
+        let mut data = vec![0u8; mats_off + 0x10];
+        put_u32(&mut data, 0x00, 1); // models_count
+        put_i64(&mut data, 0x08, models_off as i64);
+        put_i64(&mut data, 0x10, (mats_off + 0x10) as i64); // skeletons (count 0)
+
+        put_u64(&mut data, rec, 0xdead_beef_cafe_f00d); // path_id
+        data[mp + 0x0B] = 1; // dyes_count
+        put_i64(&mut data, mp + 0x20, (dye_off - mp) as i64); // dye relptr, base = proto
+
+        put_u32(&mut data, dye_off, 0x46f1_b231); // matter
+        put_u32(&mut data, dye_off + 0x04, 0x46f1_b231); // replaces
+        put_u32(&mut data, dye_off + 0x08, 2); // tints_count
+        put_i64(&mut data, dye_off + 0x10, (names_off - dye_off) as i64);
+        put_i64(&mut data, dye_off + 0x18, (mats_off - dye_off) as i64);
+        put_u32(&mut data, names_off, 0x955d_be29);
+        put_u32(&mut data, names_off + 4, 0x0e6c_e501);
+        put_u64(&mut data, mats_off, 0xc042_cbb3_aa90_21e2);
+        put_u64(&mut data, mats_off + 8, 0x1111_2222_3333_4444);
+
+        let parsed = parse_merged_models(&data).expect("merged models");
+        let dyes = &parsed.models[0].model_proto.dyes;
+        assert_eq!(dyes.len(), 1);
+        assert_eq!(dyes[0].matter_id, 0x46f1_b231);
+        assert_eq!(dyes[0].replaces_id, 0x46f1_b231);
+        assert_eq!(dyes[0].tint_name_ids, [0x955d_be29, 0x0e6c_e501]);
+        assert_eq!(dyes[0].tint_material_ids, [0xc042_cbb3_aa90_21e2, 0x1111_2222_3333_4444]);
+    }
 
     fn put_u16(data: &mut [u8], offset: usize, value: u16) {
         data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());

@@ -218,7 +218,11 @@ fn parse_model_at(blob_data: &[u8], base: usize) -> Result<ModelPrototype, Repor
     })
 }
 
-fn parse_dye_entries(blob_data: &[u8], offset: usize, count: usize) -> Result<Vec<DyeEntry>, Report<ModelError>> {
+pub(crate) fn parse_dye_entries(
+    blob_data: &[u8],
+    offset: usize,
+    count: usize,
+) -> Result<Vec<DyeEntry>, Report<ModelError>> {
     let need = count * DYE_ENTRY_SIZE;
     if offset + need > blob_data.len() {
         return Err(Report::new(ModelError::DataTooShort { offset, need, have: blob_data.len() }));
