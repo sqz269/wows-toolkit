@@ -172,6 +172,14 @@ enum Commands {
         #[clap(long)]
         decode: bool,
 
+        /// Write full diagnostic collision-model payload JSON.
+        ///
+        /// Includes vertices, edge pairs, raw face loops, and diagnostic fan
+        /// triangle metadata. The fan triangles are proxy/debug geometry, not
+        /// proof of native solver parity.
+        #[clap(long)]
+        collision_json: Option<PathBuf>,
+
         /// Read file from disk instead of VFS
         #[clap(long)]
         no_vfs: bool,
@@ -472,6 +480,15 @@ enum Commands {
         /// are downsampled with box filtering. Reduces GLB file size significantly.
         #[arg(long)]
         max_texture_size: Option<u32>,
+
+        /// Write a map-level collision manifest sidecar.
+        ///
+        /// The manifest includes obstacle placements, collision-model table
+        /// references, raw loader-level vertices/edge pairs/face loops, and
+        /// diagnostic fan-triangle metadata. It does not prove native solver
+        /// parity for movement, projectile, navigation, or LOS behavior.
+        #[arg(long)]
+        collision_manifest_json: Option<PathBuf>,
     },
     /// Inspect armor model geometry and GameParams thickness data for a ship
     Armor {
@@ -1416,9 +1433,9 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
                 }
             };
         }
-        Commands::Geometry { file, decode, no_vfs } => {
+        Commands::Geometry { file, decode, collision_json, no_vfs } => {
             let file_data = read_file_data(&file, no_vfs, vfs.as_ref())?;
-            run_geometry(&file_data, &file.to_string_lossy(), decode)?;
+            run_geometry(&file_data, &file.to_string_lossy(), decode, collision_json.as_deref())?;
         }
         Commands::ExportModel {
             file,
@@ -1516,6 +1533,7 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
             vegetation_density,
             no_textures,
             max_texture_size,
+            collision_manifest_json,
         } => {
             run_export_map(
                 &space_dir,
@@ -1530,6 +1548,7 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
                 vegetation_density,
                 no_textures,
                 max_texture_size,
+                collision_manifest_json.as_deref(),
             )?;
         }
         Commands::Armor { name, vehicle, hull, json } => {
@@ -1715,7 +1734,7 @@ fn load_game_params(vfs: &VfsPath) -> Result<pickled::Value, Report> {
     Ok(pickle)
 }
 
-fn run_geometry(file_data: &[u8], name: &str, decode: bool) -> Result<(), Report> {
+fn run_geometry(file_data: &[u8], name: &str, decode: bool, collision_json: Option<&Path>) -> Result<(), Report> {
     use wowsunpack::models::geometry;
 
     let geom = geometry::parse_geometry(file_data)?;
@@ -1785,13 +1804,180 @@ fn run_geometry(file_data: &[u8], name: &str, decode: bool) -> Result<(), Report
 
     println!("Collision models: {}", geom.collision_models.len());
     for (i, cm) in geom.collision_models.iter().enumerate() {
-        println!("  [{i}] name=\"{}\" size={}", cm.name, cm.size_in_bytes);
+        println!(
+            "  [{i}] name=\"{}\" size={} cmData=[0x{:X},0x{:X}) relptr={}",
+            cm.name,
+            cm.size_in_bytes,
+            cm.segment_offset,
+            cm.segment_end_offset,
+            cm.data_relptr
+        );
+        if decode {
+            match geometry::parse_collision_model_data(cm.data) {
+                Ok(parsed) => {
+                    let stats = parsed.stats();
+                    println!(
+                        "    -> magic=0x{:08X} objects={} vertices={} edgePairs={} faces={} faceIndices={} debugFanTris={} nativeTriCandidates={} zeroFaces={} maxFaceIndices={}",
+                        parsed.magic,
+                        stats.object_count,
+                        stats.vertex_count,
+                        stats.edge_pair_count,
+                        stats.face_count,
+                        stats.face_index_count,
+                        stats.debug_fan_triangle_count,
+                        stats.native_postload_triangle_candidate_count,
+                        stats.face_with_vertex_zero_count,
+                        stats.max_face_index_count
+                    );
+                }
+                Err(e) => println!("    -> cmData parse error: {e:?}"),
+            }
+        }
     }
     println!();
 
     println!("Armor models: {}", geom.armor_models.len());
     for (i, am) in geom.armor_models.iter().enumerate() {
         println!("  [{i}] name=\"{}\" triangles={}", am.name, am.triangles.len());
+    }
+
+    if let Some(path) = collision_json {
+        write_collision_json(&geom, name, path)?;
+        println!("Collision JSON written to {}", path.display());
+    }
+
+    Ok(())
+}
+
+fn write_collision_json(
+    geom: &wowsunpack::models::geometry::MergedGeometry<'_>,
+    source_name: &str,
+    out_path: &Path,
+) -> Result<(), Report> {
+    use serde_json::json;
+    use wowsunpack::models::geometry;
+
+    let mut models = Vec::with_capacity(geom.collision_models.len());
+    let mut parse_error_count = 0usize;
+
+    for (model_index, model) in geom.collision_models.iter().enumerate() {
+        let magic_at_start = model
+            .data
+            .get(0..4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four-byte magic slice")));
+
+        match geometry::parse_collision_model_data(model.data) {
+            Ok(parsed) => {
+                let stats = parsed.stats();
+                let mut objects = Vec::with_capacity(parsed.objects.len());
+                for (object_index, object) in parsed.objects.iter().enumerate() {
+                    let mut faces = Vec::with_capacity(object.faces.len());
+                    for (face_index, face) in object.faces.iter().enumerate() {
+                        faces.push(json!({
+                            "index": face_index,
+                            "index_count": face.vertex_indices.len(),
+                            "vertex_indices": &face.vertex_indices,
+                            "edge_pair_indices": &face.edge_pair_indices,
+                            "field_30": face.field_30,
+                            "contains_vertex_zero": face.contains_vertex_zero(),
+                            "native_postload_triangle_candidate": face.native_postload_triangle_candidate(),
+                            "debug_fan_triangles": face.debug_fan_triangles(),
+                        }));
+                    }
+                    objects.push(json!({
+                        "index": object_index,
+                        "vertex_count": object.vertices.len(),
+                        "edge_pair_count": object.edge_pairs.len(),
+                        "face_count": object.faces.len(),
+                        "debug_fan_triangle_count": object
+                            .faces
+                            .iter()
+                            .map(|face| face.debug_fan_triangle_count())
+                            .sum::<usize>(),
+                        "native_postload_triangle_candidate_count": object
+                            .faces
+                            .iter()
+                            .map(|face| face.native_postload_triangle_count())
+                            .sum::<usize>(),
+                        "vertices": &object.vertices,
+                        "edge_pairs": &object.edge_pairs,
+                        "faces": faces,
+                    }));
+                }
+
+                models.push(json!({
+                    "index": model_index,
+                    "name": model.name.as_str(),
+                    "size_in_bytes": model.size_in_bytes,
+                    "descriptor_offset": model.descriptor_offset,
+                    "descriptor_offset_hex": format!("0x{:X}", model.descriptor_offset),
+                    "cm_data_offset": model.segment_offset,
+                    "cm_data_offset_hex": format!("0x{:X}", model.segment_offset),
+                    "cm_data_end_offset": model.segment_end_offset,
+                    "cm_data_end_offset_hex": format!("0x{:X}", model.segment_end_offset),
+                    "cm_data_relptr": model.data_relptr,
+                    "magic": parsed.magic,
+                    "magic_hex": format!("0x{:08X}", parsed.magic),
+                    "consumed_bytes": parsed.consumed_bytes,
+                    "stats": {
+                        "object_count": stats.object_count,
+                        "vertex_count": stats.vertex_count,
+                        "edge_pair_count": stats.edge_pair_count,
+                        "face_count": stats.face_count,
+                        "face_index_count": stats.face_index_count,
+                        "face_with_vertex_zero_count": stats.face_with_vertex_zero_count,
+                        "debug_fan_triangle_count": stats.debug_fan_triangle_count,
+                        "native_postload_triangle_candidate_count": stats.native_postload_triangle_candidate_count,
+                        "max_face_index_count": stats.max_face_index_count,
+                    },
+                    "objects": objects,
+                }));
+            }
+            Err(error) => {
+                parse_error_count += 1;
+                models.push(json!({
+                    "index": model_index,
+                    "name": model.name.as_str(),
+                    "size_in_bytes": model.size_in_bytes,
+                    "descriptor_offset": model.descriptor_offset,
+                    "descriptor_offset_hex": format!("0x{:X}", model.descriptor_offset),
+                    "cm_data_offset": model.segment_offset,
+                    "cm_data_offset_hex": format!("0x{:X}", model.segment_offset),
+                    "cm_data_end_offset": model.segment_end_offset,
+                    "cm_data_end_offset_hex": format!("0x{:X}", model.segment_end_offset),
+                    "cm_data_relptr": model.data_relptr,
+                    "magic": magic_at_start,
+                    "magic_hex": magic_at_start.map(|magic| format!("0x{magic:08X}")),
+                    "parse_error": error.to_string(),
+                }));
+            }
+        }
+    }
+
+    let manifest = json!({
+        "schema": "wows.geometry.collision_models.v1",
+        "source": source_name,
+        "collision_model_count": geom.collision_models.len(),
+        "parse_error_count": parse_error_count,
+        "notes": [
+            "vertices, edge_pairs, and face loops are direct loader-level cmData records",
+            "debug_fan_triangles triangulate each face loop as a simple fan for visualization",
+            "native_postload_triangle_candidate mirrors the observed no-zero face condition in FUN_1403d9ea0",
+            "this manifest does not prove movement, projectile, navigation, LOS, or broad-phase solver parity"
+        ],
+        "models": models,
+    });
+
+    if out_path == Path::new("-") {
+        serde_json::to_writer_pretty(stdout(), &manifest)?;
+    } else {
+        if let Some(parent) = out_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = File::create(out_path)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, &manifest)?;
+        writer.write_all(b"\n")?;
     }
 
     Ok(())
@@ -2507,6 +2693,7 @@ fn run_export_map(
     vegetation_density: f32,
     no_textures: bool,
     max_texture_size: Option<u32>,
+    collision_manifest_json: Option<&Path>,
 ) -> Result<(), Report> {
     use wowsunpack::export::gltf_export;
     use wowsunpack::export::texture;
@@ -2770,6 +2957,14 @@ fn run_export_map(
         vegetation_density,
     })
     .context("Failed to build map scene")?;
+
+    if let Some(path) = collision_manifest_json {
+        let mut file = std::fs::File::create(path).context("Failed to create collision manifest JSON")?;
+        gltf_export::write_map_collision_manifest_json(&scene, &geom, &dir_str, &mut file)
+            .context("Failed to write collision manifest JSON")?;
+        let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        println!("Collision manifest written to {} ({} bytes)", path.display(), file_size);
+    }
 
     // 9. Export to GLB.
     let mut out_file = std::fs::File::create(output).context("Failed to create output file")?;

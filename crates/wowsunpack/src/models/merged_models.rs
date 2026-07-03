@@ -10,6 +10,7 @@ use rootcause::Report;
 use thiserror::Error;
 use winnow::Parser;
 use winnow::binary::le_f32;
+use winnow::binary::le_i32;
 use winnow::binary::le_i64;
 use winnow::binary::le_u8;
 use winnow::binary::le_u16;
@@ -115,8 +116,11 @@ pub struct SpacePointLight {
     pub color: [f32; 4],
     /// Falloff radius in metres. Maps to `THREE.PointLight.distance`.
     pub radius: f32,
-    /// Engine `Quality` enum minimum: 0=Low, 1=Medium, 2=High, 3=Ultra.
-    /// Engine skips the light when the runtime quality is below this.
+    /// Engine point-light minimum-quality threshold, driven by the native
+    /// DYNAMIC_LIGHTING graphics setting. Native quality tokens are descending:
+    /// MAX/MAXIMUM=0, VERYHIGH=1, HIGH=2, MEDIUM=3, LOW=4, VERYLOW=5,
+    /// MIN/MINIMUM=6. Consumers should draw when
+    /// dynamic_lighting_runtime_raw <= min_quality.
     pub min_quality: u32,
 }
 
@@ -139,10 +143,13 @@ pub struct SpaceInstance {
     /// `landscapeBias` LOD policy. Consumers can use this to apply
     /// distance fog or LOD distance gating that matches engine behavior.
     pub is_landscape: bool,
-    /// Engine `minimumQualityLevel` (graphics::preferences::Quality enum:
-    /// 0=Low, 1=Medium, 2=High, 3=Ultra). The engine skips this instance
-    /// when the runtime quality preset is below this value; useful as a
-    /// viewer-side detail filter.
+    /// Engine `minimumQualityLevel`. Native code stages this byte into
+    /// ecs::model::ModelPropertiesComponent byte 1 and filters map model ids
+    /// against the OBJECT_LOD runtime raw byte. Native quality tokens are
+    /// descending:
+    /// MAX/MAXIMUM=0, VERYHIGH=1, HIGH=2, MEDIUM=3, LOW=4, VERYLOW=5,
+    /// MIN/MINIMUM=6. Consumers should draw when
+    /// object_lod_runtime_raw <= this value.
     pub min_quality_level: u8,
     /// Stable authoring GUID string at +0x40/+0x48, when present.
     pub stable_guid: Option<String>,
@@ -157,11 +164,88 @@ pub struct SpaceInstance {
     pub material_instances: Vec<MaterialPrototype>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SpaceObstacle {
+    pub source_offset: usize,
+    pub transform: Matrix4x4,
+    pub position: [f32; 3],
+    pub packed_indices: u32,
+    pub candidate_model_instance_index: u16,
+    pub candidate_collision_model_index: u16,
+    pub field_44: u32,
+    pub grid_min: [i32; 2],
+    pub grid_max: [i32; 2],
+}
+
+#[derive(Debug, Clone)]
+pub struct SpaceParticle {
+    pub transform: Matrix4x4,
+    pub position: [f32; 3],
+    pub raw_guid_blob: [u8; 16],
+    pub resource_id: u64,
+    pub intensity_count: u32,
+    pub intensity_values: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpaceStaticDecalHeader {
+    pub technique: u32,
+    pub influence: u32,
+    pub field_08: u32,
+    pub field_0c: u32,
+    pub variant: u32,
+    pub alpha: f32,
+    pub field_18: u32,
+    pub field_1c: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpaceStaticDecal {
+    pub transform: Matrix4x4,
+    pub position: [f32; 3],
+    pub header: SpaceStaticDecalHeader,
+    pub texture_paths: Vec<Option<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpaceProbe {
+    pub transform: Matrix4x4,
+    pub position: [f32; 3],
+    pub guid: Option<String>,
+    pub name: Option<String>,
+    pub resolution: u32,
+    pub is_main_probe: bool,
+    pub draw_full_scene: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpaceUserObjectPropertyValue {
+    pub path: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpaceUserObject {
+    pub transform: Matrix4x4,
+    pub position: [f32; 3],
+    pub guid: Option<String>,
+    pub object_type: Option<String>,
+    pub properties_xml: Option<String>,
+    pub properties_well_formed: bool,
+    pub property_tags: Vec<String>,
+    pub property_values: Vec<SpaceUserObjectPropertyValue>,
+}
+
 /// Parsed `space.bin` instance placements + lighting.
 #[derive(Debug)]
 pub struct SpaceInstances {
     pub instances: Vec<SpaceInstance>,
+    pub obstacles: Vec<SpaceObstacle>,
+    pub particles: Vec<SpaceParticle>,
     pub point_lights: Vec<SpacePointLight>,
+    pub probes: Vec<SpaceProbe>,
+    pub static_decals: Vec<SpaceStaticDecal>,
+    pub user_objects: Vec<SpaceUserObject>,
 }
 
 // ── Winnow sub-parsers (merged-specific) ────────────────────────────────────
@@ -253,8 +337,8 @@ fn parse_visual_proto_inline_fields(input: &mut &[u8]) -> WResult<VisualProtoInl
 //   +0x5a  u8        materialInstanceCount
 //   +0x5b  u8        minimumQualityLevel
 //   +0x5c  4 bytes   pad
-//   +0x60  i64       modelDyes relptr            — DROPPED (Phase 2)
-//   +0x68  i64       materialInstances relptr    — DROPPED (Phase 2)
+//   +0x60  i64       modelDyes relptr
+//   +0x68  i64       materialInstances relptr
 
 /// Parse a single ModelInstance record (0x70 bytes) into a fully-resolved
 /// `SpaceInstance`. Inner relptrs at +0x60 (modelDyes) and +0x68
@@ -412,7 +496,12 @@ pub fn parse_merged_models(file_data: &[u8]) -> Result<MergedModels, Report<Merg
 
 const SPACE_HEADER_SIZE: usize = 0x60;
 const SPACE_INSTANCE_SIZE: usize = 0x70;
+const SPACE_OBSTACLE_SIZE: usize = 0x58;
+const SPACE_PARTICLE_SIZE: usize = 0x68;
 const SPACE_POINT_LIGHT_SIZE: usize = 0xc0;
+const SPACE_PROBE_SIZE: usize = 0x70;
+const SPACE_STATIC_DECAL_SIZE: usize = 0x68;
+const SPACE_USER_OBJECT_SIZE: usize = 0x70;
 
 // Header layout (see audit doc § "8 typed sub-arrays"):
 //   +0x00..+0x20  eight u32 counts in declaration order
@@ -420,7 +509,12 @@ const SPACE_POINT_LIGHT_SIZE: usize = 0xc0;
 // Sub-array order: models, obstacles, particles, pointLights, probes,
 // staticDecals, userObjects, prefabs.
 const SUBARRAY_MODELS: usize = 0;
+const SUBARRAY_OBSTACLES: usize = 1;
+const SUBARRAY_PARTICLES: usize = 2;
 const SUBARRAY_POINT_LIGHTS: usize = 3;
+const SUBARRAY_PROBES: usize = 4;
+const SUBARRAY_STATIC_DECALS: usize = 5;
+const SUBARRAY_USER_OBJECTS: usize = 6;
 
 /// Parse the 8 (count, relptr) pairs out of the space.bin header.
 ///
@@ -457,31 +551,21 @@ fn parse_space_header(file_data: &[u8]) -> Result<[(u32, usize); 8], Report<Merg
     Ok(out)
 }
 
-fn read_string_descriptor(file_data: &[u8], descriptor_base: usize, len: u64, relptr: i64) -> Option<String> {
-    if len == 0 {
-        return None;
-    }
-    let start_i64 = descriptor_base as i64 + relptr;
-    if start_i64 < 0 {
-        return None;
-    }
-    let start = start_i64 as usize;
-    let end = start.checked_add(len as usize)?;
-    let bytes = file_data.get(start..end)?;
-    let bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes);
-    Some(String::from_utf8_lossy(bytes).into_owned())
-}
-
-/// Parse a `space.bin` file to extract model placements + point lights.
+/// Parse a `space.bin` file to extract the typed instance sub-arrays.
 ///
 /// The engine's `SpaceContent::Instances` block carries eight typed
-/// sub-arrays; we currently consume two: models (visible meshes) and
-/// pointLights (atmospheric lighting). The other six are intentionally
-/// dropped — see the audit doc backlog.
+/// sub-arrays; we consume seven: models, obstacles, particles,
+/// pointLights, probes, staticDecals, and userObjects. Only `prefabs[]`
+/// is skipped (dead data in the shipped game — see the audit doc).
 pub fn parse_space_instances(file_data: &[u8]) -> Result<SpaceInstances, Report<MergedModelsError>> {
     let header = parse_space_header(file_data)?;
     let (instance_count, instances_offset) = header[SUBARRAY_MODELS];
+    let (obstacle_count, obstacles_offset) = header[SUBARRAY_OBSTACLES];
+    let (particle_count, particles_offset) = header[SUBARRAY_PARTICLES];
     let (light_count, lights_offset) = header[SUBARRAY_POINT_LIGHTS];
+    let (probe_count, probes_offset) = header[SUBARRAY_PROBES];
+    let (static_decal_count, static_decals_offset) = header[SUBARRAY_STATIC_DECALS];
+    let (user_object_count, user_objects_offset) = header[SUBARRAY_USER_OBJECTS];
 
     let instances = if instance_count == 0 {
         Vec::new()
@@ -505,6 +589,24 @@ pub fn parse_space_instances(file_data: &[u8]) -> Result<SpaceInstances, Report<
         out
     };
 
+    let obstacles = parse_space_record_array(
+        file_data,
+        obstacles_offset,
+        obstacle_count as usize,
+        SPACE_OBSTACLE_SIZE,
+        parse_space_obstacle_record,
+        "space obstacles",
+    )?;
+
+    let particles = parse_space_record_array(
+        file_data,
+        particles_offset,
+        particle_count as usize,
+        SPACE_PARTICLE_SIZE,
+        parse_space_particle_record,
+        "space particles",
+    )?;
+
     let point_lights = if light_count == 0 {
         Vec::new()
     } else {
@@ -522,7 +624,366 @@ pub fn parse_space_instances(file_data: &[u8]) -> Result<SpaceInstances, Report<
         )?
     };
 
-    Ok(SpaceInstances { instances, point_lights })
+    let probes = parse_space_record_array(
+        file_data,
+        probes_offset,
+        probe_count as usize,
+        SPACE_PROBE_SIZE,
+        parse_space_probe_record,
+        "space probes",
+    )?;
+
+    let static_decals = parse_space_record_array(
+        file_data,
+        static_decals_offset,
+        static_decal_count as usize,
+        SPACE_STATIC_DECAL_SIZE,
+        parse_space_static_decal_record,
+        "space static decals",
+    )?;
+
+    let user_objects = parse_space_record_array(
+        file_data,
+        user_objects_offset,
+        user_object_count as usize,
+        SPACE_USER_OBJECT_SIZE,
+        parse_space_user_object_record,
+        "space user objects",
+    )?;
+
+    Ok(SpaceInstances {
+        instances,
+        obstacles,
+        particles,
+        point_lights,
+        probes,
+        static_decals,
+        user_objects,
+    })
+}
+
+fn parse_space_record_array<T>(
+    file_data: &[u8],
+    offset: usize,
+    count: usize,
+    stride: usize,
+    parser: fn(&[u8], usize) -> Result<T, Report<MergedModelsError>>,
+    label: &str,
+) -> Result<Vec<T>, Report<MergedModelsError>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let need = count * stride;
+    if offset + need > file_data.len() {
+        return Err(Report::new(MergedModelsError::DataTooShort { offset, need, have: file_data.len() }));
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let rec_base = offset + i * stride;
+        let rec = parser(file_data, rec_base)
+            .map_err(|e| MergedModelsError::ParseError(format!("{label}[{i}] @ 0x{rec_base:x}: {e}")))?;
+        out.push(rec);
+    }
+    Ok(out)
+}
+
+fn read_string_descriptor(file_data: &[u8], descriptor_base: usize, len: u64, relptr: i64) -> Option<String> {
+    if len == 0 {
+        return None;
+    }
+    let start_i64 = descriptor_base as i64 + relptr;
+    if start_i64 < 0 {
+        return None;
+    }
+    let start = start_i64 as usize;
+    let end = start.checked_add(len as usize)?;
+    let bytes = file_data.get(start..end)?;
+    let bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes);
+    Some(String::from_utf8_lossy(bytes).into_owned())
+}
+
+fn matrix_position(transform: &Matrix4x4) -> [f32; 3] {
+    [transform.0[12], transform.0[13], transform.0[14]]
+}
+
+fn parse_space_obstacle_record(
+    file_data: &[u8],
+    rec_base: usize,
+) -> Result<SpaceObstacle, Report<MergedModelsError>> {
+    let input = &mut &file_data[rec_base..rec_base + SPACE_OBSTACLE_SIZE];
+    let transform = parser_utils::parse_matrix4x4(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("matrix: {e}"))))?;
+    let packed_indices = le_u32
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("packed: {e}"))))?;
+    let field_44 = le_u32
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("field_44: {e}"))))?;
+    let min_x = le_i32
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("grid min x: {e}"))))?;
+    let min_y = le_i32
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("grid min y: {e}"))))?;
+    let max_x = le_i32
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("grid max x: {e}"))))?;
+    let max_y = le_i32
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("grid max y: {e}"))))?;
+
+    Ok(SpaceObstacle {
+        source_offset: rec_base,
+        position: matrix_position(&transform),
+        transform,
+        packed_indices,
+        candidate_model_instance_index: (packed_indices & 0xffff) as u16,
+        candidate_collision_model_index: (packed_indices >> 16) as u16,
+        field_44,
+        grid_min: [min_x, min_y],
+        grid_max: [max_x, max_y],
+    })
+}
+
+fn parse_space_particle_record(
+    file_data: &[u8],
+    rec_base: usize,
+) -> Result<SpaceParticle, Report<MergedModelsError>> {
+    let input = &mut &file_data[rec_base..rec_base + SPACE_PARTICLE_SIZE];
+    let transform = parser_utils::parse_matrix4x4(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("matrix: {e}"))))?;
+    let guid_bytes: &[u8] = take(16usize)
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("guid blob: {e}"))))?;
+    let mut raw_guid_blob = [0u8; 16];
+    raw_guid_blob.copy_from_slice(guid_bytes);
+    let resource_id = le_u64
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("resource id: {e}"))))?;
+    let intensity_count = le_u32
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("intensity count: {e}"))))?;
+    let _pad = le_u32
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("intensity pad: {e}"))))?;
+    let intensity_relptr = le_i64
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("intensity relptr: {e}"))))?;
+
+    let mut intensity_values = Vec::with_capacity(intensity_count as usize);
+    if intensity_count > 0 {
+        let start_i64 = rec_base as i64 + intensity_relptr;
+        if start_i64 >= 0 {
+            let start = start_i64 as usize;
+            let need = intensity_count as usize * 4;
+            if start + need <= file_data.len() {
+                let mut value_input = &file_data[start..start + need];
+                for _ in 0..intensity_count {
+                    intensity_values.push(le_f32.parse_next(&mut value_input).map_err(|e: ErrMode<ContextError>| {
+                        Report::new(MergedModelsError::ParseError(format!("intensity value: {e}")))
+                    })?);
+                }
+            }
+        }
+    }
+
+    Ok(SpaceParticle {
+        position: matrix_position(&transform),
+        transform,
+        raw_guid_blob,
+        resource_id,
+        intensity_count,
+        intensity_values,
+    })
+}
+
+fn parse_space_probe_record(file_data: &[u8], rec_base: usize) -> Result<SpaceProbe, Report<MergedModelsError>> {
+    let input = &mut &file_data[rec_base..rec_base + SPACE_PROBE_SIZE];
+    let transform = parser_utils::parse_matrix4x4(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("matrix: {e}"))))?;
+    let guid_len = le_u64
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("guid len: {e}"))))?;
+    let guid_relptr = le_i64
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("guid relptr: {e}"))))?;
+    let name_len = le_u64
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("name len: {e}"))))?;
+    let name_relptr = le_i64
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("name relptr: {e}"))))?;
+    let resolution = le_u32
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("resolution: {e}"))))?;
+    let _pad = take(4usize)
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("probe pad: {e}"))))?;
+    let is_main_probe = le_u8
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("main probe: {e}"))))?
+        != 0;
+    let draw_full_scene = le_u8
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("draw full scene: {e}"))))?
+        != 0;
+
+    Ok(SpaceProbe {
+        position: matrix_position(&transform),
+        transform,
+        guid: read_string_descriptor(file_data, rec_base + 0x40, guid_len, guid_relptr),
+        name: read_string_descriptor(file_data, rec_base + 0x50, name_len, name_relptr),
+        resolution,
+        is_main_probe,
+        draw_full_scene,
+    })
+}
+
+fn parse_space_static_decal_record(
+    file_data: &[u8],
+    rec_base: usize,
+) -> Result<SpaceStaticDecal, Report<MergedModelsError>> {
+    let input = &mut &file_data[rec_base..rec_base + SPACE_STATIC_DECAL_SIZE];
+    let technique = le_u32.parse_next(input).map_err(|e: ErrMode<ContextError>| {
+        Report::new(MergedModelsError::ParseError(format!("technique: {e}")))
+    })?;
+    let influence = le_u32.parse_next(input).map_err(|e: ErrMode<ContextError>| {
+        Report::new(MergedModelsError::ParseError(format!("influence: {e}")))
+    })?;
+    let field_08 = le_u32.parse_next(input).map_err(|e: ErrMode<ContextError>| {
+        Report::new(MergedModelsError::ParseError(format!("field_08: {e}")))
+    })?;
+    let field_0c = le_u32.parse_next(input).map_err(|e: ErrMode<ContextError>| {
+        Report::new(MergedModelsError::ParseError(format!("field_0c: {e}")))
+    })?;
+    let variant = le_u32.parse_next(input).map_err(|e: ErrMode<ContextError>| {
+        Report::new(MergedModelsError::ParseError(format!("variant: {e}")))
+    })?;
+    let alpha = le_f32
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("alpha: {e}"))))?;
+    let field_18 = le_u32.parse_next(input).map_err(|e: ErrMode<ContextError>| {
+        Report::new(MergedModelsError::ParseError(format!("field_18: {e}")))
+    })?;
+    let field_1c = le_u32.parse_next(input).map_err(|e: ErrMode<ContextError>| {
+        Report::new(MergedModelsError::ParseError(format!("field_1c: {e}")))
+    })?;
+    let texture_block_relptr = le_i64.parse_next(input).map_err(|e: ErrMode<ContextError>| {
+        Report::new(MergedModelsError::ParseError(format!("texture block: {e}")))
+    })?;
+    let transform = parser_utils::parse_matrix4x4(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("matrix: {e}"))))?;
+
+    let texture_paths = read_static_decal_texture_paths(file_data, rec_base, texture_block_relptr);
+
+    Ok(SpaceStaticDecal {
+        position: matrix_position(&transform),
+        transform,
+        header: SpaceStaticDecalHeader { technique, influence, field_08, field_0c, variant, alpha, field_18, field_1c },
+        texture_paths,
+    })
+}
+
+fn read_static_decal_texture_paths(file_data: &[u8], rec_base: usize, texture_block_relptr: i64) -> Vec<Option<String>> {
+    let block_i64 = rec_base as i64 + texture_block_relptr;
+    if block_i64 < 0 {
+        return vec![None, None, None];
+    }
+    let block = block_i64 as usize;
+    let mut paths = Vec::with_capacity(3);
+    for i in 0..3 {
+        let descriptor_base = block + i * 0x10;
+        if descriptor_base + 0x10 > file_data.len() {
+            paths.push(None);
+            continue;
+        }
+        let len = u64::from_le_bytes(file_data[descriptor_base..descriptor_base + 8].try_into().unwrap());
+        let relptr = i64::from_le_bytes(file_data[descriptor_base + 8..descriptor_base + 0x10].try_into().unwrap());
+        paths.push(read_string_descriptor(file_data, descriptor_base, len, relptr));
+    }
+    paths
+}
+
+fn parse_space_user_object_record(
+    file_data: &[u8],
+    rec_base: usize,
+) -> Result<SpaceUserObject, Report<MergedModelsError>> {
+    let input = &mut &file_data[rec_base..rec_base + SPACE_USER_OBJECT_SIZE];
+    let transform = parser_utils::parse_matrix4x4(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("matrix: {e}"))))?;
+    let guid_len = le_u64
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("guid len: {e}"))))?;
+    let guid_relptr = le_i64
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("guid relptr: {e}"))))?;
+    let type_len = le_u64
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("type len: {e}"))))?;
+    let type_relptr = le_i64
+        .parse_next(input)
+        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("type relptr: {e}"))))?;
+    let properties_len = le_u64.parse_next(input).map_err(|e: ErrMode<ContextError>| {
+        Report::new(MergedModelsError::ParseError(format!("properties len: {e}")))
+    })?;
+    let properties_relptr = le_i64.parse_next(input).map_err(|e: ErrMode<ContextError>| {
+        Report::new(MergedModelsError::ParseError(format!("properties relptr: {e}")))
+    })?;
+
+    let properties_xml = read_string_descriptor(file_data, rec_base + 0x60, properties_len, properties_relptr);
+    let (properties_well_formed, property_tags, property_values) = properties_xml
+        .as_deref()
+        .map(parse_user_object_properties)
+        .unwrap_or((false, Vec::new(), Vec::new()));
+
+    Ok(SpaceUserObject {
+        position: matrix_position(&transform),
+        transform,
+        guid: read_string_descriptor(file_data, rec_base + 0x40, guid_len, guid_relptr),
+        object_type: read_string_descriptor(file_data, rec_base + 0x50, type_len, type_relptr),
+        properties_xml,
+        properties_well_formed,
+        property_tags,
+        property_values,
+    })
+}
+
+fn parse_user_object_properties(xml: &str) -> (bool, Vec<String>, Vec<SpaceUserObjectPropertyValue>) {
+    let Ok(doc) = roxmltree::Document::parse(xml) else {
+        return (false, Vec::new(), Vec::new());
+    };
+    let root = doc.root_element();
+    let mut tags = Vec::new();
+    let mut values = Vec::new();
+    let mut path = Vec::new();
+    for child in root.children().filter(|node| node.is_element()) {
+        walk_user_object_xml(child, &mut path, &mut tags, &mut values);
+    }
+    (true, tags, values)
+}
+
+fn walk_user_object_xml(
+    node: roxmltree::Node<'_, '_>,
+    path: &mut Vec<String>,
+    tags: &mut Vec<String>,
+    values: &mut Vec<SpaceUserObjectPropertyValue>,
+) {
+    let tag = node.tag_name().name().to_string();
+    if !tags.contains(&tag) {
+        tags.push(tag.clone());
+    }
+    path.push(tag);
+    let mut has_element_child = false;
+    for child in node.children().filter(|child| child.is_element()) {
+        has_element_child = true;
+        walk_user_object_xml(child, path, tags, values);
+    }
+    if !has_element_child {
+        if let Some(text) = node.text().map(str::trim).filter(|text| !text.is_empty()) {
+            values.push(SpaceUserObjectPropertyValue { path: path.join("."), value: text.to_string() });
+        }
+    }
+    path.pop();
 }
 
 // PointLightInstance layout (0xc0 stride). Cursor offsets are checked
@@ -891,6 +1352,10 @@ mod tests {
         data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 
+    fn put_i32(data: &mut [u8], offset: usize, value: i32) {
+        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
     fn put_u64(data: &mut [u8], offset: usize, value: u64) {
         data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
@@ -947,7 +1412,10 @@ mod tests {
         data[guid_offset..guid_offset + guid.len()].copy_from_slice(guid);
 
         let parsed = parse_space_instances(&data).expect("space instances");
-        assert_eq!(parsed.instances[0].stable_guid.as_deref(), Some("2E8F86C7.4B8A6236.75A3978F.4D162DE3"));
+        assert_eq!(
+            parsed.instances[0].stable_guid.as_deref(),
+            Some("2E8F86C7.4B8A6236.75A3978F.4D162DE3")
+        );
     }
 
     #[test]
@@ -984,5 +1452,286 @@ mod tests {
         assert!(
             matches!(material.properties[0].value, Some(PropertyValue::Float(v)) if (v - 0.5).abs() < f32::EPSILON)
         );
+    }
+
+    #[test]
+    fn parses_obstacle_packed_indices_and_grid_bounds() {
+        let obstacle_offset = SPACE_HEADER_SIZE;
+        let rec = obstacle_offset;
+        let mut data = vec![0u8; obstacle_offset + SPACE_OBSTACLE_SIZE];
+
+        put_u32(&mut data, 0x04, 1);
+        put_i64(&mut data, 0x28, obstacle_offset as i64);
+
+        put_f32(&mut data, rec, 1.0);
+        put_f32(&mut data, rec + 0x14, 1.0);
+        put_f32(&mut data, rec + 0x28, 1.0);
+        put_f32(&mut data, rec + 0x3c, 1.0);
+        put_f32(&mut data, rec + 0x30, -629.387);
+        put_f32(&mut data, rec + 0x34, -8.695);
+        put_f32(&mut data, rec + 0x38, -599.672);
+        let packed = (5u32 << 16) | 4u32;
+        put_u32(&mut data, rec + 0x40, packed);
+        put_i32(&mut data, rec + 0x48, -8);
+        put_i32(&mut data, rec + 0x4c, -7);
+        put_i32(&mut data, rec + 0x50, -6);
+        put_i32(&mut data, rec + 0x54, -6);
+
+        let parsed = parse_space_instances(&data).expect("space instances");
+        let obstacle = &parsed.obstacles[0];
+        assert_eq!(obstacle.source_offset, rec);
+        assert_eq!(obstacle.position, [-629.387, -8.695, -599.672]);
+        assert_eq!(obstacle.packed_indices, packed);
+        assert_eq!(obstacle.candidate_model_instance_index, 4);
+        assert_eq!(obstacle.candidate_collision_model_index, 5);
+        assert_eq!(obstacle.grid_min, [-8, -7]);
+        assert_eq!(obstacle.grid_max, [-6, -6]);
+    }
+
+    #[test]
+    fn parses_particle_intensities_relative_to_record_base() {
+        let particle_offset = SPACE_HEADER_SIZE;
+        let rec = particle_offset;
+        let intensity_offset = particle_offset + SPACE_PARTICLE_SIZE;
+        let old_wrong_offset = intensity_offset + 0x60;
+        let mut data = vec![0u8; old_wrong_offset + 24];
+
+        put_u32(&mut data, 0x08, 1);
+        put_i64(&mut data, 0x30, particle_offset as i64);
+        put_f32(&mut data, rec, 1.0);
+        put_f32(&mut data, rec + 0x14, 1.0);
+        put_f32(&mut data, rec + 0x28, 1.0);
+        put_f32(&mut data, rec + 0x3c, 1.0);
+        put_f32(&mut data, rec + 0x30, -741.305);
+        put_f32(&mut data, rec + 0x34, 13.294);
+        put_f32(&mut data, rec + 0x38, -172.677);
+        data[rec + 0x40..rec + 0x50].copy_from_slice(&[0xAB; 16]);
+        put_u64(&mut data, rec + 0x50, 0x1234_5678_90ab_cdef);
+        put_u32(&mut data, rec + 0x58, 6);
+        put_i64(&mut data, rec + 0x60, intensity_offset as i64 - rec as i64);
+
+        let values = [0.25, 0.8, 0.9, 1.5, 1.0, 1.0];
+        for (idx, value) in values.iter().enumerate() {
+            put_f32(&mut data, intensity_offset + idx * 4, *value);
+            put_f32(&mut data, old_wrong_offset + idx * 4, 99.0);
+        }
+
+        let parsed = parse_space_instances(&data).expect("space instances");
+        let particle = &parsed.particles[0];
+        assert_eq!(particle.position, [-741.305, 13.294, -172.677]);
+        assert_eq!(particle.raw_guid_blob, [0xAB; 16]);
+        assert_eq!(particle.resource_id, 0x1234_5678_90ab_cdef);
+        assert_eq!(particle.intensity_values, values);
+    }
+
+    #[test]
+    fn parses_particle_with_zero_intensity_count() {
+        let particle_offset = SPACE_HEADER_SIZE;
+        let rec = particle_offset;
+        let mut data = vec![0u8; particle_offset + SPACE_PARTICLE_SIZE];
+
+        put_u32(&mut data, 0x08, 1);
+        put_i64(&mut data, 0x30, particle_offset as i64);
+        put_u64(&mut data, rec + 0x50, 0x0fed_cba9_8765_4321);
+
+        let parsed = parse_space_instances(&data).expect("space instances");
+        let particle = &parsed.particles[0];
+        assert_eq!(particle.resource_id, 0x0fed_cba9_8765_4321);
+        assert_eq!(particle.intensity_count, 0);
+        assert!(particle.intensity_values.is_empty());
+    }
+
+    #[test]
+    fn parses_static_decal_texture_block_and_descriptors() {
+        let decal_offset = SPACE_HEADER_SIZE;
+        let rec = decal_offset;
+        let texture_block_offset = 0x120usize;
+        let tex0_offset = 0x180usize;
+        let tex1_offset = 0x1d0usize;
+        let tex2_offset = 0x220usize;
+        let tex0 = b"maps/decals/01_Solomon/spot_alpha_a.tga\0";
+        let tex1 = b"maps/decals/01_Solomon/spot_n.tga\0";
+        let tex2 = b"maps/decals/01_Solomon/spot_mg.tga\0";
+
+        let mut data = vec![0u8; tex2_offset + tex2.len()];
+        put_u32(&mut data, 0x14, 1);
+        put_i64(&mut data, 0x48, decal_offset as i64);
+        put_u32(&mut data, rec, 3);
+        put_u32(&mut data, rec + 0x04, 1);
+        put_u32(&mut data, rec + 0x08, 4);
+        put_u32(&mut data, rec + 0x10, 5);
+        put_f32(&mut data, rec + 0x14, 0.31);
+        put_u32(&mut data, rec + 0x18, 1);
+        put_i64(&mut data, rec + 0x20, texture_block_offset as i64 - rec as i64);
+        put_f32(&mut data, rec + 0x28, 1.0);
+        put_f32(&mut data, rec + 0x3c, 1.0);
+        put_f32(&mut data, rec + 0x50, 1.0);
+        put_f32(&mut data, rec + 0x64, 1.0);
+        put_f32(&mut data, rec + 0x58, -231.926);
+        put_f32(&mut data, rec + 0x5c, 0.188);
+        put_f32(&mut data, rec + 0x60, -66.611);
+
+        put_u64(&mut data, texture_block_offset, tex0.len() as u64);
+        put_i64(&mut data, texture_block_offset + 0x08, tex0_offset as i64 - texture_block_offset as i64);
+        put_u64(&mut data, texture_block_offset + 0x10, tex1.len() as u64);
+        put_i64(&mut data, texture_block_offset + 0x18, tex1_offset as i64 - (texture_block_offset + 0x10) as i64);
+        put_u64(&mut data, texture_block_offset + 0x20, tex2.len() as u64);
+        put_i64(&mut data, texture_block_offset + 0x28, tex2_offset as i64 - (texture_block_offset + 0x20) as i64);
+        data[tex0_offset..tex0_offset + tex0.len()].copy_from_slice(tex0);
+        data[tex1_offset..tex1_offset + tex1.len()].copy_from_slice(tex1);
+        data[tex2_offset..tex2_offset + tex2.len()].copy_from_slice(tex2);
+
+        let parsed = parse_space_instances(&data).expect("space instances");
+        let decal = &parsed.static_decals[0];
+        assert_eq!(decal.header.technique, 3);
+        assert_eq!(decal.header.variant, 5);
+        assert!((decal.header.alpha - 0.31).abs() < f32::EPSILON);
+        assert_eq!(decal.position, [-231.926, 0.188, -66.611]);
+        assert_eq!(decal.texture_paths[0].as_deref(), Some("maps/decals/01_Solomon/spot_alpha_a.tga"));
+        assert_eq!(decal.texture_paths[1].as_deref(), Some("maps/decals/01_Solomon/spot_n.tga"));
+        assert_eq!(decal.texture_paths[2].as_deref(), Some("maps/decals/01_Solomon/spot_mg.tga"));
+    }
+
+    #[test]
+    fn preserves_blank_static_decal_third_texture_slot() {
+        let decal_offset = SPACE_HEADER_SIZE;
+        let rec = decal_offset;
+        let texture_block_offset = 0x100usize;
+        let tex0_offset = 0x130usize;
+        let tex1_offset = 0x150usize;
+        let tex2_offset = 0x170usize;
+        let tex0 = b"maps/decals/Dock/a.dds\0";
+        let tex1 = b"maps/decals/Dock/n.dds\0";
+        let tex2 = b"\0";
+
+        let mut data = vec![0u8; tex2_offset + tex2.len()];
+        put_u32(&mut data, 0x14, 1);
+        put_i64(&mut data, 0x48, decal_offset as i64);
+        put_i64(&mut data, rec + 0x20, texture_block_offset as i64 - rec as i64);
+
+        put_u64(&mut data, texture_block_offset, tex0.len() as u64);
+        put_i64(&mut data, texture_block_offset + 0x08, tex0_offset as i64 - texture_block_offset as i64);
+        put_u64(&mut data, texture_block_offset + 0x10, tex1.len() as u64);
+        put_i64(&mut data, texture_block_offset + 0x18, tex1_offset as i64 - (texture_block_offset + 0x10) as i64);
+        put_u64(&mut data, texture_block_offset + 0x20, tex2.len() as u64);
+        put_i64(&mut data, texture_block_offset + 0x28, tex2_offset as i64 - (texture_block_offset + 0x20) as i64);
+        data[tex0_offset..tex0_offset + tex0.len()].copy_from_slice(tex0);
+        data[tex1_offset..tex1_offset + tex1.len()].copy_from_slice(tex1);
+        data[tex2_offset..tex2_offset + tex2.len()].copy_from_slice(tex2);
+
+        let parsed = parse_space_instances(&data).expect("space instances");
+        let decal = &parsed.static_decals[0];
+        assert_eq!(decal.texture_paths[0].as_deref(), Some("maps/decals/Dock/a.dds"));
+        assert_eq!(decal.texture_paths[1].as_deref(), Some("maps/decals/Dock/n.dds"));
+        assert_eq!(decal.texture_paths[2].as_deref(), Some(""));
+    }
+
+    #[test]
+    fn parses_space_probe_record_from_probe_subarray() {
+        let probe_offset = SPACE_HEADER_SIZE;
+        let rec = probe_offset;
+        let guid_offset = 0x100usize;
+        let name_offset = 0x128usize;
+        let guid = b"FFE10835.4B0F3F54.96C54EAD.82303DAF\0";
+        let name = b"main_probe\0";
+
+        let mut data = vec![0u8; name_offset + name.len()];
+        put_u32(&mut data, 0x10, 1);
+        put_i64(&mut data, 0x40, probe_offset as i64);
+        put_f32(&mut data, rec, 1.0);
+        put_f32(&mut data, rec + 0x14, 1.0);
+        put_f32(&mut data, rec + 0x28, 1.0);
+        put_f32(&mut data, rec + 0x3c, 1.0);
+        put_f32(&mut data, rec + 0x34, 0.5);
+        put_u64(&mut data, rec + 0x40, guid.len() as u64);
+        put_i64(&mut data, rec + 0x48, guid_offset as i64 - (rec + 0x40) as i64);
+        put_u64(&mut data, rec + 0x50, name.len() as u64);
+        put_i64(&mut data, rec + 0x58, name_offset as i64 - (rec + 0x50) as i64);
+        put_u32(&mut data, rec + 0x60, 512);
+        data[rec + 0x68] = 1;
+        data[rec + 0x69] = 1;
+        data[guid_offset..guid_offset + guid.len()].copy_from_slice(guid);
+        data[name_offset..name_offset + name.len()].copy_from_slice(name);
+
+        let parsed = parse_space_instances(&data).expect("space instances");
+        let probe = &parsed.probes[0];
+        assert_eq!(probe.guid.as_deref(), Some("FFE10835.4B0F3F54.96C54EAD.82303DAF"));
+        assert_eq!(probe.name.as_deref(), Some("main_probe"));
+        assert_eq!(probe.resolution, 512);
+        assert!(probe.is_main_probe);
+        assert!(probe.draw_full_scene);
+        assert_eq!(probe.position, [0.0, 0.5, 0.0]);
+    }
+
+    #[test]
+    fn parses_user_object_record_from_user_objects_subarray() {
+        let user_object_offset = SPACE_HEADER_SIZE;
+        let rec = user_object_offset;
+        let guid_offset = 0x100usize;
+        let type_offset = 0x128usize;
+        let properties_offset = 0x140usize;
+        let guid = b"D03F81A8.4506DA63.2999C39B.9EB68E8D\0";
+        let object_type = b"WayPoint\0";
+        let properties = b"<properties><next><item><guid>89E297B4.4A9DF3B8.880451BD.70EA35B6</guid><chunkId>fffaffffo</chunkId></item></next><speed>12.5</speed></properties>\0";
+
+        let mut data = vec![0u8; properties_offset + properties.len()];
+        put_u32(&mut data, 0x18, 1);
+        put_i64(&mut data, 0x50, user_object_offset as i64);
+        put_f32(&mut data, rec, 1.0);
+        put_f32(&mut data, rec + 0x14, 1.0);
+        put_f32(&mut data, rec + 0x28, 1.0);
+        put_f32(&mut data, rec + 0x3c, 1.0);
+        put_f32(&mut data, rec + 0x30, 10.0);
+        put_f32(&mut data, rec + 0x34, 2.0);
+        put_f32(&mut data, rec + 0x38, -5.0);
+        put_u64(&mut data, rec + 0x40, guid.len() as u64);
+        put_i64(&mut data, rec + 0x48, guid_offset as i64 - (rec + 0x40) as i64);
+        put_u64(&mut data, rec + 0x50, object_type.len() as u64);
+        put_i64(&mut data, rec + 0x58, type_offset as i64 - (rec + 0x50) as i64);
+        put_u64(&mut data, rec + 0x60, properties.len() as u64);
+        put_i64(&mut data, rec + 0x68, properties_offset as i64 - (rec + 0x60) as i64);
+        data[guid_offset..guid_offset + guid.len()].copy_from_slice(guid);
+        data[type_offset..type_offset + object_type.len()].copy_from_slice(object_type);
+        data[properties_offset..properties_offset + properties.len()].copy_from_slice(properties);
+
+        let parsed = parse_space_instances(&data).expect("space instances");
+        let object = &parsed.user_objects[0];
+        assert_eq!(object.guid.as_deref(), Some("D03F81A8.4506DA63.2999C39B.9EB68E8D"));
+        assert_eq!(object.object_type.as_deref(), Some("WayPoint"));
+        assert_eq!(object.position, [10.0, 2.0, -5.0]);
+        assert!(object.properties_well_formed);
+        assert_eq!(object.property_tags, ["next", "item", "guid", "chunkId", "speed"]);
+        assert_eq!(object.property_values.len(), 3);
+        assert_eq!(object.property_values[0].path, "next.item.guid");
+        assert_eq!(object.property_values[1].path, "next.item.chunkId");
+        assert_eq!(object.property_values[2].path, "speed");
+    }
+
+    #[test]
+    fn preserves_malformed_user_object_properties_as_raw_text() {
+        let user_object_offset = SPACE_HEADER_SIZE;
+        let rec = user_object_offset;
+        let type_offset = 0x100usize;
+        let properties_offset = 0x110usize;
+        let object_type = b"Barge\0";
+        let properties = b"<properties><bad></properties>\0";
+
+        let mut data = vec![0u8; properties_offset + properties.len()];
+        put_u32(&mut data, 0x18, 1);
+        put_i64(&mut data, 0x50, user_object_offset as i64);
+        put_u64(&mut data, rec + 0x50, object_type.len() as u64);
+        put_i64(&mut data, rec + 0x58, type_offset as i64 - (rec + 0x50) as i64);
+        put_u64(&mut data, rec + 0x60, properties.len() as u64);
+        put_i64(&mut data, rec + 0x68, properties_offset as i64 - (rec + 0x60) as i64);
+        data[type_offset..type_offset + object_type.len()].copy_from_slice(object_type);
+        data[properties_offset..properties_offset + properties.len()].copy_from_slice(properties);
+
+        let parsed = parse_space_instances(&data).expect("space instances");
+        let object = &parsed.user_objects[0];
+        assert_eq!(object.object_type.as_deref(), Some("Barge"));
+        assert_eq!(object.properties_xml.as_deref(), Some("<properties><bad></properties>"));
+        assert!(!object.properties_well_formed);
+        assert!(object.property_tags.is_empty());
+        assert!(object.property_values.is_empty());
     }
 }

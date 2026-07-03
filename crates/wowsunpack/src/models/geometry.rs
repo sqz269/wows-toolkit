@@ -13,6 +13,8 @@ use crate::data::parser_utils::parse_packed_string;
 use crate::data::parser_utils::resolve_relptr;
 
 const ENCD_MAGIC: u32 = 0x44434E45;
+pub const COLLISION_MODEL_MAGIC_2012_02_24: u32 = 0x2402_2012;
+pub const COLLISION_MODEL_MAGIC_2011_09_26: u32 = 0x2609_2011;
 
 /// Errors that can occur during `.geometry` file parsing.
 #[derive(Debug, Error)]
@@ -99,9 +101,123 @@ pub struct IndicesPrototype<'a> {
 
 #[derive(Debug)]
 pub struct ModelPrototype<'a> {
+    /// Collision-model payload bytes. Native `CollisionModelDataPrototype`
+    /// reflection names `+0x00` as `sizeInBytes`, `+0x08` as
+    /// `collisionModelName`, and `+0x18` as the `cmData` relptr.
     pub data: &'a [u8],
     pub name: String,
+    /// Native `sizeInBytes` field at descriptor +0x00.
     pub size_in_bytes: u32,
+    /// Absolute file offset of this 0x20-byte descriptor.
+    pub descriptor_offset: usize,
+    /// Native `cmData` relptr field at descriptor +0x18.
+    pub data_relptr: i64,
+    /// `data_relptr` resolved against `descriptor_offset`.
+    pub relptr_data_offset: Option<usize>,
+    /// Absolute file offset just after the descriptor table.
+    pub blob_offset: usize,
+    /// Absolute file range covered by this model's payload bytes.
+    pub segment_offset: usize,
+    pub segment_end_offset: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct CollisionModelData {
+    pub magic: u32,
+    pub objects: Vec<CollisionObject>,
+    pub consumed_bytes: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CollisionModelStats {
+    pub object_count: usize,
+    pub vertex_count: usize,
+    pub edge_pair_count: usize,
+    pub face_count: usize,
+    pub face_index_count: usize,
+    pub face_with_vertex_zero_count: usize,
+    pub debug_fan_triangle_count: usize,
+    pub native_postload_triangle_candidate_count: usize,
+    pub max_face_index_count: usize,
+}
+
+impl CollisionModelData {
+    pub fn stats(&self) -> CollisionModelStats {
+        let mut stats = CollisionModelStats {
+            object_count: self.objects.len(),
+            ..CollisionModelStats::default()
+        };
+        for object in &self.objects {
+            stats.vertex_count += object.vertices.len();
+            stats.edge_pair_count += object.edge_pairs.len();
+            stats.face_count += object.faces.len();
+            for face in &object.faces {
+                stats.face_index_count += face.vertex_indices.len();
+                stats.max_face_index_count = stats.max_face_index_count.max(face.vertex_indices.len());
+                if face.contains_vertex_zero() {
+                    stats.face_with_vertex_zero_count += 1;
+                }
+                stats.debug_fan_triangle_count += face.debug_fan_triangle_count();
+                stats.native_postload_triangle_candidate_count += face.native_postload_triangle_count();
+            }
+        }
+        stats
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CollisionObject {
+    /// 12-byte vector array consumed by `Physics::CollisionModel::load`.
+    pub vertices: Vec<[f32; 3]>,
+    /// 8-byte pair array. Corpus validation shows each pair indexes
+    /// `vertices[]`; face records index this array separately.
+    pub edge_pairs: Vec<[u32; 2]>,
+    pub faces: Vec<CollisionFace>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CollisionFace {
+    /// Index loop into `CollisionObject::vertices`.
+    pub vertex_indices: Vec<u32>,
+    /// Parallel index loop into `CollisionObject::edge_pairs`.
+    pub edge_pair_indices: Vec<u32>,
+    /// Present for magic `0x24022012`; absent for `0x26092011`.
+    /// Native post-load storage writes it near face-record offset `+0x30`.
+    pub field_30: Option<u32>,
+}
+
+impl CollisionFace {
+    pub fn contains_vertex_zero(&self) -> bool {
+        self.vertex_indices.contains(&0)
+    }
+
+    pub fn debug_fan_triangle_count(&self) -> usize {
+        self.vertex_indices.len().saturating_sub(2)
+    }
+
+    pub fn native_postload_triangle_candidate(&self) -> bool {
+        self.debug_fan_triangle_count() > 0 && !self.contains_vertex_zero()
+    }
+
+    pub fn native_postload_triangle_count(&self) -> usize {
+        if self.native_postload_triangle_candidate() {
+            self.debug_fan_triangle_count()
+        } else {
+            0
+        }
+    }
+
+    /// Diagnostic polygon fan. Native post-load code only caches the no-zero
+    /// subset; keep this helper labelled as debug geometry, not solver parity.
+    pub fn debug_fan_triangles(&self) -> Vec<[u32; 3]> {
+        if self.vertex_indices.len() < 3 {
+            return Vec::new();
+        }
+        let first = self.vertex_indices[0];
+        (2..self.vertex_indices.len())
+            .map(|index| [first, self.vertex_indices[index - 1], self.vertex_indices[index]])
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -434,6 +550,128 @@ pub fn parse_splash_file(data: &[u8]) -> Result<Vec<SplashBox>, Report<GeometryE
     Ok(boxes)
 }
 
+/// Parse a native `Physics::CollisionModel::load` payload (`cmData`).
+///
+/// This is a diagnostic parser for the loader-level object structure. It does
+/// not yet assign final gameplay/physics names to every section and does not
+/// reproduce native broad-phase or collision-query behavior.
+pub fn parse_collision_model_data(data: &[u8]) -> Result<CollisionModelData, Report<GeometryError>> {
+    let mut cursor = CollisionCursor::new(data);
+    let magic = cursor.read_u32("collision magic")?;
+    if magic != COLLISION_MODEL_MAGIC_2012_02_24 && magic != COLLISION_MODEL_MAGIC_2011_09_26 {
+        return Err(Report::new(GeometryError::ParseError(format!(
+            "collision model: unsupported magic 0x{magic:08X}"
+        ))));
+    }
+
+    let object_count = cursor.read_u32("collision object count")? as usize;
+    let mut objects = Vec::with_capacity(object_count);
+    for object_index in 0..object_count {
+        let vertex_count = cursor.read_u32("collision vertex count")? as usize;
+        let mut vertices = Vec::with_capacity(vertex_count);
+        for _ in 0..vertex_count {
+            vertices.push([cursor.read_f32("vertex x")?, cursor.read_f32("vertex y")?, cursor.read_f32("vertex z")?]);
+        }
+
+        let edge_pair_count = cursor.read_u32("collision edge-pair count")? as usize;
+        let mut edge_pairs = Vec::with_capacity(edge_pair_count);
+        for pair_index in 0..edge_pair_count {
+            let a = cursor.read_u32("edge-pair a")?;
+            let b = cursor.read_u32("edge-pair b")?;
+            if a as usize >= vertex_count || b as usize >= vertex_count {
+                return Err(Report::new(GeometryError::ParseError(format!(
+                    "collision object[{object_index}] edge_pair[{pair_index}] references vertex {a}/{b}, vertex_count={vertex_count}"
+                ))));
+            }
+            edge_pairs.push([a, b]);
+        }
+
+        let face_count = cursor.read_u32("collision face count")? as usize;
+        let mut faces = Vec::with_capacity(face_count);
+        for face_index in 0..face_count {
+            let index_count = cursor.read_u32("collision face index count")? as usize;
+
+            let mut vertex_indices = Vec::with_capacity(index_count);
+            for index_slot in 0..index_count {
+                let index = cursor.read_u32("collision face vertex index")?;
+                if index as usize >= vertex_count {
+                    return Err(Report::new(GeometryError::ParseError(format!(
+                        "collision object[{object_index}] face[{face_index}] vertex_indices[{index_slot}]={index} >= vertex_count={vertex_count}"
+                    ))));
+                }
+                vertex_indices.push(index);
+            }
+
+            let mut edge_pair_indices = Vec::with_capacity(index_count);
+            for index_slot in 0..index_count {
+                let index = cursor.read_u32("collision face edge-pair index")?;
+                if index as usize >= edge_pair_count {
+                    return Err(Report::new(GeometryError::ParseError(format!(
+                        "collision object[{object_index}] face[{face_index}] edge_pair_indices[{index_slot}]={index} >= edge_pair_count={edge_pair_count}"
+                    ))));
+                }
+                edge_pair_indices.push(index);
+            }
+
+            let field_30 = if magic == COLLISION_MODEL_MAGIC_2011_09_26 {
+                None
+            } else {
+                Some(cursor.read_u32("collision face field_30")?)
+            };
+
+            faces.push(CollisionFace { vertex_indices, edge_pair_indices, field_30 });
+        }
+
+        objects.push(CollisionObject { vertices, edge_pairs, faces });
+    }
+
+    if cursor.pos != data.len() {
+        return Err(Report::new(GeometryError::ParseError(format!(
+            "collision model: {} trailing bytes after parse",
+            data.len() - cursor.pos
+        ))));
+    }
+
+    Ok(CollisionModelData { magic, objects, consumed_bytes: cursor.pos })
+}
+
+struct CollisionCursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> CollisionCursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn take(&mut self, len: usize, label: &str) -> Result<&'a [u8], Report<GeometryError>> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or_else(|| Report::new(GeometryError::ParseError(format!("collision model: {label} offset overflow"))))?;
+        let bytes = self.data.get(self.pos..end).ok_or_else(|| {
+            Report::new(GeometryError::ParseError(format!(
+                "collision model: {label} out of bounds at 0x{:X}, need {len}, have {}",
+                self.pos,
+                self.data.len().saturating_sub(self.pos)
+            )))
+        })?;
+        self.pos = end;
+        Ok(bytes)
+    }
+
+    fn read_u32(&mut self, label: &str) -> Result<u32, Report<GeometryError>> {
+        let bytes = self.take(4, label)?;
+        Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
+    fn read_f32(&mut self, label: &str) -> Result<f32, Report<GeometryError>> {
+        let bytes = self.take(4, label)?;
+        Ok(f32::from_le_bytes(bytes.try_into().unwrap()))
+    }
+}
+
 /// Parse the struct fields of an IndicesPrototype (0x10 bytes).
 /// Returns (data_relptr, size_in_bytes, index_size).
 fn parse_indices_fields(input: &mut &[u8]) -> WResult<(i64, u32, u16)> {
@@ -470,10 +708,10 @@ fn parse_indices_array<'a>(
 /// Parse the struct fields of a ModelPrototype (0x20 bytes: armor or collision).
 /// Returns (data_relptr, size_in_bytes).
 fn parse_model_fields(input: &mut &[u8]) -> WResult<(i64, u32)> {
-    let data_relptr = le_i64.parse_next(input)?;
-    let _packed_string: &[u8] = take(16usize).parse_next(input)?;
     let size_in_bytes = le_u32.parse_next(input)?;
-    let _padding = le_u32.parse_next(input)?;
+    let _reserved = le_u32.parse_next(input)?;
+    let _packed_string: &[u8] = take(16usize).parse_next(input)?;
+    let data_relptr = le_i64.parse_next(input)?;
     Ok((data_relptr, size_in_bytes))
 }
 
@@ -555,9 +793,8 @@ fn parse_armor_data(data: &[u8]) -> Result<Vec<ArmorTriangle>, Report<GeometryEr
     Ok(triangles)
 }
 
-/// Parse armor model array. Unlike collision models where data_relptr points to
-/// the start of the data, for armor models the actual data extends from right
-/// after the struct (struct_base + 0x20) to data_offset + size_in_bytes.
+/// Parse armor model array. Armor records use the same native
+/// `{ sizeInBytes, name, data relptr }` descriptor shape as collision models.
 fn parse_armor_model_array(
     file_data: &[u8],
     offset: usize,
@@ -576,10 +813,8 @@ fn parse_armor_model_array(
         let name = parse_packed_string(file_data, packed_string_base)
             .map_err(|e| Report::new(GeometryError::ParseError(format!("armor[{i}] packed string: {e}"))))?;
 
-        // Armor data starts right after the struct and extends to where
-        // data_relptr + size_in_bytes points (relptr points near the end)
-        let data_start = struct_base + 0x20;
-        let data_end = resolve_relptr(struct_base, data_relptr) + size_in_bytes as usize;
+        let data_start = resolve_relptr(struct_base, data_relptr);
+        let data_end = data_start + size_in_bytes as usize;
 
         if data_end > file_data.len() {
             return Err(Report::new(GeometryError::OutOfBounds { offset: data_end }));
@@ -600,6 +835,7 @@ fn parse_model_array<'a>(
     count: usize,
 ) -> Result<Vec<ModelPrototype<'a>>, Report<GeometryError>> {
     let mut result = Vec::with_capacity(count);
+    let blob_offset = offset + count * 0x20;
 
     for i in 0..count {
         let struct_base = offset + i * 0x20;
@@ -611,15 +847,221 @@ fn parse_model_array<'a>(
         let packed_string_base = struct_base + 0x08;
         let name = parse_packed_string(file_data, packed_string_base)
             .map_err(|e| Report::new(GeometryError::ParseError(format!("model[{i}] packed string: {e}"))))?;
-        let data_offset = resolve_relptr(struct_base, data_relptr);
 
-        if data_offset + size_in_bytes as usize > file_data.len() {
-            return Err(Report::new(GeometryError::OutOfBounds { offset: data_offset }));
+        let relptr_data_offset = (struct_base as i64)
+            .checked_add(data_relptr)
+            .and_then(|offset| usize::try_from(offset).ok());
+        let Some(segment_offset) = relptr_data_offset else {
+            return Err(Report::new(GeometryError::OutOfBounds { offset: struct_base }));
+        };
+        let segment_end_offset = segment_offset + size_in_bytes as usize;
+        if segment_end_offset > file_data.len() {
+            return Err(Report::new(GeometryError::OutOfBounds { offset: segment_end_offset }));
         }
-        let data = &file_data[data_offset..data_offset + size_in_bytes as usize];
 
-        result.push(ModelPrototype { data, name, size_in_bytes });
+        let data = &file_data[segment_offset..segment_end_offset];
+
+        result.push(ModelPrototype {
+            data,
+            name,
+            size_in_bytes,
+            descriptor_offset: struct_base,
+            data_relptr,
+            relptr_data_offset,
+            blob_offset,
+            segment_offset,
+            segment_end_offset,
+        });
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn put_i64(data: &mut [u8], offset: usize, value: i64) {
+        data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(data: &mut [u8], offset: usize, value: u32) {
+        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u32(data: &mut Vec<u8>, value: u32) {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_f32(data: &mut Vec<u8>, value: f32) {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn parses_collision_model_payloads_from_size_and_cmdata_relptr() {
+        let table_offset = 0x20usize;
+        let count = 3usize;
+        let blob_offset = table_offset + count * 0x20;
+        let mut data = vec![0u8; blob_offset + 0x0b];
+
+        put_u32(&mut data, table_offset, 0x04);
+        put_i64(&mut data, table_offset + 0x18, blob_offset as i64 - table_offset as i64);
+        put_u32(&mut data, table_offset + 0x20, 0x06);
+        put_i64(
+            &mut data,
+            table_offset + 0x20 + 0x18,
+            (blob_offset + 0x04) as i64 - (table_offset + 0x20) as i64,
+        );
+        put_u32(&mut data, table_offset + 0x40, 0x01);
+        put_i64(
+            &mut data,
+            table_offset + 0x40 + 0x18,
+            (blob_offset + 0x0a) as i64 - (table_offset + 0x40) as i64,
+        );
+
+        data[blob_offset..blob_offset + 0x0b].copy_from_slice(&[
+            0xa0, 0xa1, 0xa2, 0xa3, 0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xc0,
+        ]);
+
+        let parsed = parse_model_array(&data, table_offset, count).expect("collision models");
+
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].data, &[0xa0, 0xa1, 0xa2, 0xa3]);
+        assert_eq!(parsed[0].size_in_bytes, 0x04);
+        assert_eq!(parsed[0].descriptor_offset, table_offset);
+        assert_eq!(parsed[0].relptr_data_offset, Some(blob_offset));
+        assert_eq!(parsed[0].blob_offset, blob_offset);
+        assert_eq!(parsed[0].segment_offset, blob_offset);
+        assert_eq!(parsed[0].segment_end_offset, blob_offset + 0x04);
+
+        assert_eq!(parsed[1].data, &[0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5]);
+        assert_eq!(parsed[1].size_in_bytes, 0x06);
+        assert_eq!(parsed[1].segment_offset, blob_offset + 0x04);
+        assert_eq!(parsed[1].segment_end_offset, blob_offset + 0x0a);
+
+        assert_eq!(parsed[2].data, &[0xc0]);
+        assert_eq!(parsed[2].size_in_bytes, 0x01);
+        assert_eq!(parsed[2].segment_offset, blob_offset + 0x0a);
+        assert_eq!(parsed[2].segment_end_offset, blob_offset + 0x0b);
+    }
+
+    #[test]
+    fn rejects_collision_model_cmdata_range_past_file_end() {
+        let table_offset = 0x20usize;
+        let count = 1usize;
+        let blob_offset = table_offset + count * 0x20;
+        let mut data = vec![0u8; blob_offset + 0x04];
+
+        put_u32(&mut data, table_offset, 0x08);
+        put_i64(&mut data, table_offset + 0x18, blob_offset as i64 - table_offset as i64);
+
+        let err = parse_model_array(&data, table_offset, count).expect_err("range should fail");
+        let message = err.to_string();
+        assert!(message.contains("beyond file"), "{message}");
+    }
+
+    #[test]
+    fn parses_collision_model_cmdata_loader_payload() {
+        let mut data = Vec::new();
+        push_u32(&mut data, COLLISION_MODEL_MAGIC_2012_02_24);
+        push_u32(&mut data, 1); // object count
+        push_u32(&mut data, 3); // vertices
+        for vertex in [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            for value in vertex {
+                push_f32(&mut data, value);
+            }
+        }
+        push_u32(&mut data, 3); // edge pairs
+        for pair in [[0, 1], [1, 2], [2, 0]] {
+            push_u32(&mut data, pair[0]);
+            push_u32(&mut data, pair[1]);
+        }
+        push_u32(&mut data, 1); // faces
+        push_u32(&mut data, 3); // face index count
+        for index in [0, 1, 2] {
+            push_u32(&mut data, index);
+        }
+        for index in [0, 1, 2] {
+            push_u32(&mut data, index);
+        }
+        push_u32(&mut data, 0x44); // field_30 for 0x24022012
+
+        let parsed = parse_collision_model_data(&data).expect("cmData");
+
+        assert_eq!(parsed.magic, COLLISION_MODEL_MAGIC_2012_02_24);
+        assert_eq!(parsed.consumed_bytes, data.len());
+        assert_eq!(parsed.objects.len(), 1);
+        let object = &parsed.objects[0];
+        assert_eq!(object.vertices.len(), 3);
+        assert_eq!(object.edge_pairs, [[0, 1], [1, 2], [2, 0]]);
+        assert_eq!(object.faces.len(), 1);
+        assert_eq!(object.faces[0].vertex_indices, [0, 1, 2]);
+        assert_eq!(object.faces[0].edge_pair_indices, [0, 1, 2]);
+        assert_eq!(object.faces[0].field_30, Some(0x44));
+
+        let stats = parsed.stats();
+        assert_eq!(stats.object_count, 1);
+        assert_eq!(stats.vertex_count, 3);
+        assert_eq!(stats.edge_pair_count, 3);
+        assert_eq!(stats.face_count, 1);
+        assert_eq!(stats.face_index_count, 3);
+        assert_eq!(stats.face_with_vertex_zero_count, 1);
+        assert_eq!(stats.debug_fan_triangle_count, 1);
+        assert_eq!(stats.native_postload_triangle_candidate_count, 0);
+        assert_eq!(stats.max_face_index_count, 3);
+    }
+
+    #[test]
+    fn parses_legacy_collision_model_cmdata_without_face_field_30() {
+        let mut data = Vec::new();
+        push_u32(&mut data, COLLISION_MODEL_MAGIC_2011_09_26);
+        push_u32(&mut data, 1); // object count
+        push_u32(&mut data, 3); // vertices
+        for vertex in [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            for value in vertex {
+                push_f32(&mut data, value);
+            }
+        }
+        push_u32(&mut data, 3); // edge pairs
+        for pair in [[0, 1], [1, 2], [2, 0]] {
+            push_u32(&mut data, pair[0]);
+            push_u32(&mut data, pair[1]);
+        }
+        push_u32(&mut data, 1); // faces
+        push_u32(&mut data, 3); // face index count
+        for index in [0, 1, 2] {
+            push_u32(&mut data, index);
+        }
+        for index in [0, 1, 2] {
+            push_u32(&mut data, index);
+        }
+
+        let parsed = parse_collision_model_data(&data).expect("legacy cmData");
+        assert_eq!(parsed.objects[0].faces[0].field_30, None);
+    }
+
+    #[test]
+    fn collision_face_debug_fan_and_native_candidate_counts() {
+        let no_zero_face = CollisionFace {
+            vertex_indices: vec![3, 4, 5, 6],
+            edge_pair_indices: vec![0, 1, 2, 3],
+            field_30: Some(7),
+        };
+        assert!(!no_zero_face.contains_vertex_zero());
+        assert!(no_zero_face.native_postload_triangle_candidate());
+        assert_eq!(no_zero_face.debug_fan_triangle_count(), 2);
+        assert_eq!(no_zero_face.native_postload_triangle_count(), 2);
+        assert_eq!(no_zero_face.debug_fan_triangles(), vec![[3, 4, 5], [3, 5, 6]]);
+
+        let zero_face = CollisionFace {
+            vertex_indices: vec![3, 0, 5, 6],
+            edge_pair_indices: vec![0, 1, 2, 3],
+            field_30: Some(8),
+        };
+        assert!(zero_face.contains_vertex_zero());
+        assert!(!zero_face.native_postload_triangle_candidate());
+        assert_eq!(zero_face.debug_fan_triangle_count(), 2);
+        assert_eq!(zero_face.native_postload_triangle_count(), 0);
+        assert_eq!(zero_face.debug_fan_triangles(), vec![[3, 0, 5], [3, 5, 6]]);
+    }
 }

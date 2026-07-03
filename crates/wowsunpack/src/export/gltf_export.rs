@@ -483,8 +483,12 @@ pub struct MapModelInstance {
     /// LNR* / TILEDLAND backdrop landmass proxies that the engine renders
     /// with a coarser LOD policy + distance-fog attenuation.
     pub is_landscape: bool,
-    /// Engine `minimumQualityLevel` (0=Low, 1=Medium, 2=High, 3=Ultra).
-    /// Engine skips the instance when runtime quality is below this.
+    /// Engine `minimumQualityLevel` raw threshold. Native code stages this byte
+    /// into ecs::model::ModelPropertiesComponent byte 1 and filters map model
+    /// ids against the OBJECT_LOD runtime raw byte. Native quality tokens are
+    /// descending: MAX/MAXIMUM=0, VERYHIGH=1, HIGH=2, MEDIUM=3, LOW=4,
+    /// VERYLOW=5, MIN/MINIMUM=6. Consumers should draw when
+    /// object_lod_runtime_raw <= this.
     pub min_quality_level: u8,
     /// Stable authoring GUID string from the ModelInstance descriptor, when present.
     pub stable_guid: Option<String>,
@@ -504,6 +508,66 @@ pub struct MapModelInstance {
     pub material_instance_count: u8,
     /// Decoded 0x70-stride `MaterialInstancePrototype` overrides.
     pub material_instances: Vec<crate::models::material::MaterialPrototype>,
+}
+
+/// A map-authored particle emitter anchor from `space.bin.particles[]`.
+pub struct MapParticleInstance {
+    pub transform: [f32; 16],
+    pub position: [f32; 3],
+    pub raw_guid_blob: [u8; 16],
+    pub resource_id: u64,
+    pub resource_path: Option<String>,
+    pub intensity_count: u32,
+    pub intensity_values: Vec<f32>,
+}
+
+/// A map-authored obstacle/collision-proxy record enriched with best-effort
+/// joins to `space.bin.models[]` and `models.geometry.collision_models[]`.
+pub struct MapObstacleInstance {
+    pub source_offset: usize,
+    pub transform: [f32; 16],
+    pub position: [f32; 3],
+    pub packed_indices: u32,
+    pub candidate_model_instance_index: u16,
+    pub candidate_collision_model_index: u16,
+    pub candidate_model_instance_valid: bool,
+    pub candidate_model_path_id: Option<u64>,
+    pub candidate_model_stable_guid: Option<String>,
+    pub candidate_collision_model_valid: bool,
+    pub candidate_collision_model_size_bytes: Option<u32>,
+    pub candidate_collision_model_cm_data_offset: Option<usize>,
+    pub candidate_collision_model_cm_data_end_offset: Option<usize>,
+    pub candidate_collision_model_cm_data_relptr: Option<i64>,
+    pub candidate_collision_model_name: Option<String>,
+    pub candidate_collision_model_magic: Option<u32>,
+    pub candidate_collision_model_object_count: Option<usize>,
+    pub candidate_collision_model_vertex_count: Option<usize>,
+    pub candidate_collision_model_edge_pair_count: Option<usize>,
+    pub candidate_collision_model_face_count: Option<usize>,
+    pub candidate_collision_model_face_index_count: Option<usize>,
+    pub candidate_collision_model_face_with_vertex_zero_count: Option<usize>,
+    pub candidate_collision_model_debug_fan_triangle_count: Option<usize>,
+    pub candidate_collision_model_native_triangle_candidate_count: Option<usize>,
+    pub candidate_collision_model_max_face_index_count: Option<usize>,
+    pub candidate_collision_model_parse_error: Option<String>,
+    pub field_44: u32,
+    pub grid_min: [i32; 2],
+    pub grid_max: [i32; 2],
+}
+
+#[derive(Clone)]
+struct CollisionModelDiagnosticSummary {
+    magic: Option<u32>,
+    object_count: Option<usize>,
+    vertex_count: Option<usize>,
+    edge_pair_count: Option<usize>,
+    face_count: Option<usize>,
+    face_index_count: Option<usize>,
+    face_with_vertex_zero_count: Option<usize>,
+    debug_fan_triangle_count: Option<usize>,
+    native_triangle_candidate_count: Option<usize>,
+    max_face_index_count: Option<usize>,
+    parse_error: Option<String>,
 }
 
 /// Complete decoded map scene, format-agnostic.
@@ -530,11 +594,21 @@ pub struct MapScene {
     /// GPU-instanced vegetation: `(mesh_idx, positions)` per species.
     /// Exported as `EXT_mesh_gpu_instancing` nodes (one node per species).
     pub vegetation_instances: Vec<(usize, Vec<[f32; 3]>)>,
+    /// Engine ObstacleInstance placements from `space.bin`'s obstacles[] sub-array.
+    pub obstacles: Vec<MapObstacleInstance>,
+    /// Engine ParticleInstance placements from `space.bin`'s particles[] sub-array.
+    pub particles: Vec<MapParticleInstance>,
+    /// Engine StaticDecalInstance placements from `space.bin`'s staticDecals[] sub-array.
+    pub static_decals: Vec<crate::models::merged_models::SpaceStaticDecal>,
     /// Engine PointLightInstance placements from `space.bin`'s pointLights[]
     /// sub-array (stride 0xc0). Emitted into Scene extras as a `lights`
     /// array — the webview consumer instantiates `THREE.PointLight` per
     /// entry. World position already has the instance transform applied.
     pub point_lights: Vec<crate::models::merged_models::SpacePointLight>,
+    /// Engine ProbeInstance placements from `space.bin`'s probes[] sub-array.
+    pub probes: Vec<crate::models::merged_models::SpaceProbe>,
+    /// Engine UserObjectInstance placements from `space.bin`'s userObjects[] sub-array.
+    pub user_objects: Vec<crate::models::merged_models::SpaceUserObject>,
 }
 
 /// Cache key for deduplicating map materials by visual parameters.
@@ -924,9 +998,142 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         );
     }
 
+    let collision_model_summaries: Vec<CollisionModelDiagnosticSummary> = geometry
+        .collision_models
+        .iter()
+        .map(|model| match crate::models::geometry::parse_collision_model_data(model.data) {
+            Ok(parsed) => {
+                let stats = parsed.stats();
+                CollisionModelDiagnosticSummary {
+                    magic: Some(parsed.magic),
+                    object_count: Some(stats.object_count),
+                    vertex_count: Some(stats.vertex_count),
+                    edge_pair_count: Some(stats.edge_pair_count),
+                    face_count: Some(stats.face_count),
+                    face_index_count: Some(stats.face_index_count),
+                    face_with_vertex_zero_count: Some(stats.face_with_vertex_zero_count),
+                    debug_fan_triangle_count: Some(stats.debug_fan_triangle_count),
+                    native_triangle_candidate_count: Some(stats.native_postload_triangle_candidate_count),
+                    max_face_index_count: Some(stats.max_face_index_count),
+                    parse_error: None,
+                }
+            }
+            Err(error) => CollisionModelDiagnosticSummary {
+                magic: None,
+                object_count: None,
+                vertex_count: None,
+                edge_pair_count: None,
+                face_count: None,
+                face_index_count: None,
+                face_with_vertex_zero_count: None,
+                debug_fan_triangle_count: None,
+                native_triangle_candidate_count: None,
+                max_face_index_count: None,
+                parse_error: Some(error.to_string()),
+            },
+        })
+        .collect();
+
+    let obstacles: Vec<MapObstacleInstance> = space
+        .map(|s| {
+            s.obstacles
+                .iter()
+                .map(|o| {
+                    let model_ref = s.instances.get(o.candidate_model_instance_index as usize);
+                    let collision_model_ref = geometry.collision_models.get(o.candidate_collision_model_index as usize);
+                    let collision_summary = collision_model_summaries.get(o.candidate_collision_model_index as usize);
+                    MapObstacleInstance {
+                        source_offset: o.source_offset,
+                        transform: o.transform.0,
+                        position: o.position,
+                        packed_indices: o.packed_indices,
+                        candidate_model_instance_index: o.candidate_model_instance_index,
+                        candidate_collision_model_index: o.candidate_collision_model_index,
+                        candidate_model_instance_valid: model_ref.is_some(),
+                        candidate_model_path_id: model_ref.map(|m| m.path_id),
+                        candidate_model_stable_guid: model_ref.and_then(|m| m.stable_guid.clone()),
+                        candidate_collision_model_valid: collision_model_ref.is_some(),
+                        candidate_collision_model_size_bytes: collision_model_ref.map(|m| m.size_in_bytes),
+                        candidate_collision_model_cm_data_offset: collision_model_ref.map(|m| m.segment_offset),
+                        candidate_collision_model_cm_data_end_offset: collision_model_ref.map(|m| m.segment_end_offset),
+                        candidate_collision_model_cm_data_relptr: collision_model_ref.map(|m| m.data_relptr),
+                        candidate_collision_model_name: collision_model_ref
+                            .map(|m| m.name.clone())
+                            .filter(|name| !name.is_empty()),
+                        candidate_collision_model_magic: collision_summary.and_then(|summary| summary.magic),
+                        candidate_collision_model_object_count: collision_summary.and_then(|summary| summary.object_count),
+                        candidate_collision_model_vertex_count: collision_summary.and_then(|summary| summary.vertex_count),
+                        candidate_collision_model_edge_pair_count: collision_summary
+                            .and_then(|summary| summary.edge_pair_count),
+                        candidate_collision_model_face_count: collision_summary.and_then(|summary| summary.face_count),
+                        candidate_collision_model_face_index_count: collision_summary
+                            .and_then(|summary| summary.face_index_count),
+                        candidate_collision_model_face_with_vertex_zero_count: collision_summary
+                            .and_then(|summary| summary.face_with_vertex_zero_count),
+                        candidate_collision_model_debug_fan_triangle_count: collision_summary
+                            .and_then(|summary| summary.debug_fan_triangle_count),
+                        candidate_collision_model_native_triangle_candidate_count: collision_summary
+                            .and_then(|summary| summary.native_triangle_candidate_count),
+                        candidate_collision_model_max_face_index_count: collision_summary
+                            .and_then(|summary| summary.max_face_index_count),
+                        candidate_collision_model_parse_error: collision_summary
+                            .and_then(|summary| summary.parse_error.clone()),
+                        field_44: o.field_44,
+                        grid_min: o.grid_min,
+                        grid_max: o.grid_max,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !obstacles.is_empty() {
+        eprintln!("  {} obstacles", obstacles.len());
+    }
+
+    let particles: Vec<MapParticleInstance> = space
+        .map(|s| {
+            s.particles
+                .iter()
+                .map(|p| {
+                    let resource_path = db.and_then(|db| {
+                        let index = self_id_index.as_ref()?;
+                        let entry_idx = *index.get(&p.resource_id)?;
+                        Some(db.reconstruct_path(entry_idx, index))
+                    });
+                    MapParticleInstance {
+                        transform: p.transform.0,
+                        position: p.position,
+                        raw_guid_blob: p.raw_guid_blob,
+                        resource_id: p.resource_id,
+                        resource_path,
+                        intensity_count: p.intensity_count,
+                        intensity_values: p.intensity_values.clone(),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !particles.is_empty() {
+        let resolved = particles.iter().filter(|p| p.resource_path.is_some()).count();
+        eprintln!("  {} particles ({resolved} resource paths resolved)", particles.len());
+    }
+
+    let static_decals = space.map(|s| s.static_decals.clone()).unwrap_or_default();
+    if !static_decals.is_empty() {
+        eprintln!("  {} static decals", static_decals.len());
+    }
+
     let point_lights = space.map(|s| s.point_lights.clone()).unwrap_or_default();
     if !point_lights.is_empty() {
         eprintln!("  {} point lights", point_lights.len());
+    }
+    let probes = space.map(|s| s.probes.clone()).unwrap_or_default();
+    if !probes.is_empty() {
+        eprintln!("  {} probes", probes.len());
+    }
+    let user_objects = space.map(|s| s.user_objects.clone()).unwrap_or_default();
+    if !user_objects.is_empty() {
+        eprintln!("  {} user objects", user_objects.len());
     }
 
     Ok(MapScene {
@@ -938,7 +1145,12 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         bounds: bounds.clone(),
         fog: fog.clone(),
         vegetation_instances,
+        obstacles,
+        particles,
+        static_decals,
         point_lights,
+        probes,
+        user_objects,
     })
 }
 
@@ -1170,21 +1382,121 @@ fn build_instance_extras(inst: &MapModelInstance) -> json::extras::Extras {
     serde_json::value::to_raw_value(&value).ok().map(Box::from)
 }
 
-/// Build glTF `extras` for the root Scene: map bounds + engine fog state
-/// + point lights.
+/// Build glTF `extras` for the root Scene: map bounds + engine fog state,
+/// obstacle proxies, point lights, probes, authored user objects, map particle
+/// anchors, and static map decals.
 ///
 /// Three.js maps Scene extras to `gltf.scene.userData`, so the webview
 /// can pull `bounds` (playable area), `fog` (color + density + near
-/// distance + far plane), and `lights` (engine point lights) without a
-/// separate sidecar fetch. We don't use `KHR_lights_punctual` because
+/// distance + far plane), `lights` (engine point lights), and `probes`
+/// (engine IBL/debug anchors) without a separate sidecar fetch. Obstacles,
+/// user objects, particle anchors, and static decals are also emitted as
+/// authoring/debug metadata for overlays and later collision/effect/projector
+/// instancing. We don't use `KHR_lights_punctual` because
 /// the toolkit's `gltf-json` build doesn't enable that extension feature
 /// — scene extras is the lower-friction path and three.js consumes it as
 /// `gltf.scene.userData.lights` natively.
 fn build_scene_extras(
     bounds: &SpaceBounds,
     fog: Option<&SpaceFog>,
+    obstacles: &[MapObstacleInstance],
+    particles: &[MapParticleInstance],
+    static_decals: &[crate::models::merged_models::SpaceStaticDecal],
     point_lights: &[crate::models::merged_models::SpacePointLight],
+    probes: &[crate::models::merged_models::SpaceProbe],
+    user_objects: &[crate::models::merged_models::SpaceUserObject],
 ) -> json::extras::Extras {
+    let obstacles: Vec<_> = obstacles
+        .iter()
+        .map(|o| {
+            let source_offset_hex = format!("0x{:X}", o.source_offset);
+            let packed_indices_hex = format!("0x{:08X}", o.packed_indices);
+            let candidate_collision_model_magic_hex = o
+                .candidate_collision_model_magic
+                .map(|magic| format!("0x{magic:08X}"));
+            serde_json::json!({
+                "source_offset": o.source_offset,
+                "source_offset_hex": source_offset_hex,
+                "position": o.position,
+                "transform": o.transform,
+                "packed_indices": o.packed_indices,
+                "packed_indices_hex": packed_indices_hex,
+                "candidate_model_instance_index": o.candidate_model_instance_index,
+                "candidate_collision_model_index": o.candidate_collision_model_index,
+                "candidate_model_instance_valid": o.candidate_model_instance_valid,
+                "candidate_model_path_id": o.candidate_model_path_id,
+                "candidate_model_stable_guid": o.candidate_model_stable_guid.as_deref(),
+                "candidate_collision_model_valid": o.candidate_collision_model_valid,
+                "candidate_collision_model_size_bytes": o.candidate_collision_model_size_bytes,
+                "candidate_collision_model_cm_data_offset": o.candidate_collision_model_cm_data_offset,
+                "candidate_collision_model_cm_data_end_offset": o.candidate_collision_model_cm_data_end_offset,
+                "candidate_collision_model_cm_data_relptr": o.candidate_collision_model_cm_data_relptr,
+                "candidate_collision_model_name": o.candidate_collision_model_name.as_deref(),
+                "candidate_collision_model_magic": o.candidate_collision_model_magic,
+                "candidate_collision_model_magic_hex": candidate_collision_model_magic_hex.as_deref(),
+                "candidate_collision_model_object_count": o.candidate_collision_model_object_count,
+                "candidate_collision_model_vertex_count": o.candidate_collision_model_vertex_count,
+                "candidate_collision_model_edge_pair_count": o.candidate_collision_model_edge_pair_count,
+                "candidate_collision_model_face_count": o.candidate_collision_model_face_count,
+                "candidate_collision_model_face_index_count": o.candidate_collision_model_face_index_count,
+                "candidate_collision_model_face_with_vertex_zero_count": o.candidate_collision_model_face_with_vertex_zero_count,
+                "candidate_collision_model_debug_fan_triangle_count": o.candidate_collision_model_debug_fan_triangle_count,
+                "candidate_collision_model_native_triangle_candidate_count": o.candidate_collision_model_native_triangle_candidate_count,
+                "candidate_collision_model_max_face_index_count": o.candidate_collision_model_max_face_index_count,
+                "candidate_collision_model_parse_error": o.candidate_collision_model_parse_error.as_deref(),
+                "field_44": o.field_44,
+                "grid_min": o.grid_min,
+                "grid_max": o.grid_max,
+            })
+        })
+        .collect();
+    let particles: Vec<_> = particles
+        .iter()
+        .map(|p| {
+            let resource_id_hex = format!("0x{:016X}", p.resource_id);
+            serde_json::json!({
+                "position": p.position,
+                "transform": p.transform,
+                "raw_guid_blob": p.raw_guid_blob,
+                "resource_id": p.resource_id,
+                "resource_id_hex": resource_id_hex,
+                "resource_path": p.resource_path.as_deref(),
+                "intensity_count": p.intensity_count,
+                "intensity_values": &p.intensity_values,
+            })
+        })
+        .collect();
+    let static_decals: Vec<_> = static_decals
+        .iter()
+        .map(|d| {
+            let texture_paths: Vec<_> = d.texture_paths.iter().map(|p| p.as_deref()).collect();
+            serde_json::json!({
+                "position": d.position,
+                "transform": d.transform.0,
+                "header": {
+                    "technique": d.header.technique,
+                    "influence": d.header.influence,
+                    "field_08": d.header.field_08,
+                    "field_0c": d.header.field_0c,
+                    "variant": d.header.variant,
+                    "alpha": d.header.alpha,
+                    "field_18": d.header.field_18,
+                    "field_1c": d.header.field_1c,
+                },
+                "header_tuple": [
+                    d.header.technique,
+                    d.header.influence,
+                    d.header.field_08,
+                    d.header.field_0c,
+                    d.header.variant,
+                    d.header.field_18,
+                    d.header.field_1c,
+                ],
+                "alpha": d.header.alpha,
+                "texture_paths": texture_paths,
+            })
+        })
+        .collect();
     let lights: Vec<_> = point_lights
         .iter()
         .map(|l| {
@@ -1196,6 +1508,45 @@ fn build_scene_extras(
                 "color": l.color,
                 "radius": l.radius,
                 "min_quality": l.min_quality,
+            })
+        })
+        .collect();
+    let probes: Vec<_> = probes
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "guid": p.guid.as_deref(),
+                "name": p.name.as_deref(),
+                "position": p.position,
+                "transform": p.transform.0,
+                "resolution": p.resolution,
+                "is_main_probe": p.is_main_probe,
+                "draw_full_scene": p.draw_full_scene,
+            })
+        })
+        .collect();
+    let user_objects: Vec<_> = user_objects
+        .iter()
+        .map(|u| {
+            let property_values: Vec<_> = u
+                .property_values
+                .iter()
+                .map(|value| {
+                    serde_json::json!({
+                        "path": value.path.as_str(),
+                        "value": value.value.as_str(),
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "guid": u.guid.as_deref(),
+                "type": u.object_type.as_deref(),
+                "position": u.position,
+                "transform": u.transform.0,
+                "properties_xml": u.properties_xml.as_deref(),
+                "properties_well_formed": u.properties_well_formed,
+                "property_tags": &u.property_tags,
+                "property_values": property_values,
             })
         })
         .collect();
@@ -1212,9 +1563,209 @@ fn build_scene_extras(
             "fog_near_distance": f.fog_near_distance,
             "far_plane": f.far_plane,
         })),
+        "obstacles": obstacles,
+        "particles": particles,
+        "static_decals": static_decals,
         "lights": lights,
+        "probes": probes,
+        "user_objects": user_objects,
     });
     serde_json::value::to_raw_value(&value).ok().map(Box::from)
+}
+
+/// Write a map-level diagnostic collision manifest.
+///
+/// The manifest joins `space.bin.obstacles[]` placements to the unique
+/// `models.geometry.collision_models[]` payloads. Face fan triangles are
+/// labelled diagnostic proxy geometry; this sidecar does not claim native
+/// movement/projectile/navigation/LOS solver parity.
+pub fn write_map_collision_manifest_json(
+    scene: &MapScene,
+    geometry: &MergedGeometry<'_>,
+    source: &str,
+    mut writer: impl Write,
+) -> Result<(), Report<ExportError>> {
+    let mut reference_counts = vec![0usize; geometry.collision_models.len()];
+    for obstacle in &scene.obstacles {
+        let index = obstacle.candidate_collision_model_index as usize;
+        if index < reference_counts.len() {
+            reference_counts[index] += 1;
+        }
+    }
+    let referenced_collision_model_count = reference_counts.iter().filter(|&&count| count > 0).count();
+
+    let mut parse_error_count = 0usize;
+    let collision_models: Vec<_> = geometry
+        .collision_models
+        .iter()
+        .enumerate()
+        .map(|(model_index, model)| {
+            let magic_at_start = model
+                .data
+                .get(0..4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four-byte magic slice")));
+
+            match crate::models::geometry::parse_collision_model_data(model.data) {
+                Ok(parsed) => {
+                    let stats = parsed.stats();
+                    let objects: Vec<_> = parsed
+                        .objects
+                        .iter()
+                        .enumerate()
+                        .map(|(object_index, object)| {
+                            let faces: Vec<_> = object
+                                .faces
+                                .iter()
+                                .enumerate()
+                                .map(|(face_index, face)| {
+                                    serde_json::json!({
+                                        "index": face_index,
+                                        "index_count": face.vertex_indices.len(),
+                                        "vertex_indices": &face.vertex_indices,
+                                        "edge_pair_indices": &face.edge_pair_indices,
+                                        "field_30": face.field_30,
+                                        "contains_vertex_zero": face.contains_vertex_zero(),
+                                        "native_postload_triangle_candidate": face.native_postload_triangle_candidate(),
+                                        "debug_fan_triangles": face.debug_fan_triangles(),
+                                    })
+                                })
+                                .collect();
+
+                            serde_json::json!({
+                                "index": object_index,
+                                "vertex_count": object.vertices.len(),
+                                "edge_pair_count": object.edge_pairs.len(),
+                                "face_count": object.faces.len(),
+                                "debug_fan_triangle_count": object
+                                    .faces
+                                    .iter()
+                                    .map(|face| face.debug_fan_triangle_count())
+                                    .sum::<usize>(),
+                                "native_postload_triangle_candidate_count": object
+                                    .faces
+                                    .iter()
+                                    .map(|face| face.native_postload_triangle_count())
+                                    .sum::<usize>(),
+                                "vertices": &object.vertices,
+                                "edge_pairs": &object.edge_pairs,
+                                "faces": faces,
+                            })
+                        })
+                        .collect();
+
+                    serde_json::json!({
+                        "index": model_index,
+                        "name": model.name.as_str(),
+                        "referenced_by_obstacle_count": reference_counts[model_index],
+                        "size_in_bytes": model.size_in_bytes,
+                        "descriptor_offset": model.descriptor_offset,
+                        "descriptor_offset_hex": format!("0x{:X}", model.descriptor_offset),
+                        "cm_data_offset": model.segment_offset,
+                        "cm_data_offset_hex": format!("0x{:X}", model.segment_offset),
+                        "cm_data_end_offset": model.segment_end_offset,
+                        "cm_data_end_offset_hex": format!("0x{:X}", model.segment_end_offset),
+                        "cm_data_relptr": model.data_relptr,
+                        "magic": parsed.magic,
+                        "magic_hex": format!("0x{:08X}", parsed.magic),
+                        "consumed_bytes": parsed.consumed_bytes,
+                        "parse_error": serde_json::Value::Null,
+                        "stats": {
+                            "object_count": stats.object_count,
+                            "vertex_count": stats.vertex_count,
+                            "edge_pair_count": stats.edge_pair_count,
+                            "face_count": stats.face_count,
+                            "face_index_count": stats.face_index_count,
+                            "face_with_vertex_zero_count": stats.face_with_vertex_zero_count,
+                            "debug_fan_triangle_count": stats.debug_fan_triangle_count,
+                            "native_postload_triangle_candidate_count": stats.native_postload_triangle_candidate_count,
+                            "max_face_index_count": stats.max_face_index_count,
+                        },
+                        "objects": objects,
+                    })
+                }
+                Err(error) => {
+                    parse_error_count += 1;
+                    serde_json::json!({
+                        "index": model_index,
+                        "name": model.name.as_str(),
+                        "referenced_by_obstacle_count": reference_counts[model_index],
+                        "size_in_bytes": model.size_in_bytes,
+                        "descriptor_offset": model.descriptor_offset,
+                        "descriptor_offset_hex": format!("0x{:X}", model.descriptor_offset),
+                        "cm_data_offset": model.segment_offset,
+                        "cm_data_offset_hex": format!("0x{:X}", model.segment_offset),
+                        "cm_data_end_offset": model.segment_end_offset,
+                        "cm_data_end_offset_hex": format!("0x{:X}", model.segment_end_offset),
+                        "cm_data_relptr": model.data_relptr,
+                        "magic": magic_at_start,
+                        "magic_hex": magic_at_start.map(|magic| format!("0x{magic:08X}")),
+                        "parse_error": error.to_string(),
+                    })
+                }
+            }
+        })
+        .collect();
+
+    let obstacles: Vec<_> = scene
+        .obstacles
+        .iter()
+        .map(|obstacle| {
+            serde_json::json!({
+                "source_offset": obstacle.source_offset,
+                "source_offset_hex": format!("0x{:X}", obstacle.source_offset),
+                "position": obstacle.position,
+                "transform": obstacle.transform,
+                "packed_indices": obstacle.packed_indices,
+                "packed_indices_hex": format!("0x{:08X}", obstacle.packed_indices),
+                "candidate_model_instance_index": obstacle.candidate_model_instance_index,
+                "candidate_collision_model_index": obstacle.candidate_collision_model_index,
+                "candidate_model_instance_valid": obstacle.candidate_model_instance_valid,
+                "candidate_model_path_id": obstacle.candidate_model_path_id,
+                "candidate_model_stable_guid": obstacle.candidate_model_stable_guid.as_deref(),
+                "candidate_collision_model_valid": obstacle.candidate_collision_model_valid,
+                "candidate_collision_model_name": obstacle.candidate_collision_model_name.as_deref(),
+                "candidate_collision_model_size_bytes": obstacle.candidate_collision_model_size_bytes,
+                "candidate_collision_model_cm_data_offset": obstacle.candidate_collision_model_cm_data_offset,
+                "candidate_collision_model_cm_data_end_offset": obstacle.candidate_collision_model_cm_data_end_offset,
+                "candidate_collision_model_cm_data_relptr": obstacle.candidate_collision_model_cm_data_relptr,
+                "field_44": obstacle.field_44,
+                "grid_min": obstacle.grid_min,
+                "grid_max": obstacle.grid_max,
+            })
+        })
+        .collect();
+
+    let manifest = serde_json::json!({
+        "schema": "wows.map.collision_manifest.v1",
+        "source": source,
+        "bounds": {
+            "min_x": scene.bounds.min_x,
+            "max_x": scene.bounds.max_x,
+            "min_z": scene.bounds.min_z,
+            "max_z": scene.bounds.max_z,
+        },
+        "collision_model_count": geometry.collision_models.len(),
+        "referenced_collision_model_count": referenced_collision_model_count,
+        "collision_model_parse_error_count": parse_error_count,
+        "obstacle_count": scene.obstacles.len(),
+        "notes": [
+            "obstacles come from space.bin obstacles[] and reference models.geometry collision_models[] by high u16 packed index",
+            "collision model objects preserve loader-level vertices, edge pairs, face loops, and field_30",
+            "debug_fan_triangles triangulate each face loop as a simple visualization proxy",
+            "native_postload_triangle_candidate mirrors the observed no-zero face condition in FUN_1403d9ea0",
+            "this manifest does not prove movement, projectile, navigation, LOS, or broad-phase solver parity"
+        ],
+        "obstacles": obstacles,
+        "collision_models": collision_models,
+    });
+
+    serde_json::to_writer_pretty(&mut writer, &manifest)
+        .map_err(|e| Report::new(ExportError::Serialize(e.to_string())))?;
+    writer
+        .write_all(b"\n")
+        .map_err(|e| Report::new(ExportError::Io(e.to_string())))?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1464,9 +2015,22 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
     // far-plane parameters. Three.js exposes them as
     // `gltf.scene.userData`; the webview drives THREE.FogExp2 +
     // PerspectiveCamera.far from this.
-    let scene_extras = build_scene_extras(&scene.bounds, scene.fog.as_ref(), &scene.point_lights);
-    let gltf_scene =
-        root.push(json::Scene { nodes: scene_nodes, name: None, extensions: Default::default(), extras: scene_extras });
+    let scene_extras = build_scene_extras(
+        &scene.bounds,
+        scene.fog.as_ref(),
+        &scene.obstacles,
+        &scene.particles,
+        &scene.static_decals,
+        &scene.point_lights,
+        &scene.probes,
+        &scene.user_objects,
+    );
+    let gltf_scene = root.push(json::Scene {
+        nodes: scene_nodes,
+        name: None,
+        extensions: Default::default(),
+        extras: scene_extras,
+    });
     root.scene = Some(gltf_scene);
 
     let json_string =

@@ -261,7 +261,11 @@ fn parse_material_with_record_size(
     record_size: usize,
 ) -> Result<MaterialPrototype, Report<MaterialError>> {
     if record_data.len() < record_size {
-        return Err(Report::new(MaterialError::DataTooShort { offset: 0, need: record_size, have: record_data.len() }));
+        return Err(Report::new(MaterialError::DataTooShort {
+            offset: 0,
+            need: record_size,
+            have: record_data.len(),
+        }));
     }
 
     let hdr = {
