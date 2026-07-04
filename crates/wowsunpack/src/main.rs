@@ -3381,6 +3381,7 @@ fn run_export_map(
             "prototypes": scene.prototypes.iter().map(|p| serde_json::json!({
                 "name": p.name,
                 "model_path": p.model_path,
+                "local_mesh": p.name.is_none().then(|| format!("local_{}", p.model_index)),
                 "instance_count": p.instance_count,
                 "landscape_instance_count": p.landscape_instance_count,
             })).collect::<Vec<_>>(),
@@ -3392,6 +3393,51 @@ fn run_export_map(
                 Err(e) => eprintln!("Warning: failed to write map_model_prototypes.json: {e}"),
             },
             Err(e) => eprintln!("Warning: prototype sidecar serialize failed: {e}"),
+        }
+    }
+
+    // 9c. Standalone GLBs for MAP-LOCAL prototypes (vri == 0 — meshes exist
+    // only inside this map's models.bin, so `batch-export-model` can't reach
+    // them). Written per used prototype to `map_local/local_<index>.glb`,
+    // in the map frame (native units, no ×15 bake) so the instance
+    // manifest's matrices place them verbatim; instance extras carry the
+    // matching `local_mesh` key.
+    {
+        let local_indices: Vec<usize> =
+            scene.prototypes.iter().filter(|p| p.name.is_none()).map(|p| p.model_index).collect();
+        if !local_indices.is_empty() {
+            let out_dir = output.parent().unwrap_or_else(|| Path::new("."));
+            let local_dir = out_dir.join("map_local");
+            if let Err(e) = std::fs::create_dir_all(&local_dir) {
+                eprintln!("Warning: failed to create map_local/: {e}");
+            } else {
+                let (mut written, mut failed, mut bytes_total) = (0usize, 0usize, 0u64);
+                for &model_index in &local_indices {
+                    let path = local_dir.join(format!("local_{model_index}.glb"));
+                    let result = std::fs::File::create(&path)
+                        .map_err(|e| e.to_string())
+                        .and_then(|mut f| {
+                            gltf_export::export_map_local_prototype_glb(&scene, model_index, &mut f)
+                                .map_err(|e| e.to_string())
+                        });
+                    match result {
+                        Ok(()) => {
+                            written += 1;
+                            bytes_total += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        }
+                        Err(e) => {
+                            failed += 1;
+                            eprintln!("Warning: map-local prototype {model_index}: {e}");
+                        }
+                    }
+                }
+                println!(
+                    "  Map-local prototypes: {written}/{} GLBs under map_local/ ({} KiB){}",
+                    local_indices.len(),
+                    bytes_total / 1024,
+                    if failed > 0 { format!(", {failed} FAILED") } else { String::new() },
+                );
+            }
         }
     }
 

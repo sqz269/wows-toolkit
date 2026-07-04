@@ -499,6 +499,12 @@ pub struct MapModelInstance {
     /// batch-export the prototype standalone. `None` for map-local
     /// prototypes (vri == 0 or unresolvable).
     pub model_path: Option<String>,
+    /// `models.bin` record index of the prototype when it is MAP-LOCAL
+    /// (no `assets.bin` identity, so no `model_path`). Keys the standalone
+    /// per-map GLB written by the export driver
+    /// (`map_local/local_<index>.glb`) and the `local_mesh` instance
+    /// extras. `None` for prototypes resolvable through `assets.bin`.
+    pub local_prototype: Option<usize>,
     /// Engine `isLandscape` flag from the ModelInstance record. Identifies
     /// LNR* / TILEDLAND backdrop landmass proxies that the engine renders
     /// with a coarser LOD policy + distance-fog attenuation.
@@ -637,6 +643,11 @@ struct CollisionModelDiagnosticSummary {
 pub struct MapScene {
     /// Unique mesh primitives for instanced models (render sets, grouped per model).
     pub model_meshes: Vec<MapMesh>,
+    /// Per-`models.bin`-prototype range into `model_meshes` (index = record
+    /// index; empty range = prototype decoded no meshes at this LOD).
+    /// Lets exporters address a prototype's meshes without going through
+    /// an instance — used by the standalone map-local prototype GLBs.
+    pub model_mesh_ranges: Vec<std::ops::Range<usize>>,
     /// Positioned model instances referencing `model_meshes` by range.
     pub model_instances: Vec<MapModelInstance>,
     /// Shared albedo textures (PNG bytes). Meshes reference these by index.
@@ -706,6 +717,10 @@ pub struct MapPrototypeInfo {
     /// VFS path sans extension naming the `.geometry`/`.visual` pair;
     /// `None` for map-local prototypes.
     pub model_path: Option<String>,
+    /// `models.bin` record index — stable per-map key. For map-local
+    /// prototypes (`name == None`) this keys the standalone GLB
+    /// (`map_local/local_<index>.glb`).
+    pub model_index: usize,
     pub instance_count: u32,
     pub landscape_instance_count: u32,
 }
@@ -1115,6 +1130,7 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                 transform: negate_z_transform(inst.transform.0),
                 asset_name: asset_names[model_idx].clone(),
                 model_path: asset_paths[model_idx].clone(),
+                local_prototype: asset_names[model_idx].is_none().then_some(model_idx),
                 is_landscape: inst.is_landscape,
                 min_quality_level: inst.min_quality_level,
                 stable_guid: inst.stable_guid.clone(),
@@ -1143,6 +1159,7 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                 transform: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
                 asset_name: asset_names[model_idx].clone(),
                 model_path: asset_paths[model_idx].clone(),
+                local_prototype: asset_names[model_idx].is_none().then_some(model_idx),
                 is_landscape: false,
                 min_quality_level: 0,
                 stable_guid: None,
@@ -1448,6 +1465,7 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
 
     Ok(MapScene {
         model_meshes,
+        model_mesh_ranges,
         model_instances,
         textures,
         terrain,
@@ -1470,11 +1488,12 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                 .map(|(model_idx, (count, landscape))| MapPrototypeInfo {
                     name: asset_names[model_idx].clone(),
                     model_path: asset_paths[model_idx].clone(),
+                    model_index: model_idx,
                     instance_count: count,
                     landscape_instance_count: landscape,
                 })
                 .collect();
-            prototypes.sort_by(|a, b| a.name.cmp(&b.name));
+            prototypes.sort_by(|a, b| a.name.cmp(&b.name).then(a.model_index.cmp(&b.model_index)));
             prototypes
         },
         weathers: weathers.clone(),
@@ -1701,6 +1720,14 @@ fn build_instance_extras(inst: &MapModelInstance, dyed_material_indices: &[u32])
         // Prototype identity: VFS path sans extension, naming the
         // `.geometry`/`.visual` pair for standalone `export-model` runs.
         value["model_path"] = serde_json::json!(model_path);
+    }
+    if let Some(local_idx) = inst.local_prototype {
+        // Map-local prototype identity (no assets.bin path): keys the
+        // per-map standalone GLB written by the export driver at
+        // `map_local/<local_mesh>.glb`. The mesh stays in the map frame
+        // (Z-negated RH, NATIVE units, no ×15 bake), so consumers place it
+        // with this node's matrix exactly like the embedded copy.
+        value["local_mesh"] = serde_json::json!(format!("local_{local_idx}"));
     }
     if !dyes.is_empty() {
         value["dyes"] = serde_json::json!(dyes);
@@ -2504,6 +2531,145 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
 
     glb.to_writer(writer).map_err(|e| Report::new(ExportError::Io(e.to_string())))?;
 
+    Ok(())
+}
+
+/// Export ONE map-local prototype (`vri == 0`, no `assets.bin` identity) as a
+/// standalone GLB, so consumers that spawn prototypes from a shared library
+/// (instead of the whole-map GLB) can place map-local instances too.
+///
+/// Geometry is written EXACTLY as decoded into [`MapScene::model_meshes`]:
+/// map frame (right-handed, Z negated), NATIVE BigWorld units — deliberately
+/// NOT the `export-model` ship convention (×15 metres baked into vertices).
+/// The instance manifest's node matrix (metric translation, native-scale 3×3)
+/// therefore places this mesh identically to the embedded map-GLB copy.
+/// Static-node part matrices are already baked into the vertices at decode.
+///
+/// All parts become primitives of a single mesh/node named `local_<index>`.
+/// Only the textures this prototype references are embedded.
+pub fn export_map_local_prototype_glb(
+    scene: &MapScene,
+    model_index: usize,
+    writer: &mut impl Write,
+) -> Result<(), Report<ExportError>> {
+    let Some(range) = scene.model_mesh_ranges.get(model_index) else {
+        return Err(Report::new(ExportError::Serialize(format!(
+            "model index {model_index} out of range ({} prototypes)",
+            scene.model_mesh_ranges.len(),
+        ))));
+    };
+    if range.is_empty() {
+        return Err(Report::new(ExportError::Serialize(format!("prototype {model_index} decoded no meshes"))));
+    }
+
+    let mut root = json::Root {
+        asset: json::Asset {
+            version: "2.0".to_string(),
+            generator: Some("wowsunpack".to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bin_data: Vec<u8> = Vec::new();
+
+    // Embed only the textures this prototype's meshes reference, keyed by
+    // the scene-wide texture index so shared parts dedup within the file.
+    let mut gltf_texture_cache: HashMap<usize, json::Index<json::Texture>> = HashMap::new();
+    for mesh_idx in range.clone() {
+        let Some(tex_idx) = scene.model_meshes[mesh_idx].albedo_texture else {
+            continue;
+        };
+        if gltf_texture_cache.contains_key(&tex_idx) {
+            continue;
+        }
+        let png_bytes = &scene.textures[tex_idx];
+        let byte_offset = bin_data.len();
+        bin_data.extend_from_slice(png_bytes);
+        pad_to_4(&mut bin_data);
+        let bv = root.push(json::buffer::View {
+            buffer: json::Index::new(0),
+            byte_length: USize64::from(png_bytes.len()),
+            byte_offset: Some(USize64::from(byte_offset)),
+            byte_stride: None,
+            target: None,
+            name: None,
+            extensions: Default::default(),
+            extras: Default::default(),
+        });
+        let image = root.push(json::Image {
+            buffer_view: Some(bv),
+            mime_type: Some(json::image::MimeType("image/png".to_string())),
+            uri: None,
+            name: Some(format!("texture_{tex_idx}")),
+            extensions: Default::default(),
+            extras: Default::default(),
+        });
+        let tex = root.push(json::Texture {
+            source: image,
+            sampler: None,
+            name: None,
+            extensions: Default::default(),
+            extras: Default::default(),
+        });
+        gltf_texture_cache.insert(tex_idx, tex);
+    }
+
+    let mut mat_cache: MapMaterialCache = HashMap::new();
+    let primitives: Vec<json::mesh::Primitive> = range
+        .clone()
+        .map(|mesh_idx| {
+            build_map_mesh_primitive(
+                &mut root,
+                &mut bin_data,
+                &scene.model_meshes[mesh_idx],
+                &mut mat_cache,
+                &gltf_texture_cache,
+            )
+        })
+        .collect();
+
+    let label = format!("local_{model_index}");
+    let mesh = root.push(json::Mesh {
+        primitives,
+        weights: None,
+        name: Some(label.clone()),
+        extensions: Default::default(),
+        extras: Default::default(),
+    });
+    let node = root.push(json::Node { mesh: Some(mesh), name: Some(label.clone()), ..Default::default() });
+
+    while !bin_data.len().is_multiple_of(4) {
+        bin_data.push(0);
+    }
+    if !bin_data.is_empty() {
+        let buffer = root.push(json::Buffer {
+            byte_length: USize64::from(bin_data.len()),
+            uri: None,
+            name: None,
+            extensions: Default::default(),
+            extras: Default::default(),
+        });
+        for bv in root.buffer_views.iter_mut() {
+            bv.buffer = buffer;
+        }
+    }
+
+    let gltf_scene = root.push(json::Scene {
+        nodes: vec![node],
+        name: Some(label),
+        extensions: Default::default(),
+        extras: Default::default(),
+    });
+    root.scene = Some(gltf_scene);
+
+    let json_string =
+        json::serialize::to_string(&root).map_err(|e| Report::new(ExportError::Serialize(e.to_string())))?;
+    let glb = gltf::binary::Glb {
+        header: gltf::binary::Header { magic: *b"glTF", version: 2, length: 0 },
+        json: Cow::Owned(json_string.into_bytes()),
+        bin: if bin_data.is_empty() { None } else { Some(Cow::Owned(bin_data)) },
+    };
+    glb.to_writer(writer).map_err(|e| Report::new(ExportError::Io(e.to_string())))?;
     Ok(())
 }
 
