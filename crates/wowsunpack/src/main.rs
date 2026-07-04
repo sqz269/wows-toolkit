@@ -3244,6 +3244,44 @@ fn run_export_map(
             for i in &sp.mesh.indices {
                 mesh_blob.extend_from_slice(&i.to_le_bytes());
             }
+
+            // GENERATED LOD chain (schema v3): the map-species `.stsdk`
+            // files ship a single mesh (draw_count == 1; VB+IB fill the
+            // file — probed across the corpus 2026-07-04), so coarser
+            // levels are produced here with meshopt quadric
+            // simplification. Each LOD is only an extra INDEX range into
+            // the same vertex arrays. Foliage cards are collapse-resistant
+            // (every leaf-quad edge is a border), so targets are modest
+            // and a level is dropped when it fails to shrink ≥10% —
+            // consumers must treat `lods` as best-effort (possibly empty).
+            let mut lods: Vec<serde_json::Value> = Vec::new();
+            {
+                let mut prev_count = sp.mesh.indices.len();
+                for &(fraction, target_error) in &[(0.35f32, 0.30f32), (0.12f32, 0.60f32)] {
+                    let target = (((sp.mesh.indices.len() as f32 * fraction) as usize) / 3 * 3).max(96);
+                    if target >= prev_count {
+                        break;
+                    }
+                    let mut dst = vec![0u32; sp.mesh.indices.len()];
+                    let n = meshopt_rs::simplify::simplify(
+                        &mut dst,
+                        &sp.mesh.indices,
+                        &sp.mesh.positions,
+                        target,
+                        target_error,
+                    );
+                    if n == 0 || n >= prev_count * 9 / 10 {
+                        break;
+                    }
+                    let lod_offset = mesh_blob.len();
+                    for i in &dst[..n] {
+                        mesh_blob.extend_from_slice(&i.to_le_bytes());
+                    }
+                    lods.push(serde_json::json!({"indices_offset": lod_offset, "index_count": n}));
+                    prev_count = n;
+                }
+            }
+
             let albedo_file = sp.albedo_png.as_ref().map(|png| {
                 let name = format!("veg_albedo_{sp_idx}.png");
                 if let Err(e) = std::fs::write(out_dir.join(&name), png) {
@@ -3251,6 +3289,14 @@ fn run_export_map(
                 }
                 name
             });
+            if !lods.is_empty() {
+                let counts: Vec<String> = lods.iter().map(|l| l["index_count"].to_string()).collect();
+                println!(
+                    "  Vegetation LODs: species {sp_idx} {} -> [{}] indices",
+                    sp.mesh.indices.len(),
+                    counts.join(", "),
+                );
+            }
             species_entries.push(serde_json::json!({
                 "index": sp_idx,
                 "vertex_count": sp.mesh.positions.len(),
@@ -3259,6 +3305,7 @@ fn run_export_map(
                 "normals_offset": normals_offset,
                 "uvs_offset": uvs_offset,
                 "indices_offset": indices_offset,
+                "lods": lods,
                 "albedo_file": albedo_file,
             }));
         }
@@ -3332,9 +3379,10 @@ fn run_export_map(
             eprintln!("Warning: failed to write vegetation_meshes.bin: {e}");
         }
         let manifest = serde_json::json!({
-            "schema": "wows_map_vegetation/v2",
+            "schema": "wows_map_vegetation/v3",
             "frame": "map-GLB frame: x = BW x, z = -BW z, y up; native BW units (apply the consumer's BW->metre ruler)",
             "record": "f32le x, y, z, yaw, scale (20 bytes): yaw = radians about +Y in the map frame (already conjugated from BW; DXBC-proven per-tree rotation), scale = uniform per-tree multiplier (~0.57-1.59). v1 records were 12-byte positions only.",
+            "lod_semantics": "species.lods = GENERATED coarser index ranges into the SAME vertex arrays (meshopt simplify; the source .stsdk ships one mesh). Best-effort — may be empty; entry order = decreasing detail.",
             "meshes_file": "vegetation_meshes.bin",
             "species": species_entries,
             "layers": layer_entries,
