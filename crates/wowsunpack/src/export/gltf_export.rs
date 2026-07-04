@@ -670,6 +670,10 @@ pub struct MapScene {
     /// export driver), when the map ships the `sdf_dist.dds`/`sdf_dir.dds`
     /// pair. `None` for the 55/82 maps that never baked it.
     pub shoreline: Option<ShorelineData>,
+    /// Raw full-resolution heightfield sidecar metadata (file written next
+    /// to the GLB by the export driver). `None` when terrain is disabled or
+    /// `terrain.bin` is absent.
+    pub terrain_heightmap: Option<TerrainHeightmapData>,
     /// Per-weather-preset environment blocks parsed from
     /// `space.ubersettings` (fog, wind, sun, sun disk, sky dome asset paths,
     /// PBS cubemapsPath + packed SH, HDR environment), emitted verbatim as
@@ -705,6 +709,26 @@ pub struct ShorelineData {
     /// weather block), authored order — 1:1 with the `shoreline*` shader
     /// constants (`maxShoreDist` is in metres).
     pub params: Vec<(String, f32)>,
+}
+
+/// Raw terrain heightfield sidecar description.
+///
+/// The GLB terrain mesh is a viewing artifact: decimated by `--terrain-step`,
+/// heights clamped to sea level, fully-submerged cells culled. This sidecar
+/// preserves the FULL-resolution `terrain.bin` grid — bathymetry included —
+/// for consumers that rebuild terrain natively (heightfield collision,
+/// water-depth fields, custom LOD).
+#[derive(Clone)]
+pub struct TerrainHeightmapData {
+    /// Sidecar filename (relative to the GLB): row-major u16 little-endian,
+    /// `width × height` samples. Decode:
+    /// `h = min_height + value / 65535 × (max_height − min_height)` metres.
+    pub file: String,
+    pub width: u32,
+    pub height: u32,
+    /// Height range (metres, sea level = 0) used for u16 normalization.
+    pub min_height: f32,
+    pub max_height: f32,
 }
 
 /// Cache key for deduplicating map materials by visual parameters.
@@ -760,6 +784,7 @@ pub struct BuildMapSceneParams<'a> {
     pub vegetation: Option<&'a VegetationData>,
     pub vegetation_density: f32,
     pub shoreline: Option<ShorelineData>,
+    pub terrain_heightmap: Option<TerrainHeightmapData>,
     pub weathers: Option<serde_json::Value>,
     /// Decoded `forest_tintmap.dds` as PNG (RGB = per-location vegetation
     /// tint multiplied into SpeedTree albedo; A = terrain-correlated AO
@@ -783,6 +808,7 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         vegetation,
         vegetation_density,
         ref shoreline,
+        ref terrain_heightmap,
         ref weathers,
         ref vegetation_tint_png,
     } = *params;
@@ -1389,6 +1415,7 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         user_objects,
         dyed_materials,
         shoreline: shoreline.clone(),
+        terrain_heightmap: terrain_heightmap.clone(),
         weathers: weathers.clone(),
         vegetation_tint_texture,
     })
@@ -1671,6 +1698,7 @@ fn build_scene_extras(
     probes: &[crate::models::merged_models::SpaceProbe],
     user_objects: &[crate::models::merged_models::SpaceUserObject],
     shoreline: Option<&ShorelineData>,
+    terrain_heightmap: Option<&TerrainHeightmapData>,
     weathers: Option<&serde_json::Value>,
     vegetation_tint_texture: Option<usize>,
 ) -> json::extras::Extras {
@@ -1853,6 +1881,24 @@ fn build_scene_extras(
             "dist_value_to_texels": { "scale": 42.6, "exponent": 4.17 },
             "dir_encoding": "theta = value/255*2pi; (sin,−cos) in (u,v) points toward shore; 0 on land",
             "params": s.params.iter().cloned().collect::<std::collections::BTreeMap<String, f32>>(),
+        })),
+        // Raw full-resolution heightfield sidecar (u16 LE row-major, written
+        // next to the GLB; bathymetry preserved, unlike the GLB terrain
+        // mesh). Grid frame matches the terrain mesh SOURCE grid:
+        //   x(col) = min_x + col * (max_x - min_x) / (width - 1)
+        //   z(row) = min_z + row * (max_z - min_z) / (height - 1)  [BW frame;
+        //       glTF z = -z, so row 0 = min_z — OPPOSITE the shoreline /
+        //       vegetation_tint v_origin=max_z frame]
+        "terrain_heightmap": terrain_heightmap.map(|t| serde_json::json!({
+            "file": t.file,
+            "width": t.width,
+            "height": t.height,
+            "encoding": "u16le",
+            "height_decode": "h = min_height + value/65535*(max_height-min_height) metres",
+            "min_height": t.min_height,
+            "max_height": t.max_height,
+            "sea_level": 0.0,
+            "row0": "min_z",
         })),
         // Per-weather-preset environment blocks (fog/wind/sun/sun_disk/
         // sky_dome/pbs/spherical_harmonics/hdr_environment/forest), first =
@@ -2356,6 +2402,7 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
         &scene.probes,
         &scene.user_objects,
         scene.shoreline.as_ref(),
+        scene.terrain_heightmap.as_ref(),
         scene.weathers.as_ref(),
         scene.vegetation_tint_texture,
     );

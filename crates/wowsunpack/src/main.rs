@@ -2969,7 +2969,44 @@ fn run_export_map(
         None
     };
 
-    // 7. Build map environment config.
+    // 7b. Raw heightfield sidecar: the GLB terrain mesh is decimated and
+    // clipped to above-sea geometry for viewing; the sidecar preserves the
+    // full-resolution grid — bathymetry included — for native consumers
+    // (heightfield collision, water-depth fields, custom LOD).
+    let terrain_heightmap: Option<gltf_export::TerrainHeightmapData> = terrain_data.as_ref().and_then(|t| {
+        let mut min_h = f32::INFINITY;
+        let mut max_h = f32::NEG_INFINITY;
+        for &h in &t.heightmap {
+            min_h = min_h.min(h);
+            max_h = max_h.max(h);
+        }
+        if !min_h.is_finite() || !max_h.is_finite() {
+            eprintln!("Warning: terrain heightmap has no finite samples; skipping raw sidecar");
+            return None;
+        }
+        let span = (max_h - min_h).max(f32::EPSILON);
+        let mut raw = Vec::with_capacity(t.heightmap.len() * 2);
+        for &h in &t.heightmap {
+            let v = (((h - min_h) / span) * 65535.0).round().clamp(0.0, 65535.0) as u16;
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let out_dir = output.parent().unwrap_or_else(|| Path::new("."));
+        let file = "terrain_heightmap.r16".to_string();
+        if let Err(e) = std::fs::write(out_dir.join(&file), &raw) {
+            eprintln!("Warning: failed to write {file}: {e}");
+            return None;
+        }
+        println!("  Terrain heightmap sidecar: {}×{} u16, range [{min_h:.2}, {max_h:.2}] m", t.width, t.height);
+        Some(gltf_export::TerrainHeightmapData {
+            file,
+            width: t.width,
+            height: t.height,
+            min_height: min_h,
+            max_height: max_h,
+        })
+    });
+
+    // 7c. Build map environment config.
     let sea_level = 0.0f32;
     let terrain_cfg = terrain_data.as_ref().map(|t| gltf_export::TerrainConfig {
         terrain: t,
@@ -3148,6 +3185,7 @@ fn run_export_map(
         vegetation: vegetation_data.as_ref(),
         vegetation_density,
         shoreline,
+        terrain_heightmap,
         weathers: uber_xml.as_deref().and_then(parse_weather_blocks),
         vegetation_tint_png,
     })
