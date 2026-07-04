@@ -920,6 +920,29 @@ pub fn is_tiledland_material(mat: &MaterialPrototype) -> bool {
         && mat.get_vec4("g_tilesIndex").is_some()
 }
 
+/// Bake the TILEDLAND composite albedo for an MFM given by path id, when the
+/// material IS tiledland. Returns `None` for non-tiledland materials or on
+/// parse/bake failure — callers fall back to their regular albedo chain.
+///
+/// This is the single-model (`export-model`) entry point; the map exporter
+/// reaches the same bake through [`load_or_bake_albedo_with_alpha`]. Binding
+/// the raw MFM texture instead is WRONG for these materials: it is the tile
+/// ATLAS, which samples as striped garbage with mesh UVs (the mesh UV0 is
+/// blend-map space).
+pub fn bake_tiledland_albedo_for_path_id(
+    vfs: &vfs::VfsPath,
+    db: &PrototypeDatabase<'_>,
+    self_id_index: &HashMap<u64, usize>,
+    mfm_path_id: u64,
+    max_size: Option<u32>,
+) -> Option<Vec<u8>> {
+    let mat = parse_mfm_from_db(db, mfm_path_id)?;
+    if !is_tiledland_material(&mat) {
+        return None;
+    }
+    bake_tiledland_albedo(&mat, vfs, db, self_id_index, max_size)
+}
+
 /// Bake a TILEDLAND terrain albedo texture from MFM material properties.
 ///
 /// The TILEDLAND shader composites 4 tile layers from a shared atlas texture,

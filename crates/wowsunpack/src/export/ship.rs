@@ -2796,6 +2796,25 @@ pub fn build_texture_set(
 
     // Load base albedo textures.
     for info in &unique_infos {
+        // TILEDLAND landscape materials (LNR*/LNU* map prototypes) need the
+        // baked 4-layer splat composite — the raw MFM-bound texture is the
+        // tile ATLAS, which samples as striped garbage with mesh UVs.
+        // Mirrors the map-export path (load_or_bake_albedo_with_alpha).
+        let baked_tiledland = if info.material_mfm_path_id != 0 {
+            texture::bake_tiledland_albedo_for_path_id(vfs, db, &self_id_index, info.material_mfm_path_id, None)
+        } else {
+            None
+        };
+        if let Some(png_bytes) = baked_tiledland {
+            eprintln!("  Baked TILEDLAND albedo for {}", info.stem);
+            base.insert(info.stem.clone(), png_bytes);
+            // PBR auxiliary channels are skipped for tiledland: the MFM's
+            // normal/MG maps are per-tile atlas resources in the same
+            // non-mesh UV space as the raw albedo — binding them repeats
+            // the atlas-sampling bug on the other channels.
+            continue;
+        }
+
         let dds_bytes = if info.material_mfm_path_id != 0 {
             texture::load_mfm_bound_albedo_bytes(
                 vfs,
