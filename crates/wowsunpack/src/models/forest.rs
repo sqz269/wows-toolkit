@@ -125,8 +125,9 @@ struct RawInstance {
 }
 
 /// IEEE 754 binary16 → f32 (no `half` crate dependency). Subnormals and
-/// infinities/NaNs follow the standard mapping; shipped forest data stays
-/// well inside normal range (yaw ≤ π, scale ≈ 0.5–1.6).
+/// infinities/NaNs follow the standard mapping (exhaustively tested over
+/// all 65536 bit patterns below); shipped forest data stays well inside
+/// normal range (yaw ≤ π, scale ≈ 0.5–1.6).
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
     let exp = ((bits >> 10) & 0x1f) as u32;
@@ -134,15 +135,57 @@ fn f16_to_f32(bits: u16) -> f32 {
     let f32_bits = match (exp, frac) {
         (0, 0) => sign << 31,
         (0, _) => {
-            // Subnormal: normalize into f32.
-            let shift = frac.leading_zeros() - 21;
-            let frac = (frac << (shift + 1)) & 0x3ff;
-            (sign << 31) | ((127 - 15 - shift) << 23) | (frac << 13)
+            // Subnormal: value = frac × 2^−24. Normalize into f32: with p
+            // the highest set bit, value = 2^(p−24) × (1 + rest/2^p), so
+            // the f32 exponent field is (p − 24) + 127 = p + 103 and the
+            // remainder shifts up into the 23-bit mantissa.
+            let p = 31 - frac.leading_zeros();
+            (sign << 31) | ((p + 103) << 23) | ((frac ^ (1 << p)) << (23 - p))
         }
         (0x1f, _) => (sign << 31) | 0x7f80_0000 | (frac << 13),
         _ => (sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13),
     };
     f32::from_bits(f32_bits)
+}
+
+#[cfg(test)]
+mod f16_tests {
+    use super::f16_to_f32;
+
+    /// Reference decode straight from the IEEE 754 binary16 definition.
+    fn reference(bits: u16) -> f32 {
+        let sign = if bits & 0x8000 != 0 { -1.0f64 } else { 1.0 };
+        let exp = ((bits >> 10) & 0x1f) as i32;
+        let frac = (bits & 0x3ff) as f64;
+        let v = match exp {
+            0 => sign * frac * 2f64.powi(-24),
+            0x1f => {
+                if frac == 0.0 {
+                    return if bits & 0x8000 != 0 { f32::NEG_INFINITY } else { f32::INFINITY };
+                }
+                return f32::NAN;
+            }
+            _ => sign * (1.0 + frac / 1024.0) * 2f64.powi(exp - 15),
+        };
+        v as f32
+    }
+
+    #[test]
+    fn matches_reference_for_all_bit_patterns() {
+        for bits in 0..=u16::MAX {
+            let got = f16_to_f32(bits);
+            let want = reference(bits);
+            if want.is_nan() {
+                assert!(got.is_nan(), "0x{bits:04x}: expected NaN, got {got}");
+            } else {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "0x{bits:04x}: got {got:e}, want {want:e}",
+                );
+            }
+        }
+    }
 }
 
 fn parse_raw_instance(input: &mut &[u8]) -> WResult<RawInstance> {
