@@ -2653,18 +2653,41 @@ fn parse_space_bounds(xml: &str) -> Option<gltf_export::SpaceBounds> {
     let doc = roxmltree::Document::parse(xml).ok()?;
     let bounds = doc.descendants().find(|n| n.has_tag_name("bounds"))?;
 
-    let attr = |name: &str| -> Option<f32> { bounds.attribute(name)?.parse().ok() };
+    // Two serializations ship: attribute form (`<bounds minX="-9" .../>`,
+    // e.g. 40_Okinawa) and child-element form (`<bounds><minX> -7 </minX>`,
+    // e.g. the operations spaces). Both MUST parse — the old attribute-only
+    // reader silently fell back to ±1000 defaults on element-form maps,
+    // stretching terrain/water/tint registration (s07_Advance: real extent
+    // ±700 → published 43% oversized).
+    let field = |name: &str| -> Option<f32> {
+        if let Some(a) = bounds.attribute(name) {
+            return a.trim().parse().ok();
+        }
+        bounds
+            .children()
+            .find(|c| c.has_tag_name(name))
+            .and_then(|c| c.text())
+            .and_then(|t| t.trim().parse().ok())
+    };
 
-    let min_x = attr("minX")?;
-    let max_x = attr("maxX")?;
-    let min_y = attr("minY")?; // row axis → world Z
-    let max_y = attr("maxY")?;
+    // Chunk edge length in metres; `<chunkSize>` when present, else 100.
+    let chunk = doc
+        .descendants()
+        .find(|n| n.has_tag_name("chunkSize"))
+        .and_then(|c| c.text())
+        .and_then(|t| t.trim().parse::<f32>().ok())
+        .unwrap_or(100.0);
+
+    let min_x = field("minX")?;
+    let max_x = field("maxX")?;
+    let min_y = field("minY")?; // row axis → world Z
+    let max_y = field("maxY")?;
 
     Some(gltf_export::SpaceBounds {
-        min_x: min_x * 100.0,
-        max_x: (max_x + 1.0) * 100.0,
-        min_z: min_y * 100.0,
-        max_z: (max_y + 1.0) * 100.0,
+        min_x: min_x * chunk,
+        max_x: (max_x + 1.0) * chunk,
+        min_z: min_y * chunk,
+        max_z: (max_y + 1.0) * chunk,
     })
 }
 
@@ -2974,9 +2997,15 @@ fn run_export_map(
             Ok(data) => match terrain::parse_terrain(&data) {
                 Ok(t) => {
                     println!(
-                        "Terrain: {}×{} heightmap ({} tiles, tile_size={})",
-                        t.width, t.height, t.tiles_per_axis, t.tile_size
+                        "Terrain: {}×{} uniform poles ({} chunks/axis, block edge {})",
+                        t.width, t.height, t.chunks_per_axis, t.chunk_grid_edge
                     );
+                    if t.minmax_mismatches != 0 {
+                        eprintln!(
+                            "Warning: {} terrain chunk(s) failed the authored min/max cross-check — format drift?",
+                            t.minmax_mismatches
+                        );
+                    }
                     Some(t)
                 }
                 Err(e) => {
