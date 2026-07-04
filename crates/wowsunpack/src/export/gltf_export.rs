@@ -800,6 +800,14 @@ pub struct TerrainHeightmapData {
     /// Height range (metres, sea level = 0) used for u16 normalization.
     pub min_height: f32,
     pub max_height: f32,
+    /// TERRAIN registration bounds. The engine's terrain chunk grid is
+    /// self-centered (chunk index = signed coord + chunks/2), so its
+    /// extent is ±(chunks/2 × chunkSize) — which can DIFFER from the
+    /// space.settings bounds (some maps carry a padding ring of terrain
+    /// chunks beyond the space, e.g. s02/s13: 20-chunk terrain over an
+    /// 18-chunk space). Registering the grid with space bounds stretches
+    /// it; consumers must use THESE bounds for the heightmap.
+    pub bounds: SpaceBounds,
     /// Optional baked sun×sky lightmap PNG sidecar (also embedded in the
     /// GLB as the terrain baseColor). Rows match the heightmap grid
     /// (row 0 = min_z).
@@ -2033,11 +2041,13 @@ fn build_scene_extras(
             "max_height": t.max_height,
             "sea_level": 0.0,
             "row0": "min_z",
+            // TERRAIN chunk-grid bounds — NOT necessarily the space
+            // bounds (some maps pad the terrain grid a chunk ring wider).
             "bounds": {
-                "min_x": bounds.min_x,
-                "max_x": bounds.max_x,
-                "min_z": bounds.min_z,
-                "max_z": bounds.max_z,
+                "min_x": t.bounds.min_x,
+                "max_x": t.bounds.max_x,
+                "min_z": t.bounds.min_z,
+                "max_z": t.bounds.max_z,
             },
             // Baked sun×sky lightmap PNG (grayscale in RGB, sRGB-encoded);
             // rows match the heightmap grid (row 0 = min_z).

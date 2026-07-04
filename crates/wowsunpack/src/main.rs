@@ -2645,11 +2645,13 @@ fn run_batch_export_model(manifest_path: &Path, keep_going: bool, vfs: &VfsPath)
     Ok(())
 }
 
-/// Parse space.settings XML to extract world-space bounds.
+/// Parse space.settings XML to extract world-space bounds + chunk size.
 ///
-/// The `<bounds>` element has chunk coordinates (100m per chunk). We convert to
-/// world units: `min * 100`, `(max + 1) * 100`.
-fn parse_space_bounds(xml: &str) -> Option<gltf_export::SpaceBounds> {
+/// The `<bounds>` element has chunk coordinates; world units are
+/// `min * chunkSize`, `(max + 1) * chunkSize`. Returns the chunk size too
+/// (the terrain grid's own bounds derive from it — see the terrain
+/// registration note at the call site).
+fn parse_space_bounds(xml: &str) -> Option<(gltf_export::SpaceBounds, f32)> {
     let doc = roxmltree::Document::parse(xml).ok()?;
     let bounds = doc.descendants().find(|n| n.has_tag_name("bounds"))?;
 
@@ -2683,12 +2685,15 @@ fn parse_space_bounds(xml: &str) -> Option<gltf_export::SpaceBounds> {
     let min_y = field("minY")?; // row axis → world Z
     let max_y = field("maxY")?;
 
-    Some(gltf_export::SpaceBounds {
-        min_x: min_x * chunk,
-        max_x: (max_x + 1.0) * chunk,
-        min_z: min_y * chunk,
-        max_z: (max_y + 1.0) * chunk,
-    })
+    Some((
+        gltf_export::SpaceBounds {
+            min_x: min_x * chunk,
+            max_x: (max_x + 1.0) * chunk,
+            min_z: min_y * chunk,
+            max_z: (max_y + 1.0) * chunk,
+        },
+        chunk,
+    ))
 }
 
 /// Parse every `<Weather>` block from `space.ubersettings` into a JSON array
@@ -2935,26 +2940,26 @@ fn run_export_map(
 
     let db = assets_bin_data.as_deref().map(assets_bin::parse_assets_bin).transpose()?;
 
-    // 5. Load space.settings for world bounds.
-    let bounds = {
+    // 5. Load space.settings for world bounds + chunk size.
+    let (bounds, chunk_size) = {
         let settings_path = space_file(space_dir, "space.settings", no_vfs);
         match read_file_data(&settings_path, no_vfs, vfs) {
             Ok(data) => {
                 let xml = String::from_utf8_lossy(&data);
                 match parse_space_bounds(&xml) {
-                    Some(b) => {
-                        println!("Space bounds: X [{}, {}], Z [{}, {}]", b.min_x, b.max_x, b.min_z, b.max_z);
-                        b
+                    Some((b, chunk)) => {
+                        println!("Space bounds: X [{}, {}], Z [{}, {}] (chunk {chunk} m)", b.min_x, b.max_x, b.min_z, b.max_z);
+                        (b, chunk)
                     }
                     None => {
                         eprintln!("Warning: could not parse bounds from space.settings; using defaults.");
-                        gltf_export::SpaceBounds { min_x: -1000.0, max_x: 1000.0, min_z: -1000.0, max_z: 1000.0 }
+                        (gltf_export::SpaceBounds { min_x: -1000.0, max_x: 1000.0, min_z: -1000.0, max_z: 1000.0 }, 100.0)
                     }
                 }
             }
             Err(_) => {
                 eprintln!("Warning: space.settings not found; using default bounds.");
-                gltf_export::SpaceBounds { min_x: -1000.0, max_x: 1000.0, min_z: -1000.0, max_z: 1000.0 }
+                (gltf_export::SpaceBounds { min_x: -1000.0, max_x: 1000.0, min_z: -1000.0, max_z: 1000.0 }, 100.0)
             }
         }
     };
@@ -3022,6 +3027,24 @@ fn run_export_map(
         None
     };
 
+    // Terrain registration bounds: the terrain chunk grid is SELF-CENTERED
+    // (engine indexes its chunk table by signed coord + chunks/2), so its
+    // extent is ±(chunks/2 × chunkSize). Usually equal to the space bounds,
+    // but some maps pad the terrain a chunk-ring wider (s02/s13: 20-chunk
+    // terrain over an 18-chunk space) — registering with space bounds
+    // would stretch the grid.
+    let terrain_bounds = terrain_data.as_ref().map(|t| {
+        let half = t.chunks_per_axis as f32 * 0.5 * chunk_size;
+        let tb = gltf_export::SpaceBounds { min_x: -half, max_x: half, min_z: -half, max_z: half };
+        if (tb.min_x - bounds.min_x).abs() > 0.5 || (tb.max_x - bounds.max_x).abs() > 0.5 {
+            println!(
+                "  Terrain grid bounds X/Z [{}, {}] differ from space bounds (padding ring).",
+                tb.min_x, tb.max_x
+            );
+        }
+        tb
+    });
+
     // 7b. Raw heightfield sidecar: the GLB terrain mesh is decimated and
     // clipped to above-sea geometry for viewing; the sidecar preserves the
     // full-resolution grid — bathymetry included — for native consumers
@@ -3087,6 +3110,7 @@ fn run_export_map(
             height: t.height,
             min_height: min_h,
             max_height: max_h,
+            bounds: terrain_bounds.clone().unwrap_or_else(|| bounds.clone()),
             lightmap_file,
         })
     });
@@ -3095,7 +3119,7 @@ fn run_export_map(
     let sea_level = 0.0f32;
     let terrain_cfg = terrain_data.as_ref().map(|t| gltf_export::TerrainConfig {
         terrain: t,
-        bounds: &bounds,
+        bounds: terrain_bounds.as_ref().unwrap_or(&bounds),
         step: terrain_step,
         sea_level,
         lightmap_shadow_dds: lightmap_shadow_dds.clone(),
