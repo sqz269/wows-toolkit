@@ -3398,18 +3398,23 @@ fn run_export_map(
 
     // 9c. Standalone GLBs for MAP-LOCAL prototypes (vri == 0 — meshes exist
     // only inside this map's models.bin, so `batch-export-model` can't reach
-    // them). Written per used prototype to `map_local/local_<index>.glb`,
+    // them). Written per used prototype to `map_local/<space>/local_<index>.glb`,
     // in the map frame (native units, no ×15 bake) so the instance
     // manifest's matrices place them verbatim; instance extras carry the
-    // matching `local_mesh` key.
+    // matching `local_mesh` key. The <space> subdir is deliberate even
+    // though the output dir is already per-map: local_<i> indices are
+    // PER-MAP (local_5 on two maps = two different meshes), so a consumer
+    // merging several maps' map_local/ trees into one library folder must
+    // never flatten them — nesting here makes the safe copy the lazy one.
     {
         let local_indices: Vec<usize> =
             scene.prototypes.iter().filter(|p| p.name.is_none()).map(|p| p.model_index).collect();
         if !local_indices.is_empty() {
             let out_dir = output.parent().unwrap_or_else(|| Path::new("."));
-            let local_dir = out_dir.join("map_local");
+            let space_stem = dir_str.rsplit(['/', '\\']).next().unwrap_or("space").to_string();
+            let local_dir = out_dir.join("map_local").join(&space_stem);
             if let Err(e) = std::fs::create_dir_all(&local_dir) {
-                eprintln!("Warning: failed to create map_local/: {e}");
+                eprintln!("Warning: failed to create map_local/{space_stem}/: {e}");
             } else {
                 let (mut written, mut failed, mut bytes_total) = (0usize, 0usize, 0u64);
                 for &model_index in &local_indices {
@@ -3432,7 +3437,7 @@ fn run_export_map(
                     }
                 }
                 println!(
-                    "  Map-local prototypes: {written}/{} GLBs under map_local/ ({} KiB){}",
+                    "  Map-local prototypes: {written}/{} GLBs under map_local/{space_stem}/ ({} KiB){}",
                     local_indices.len(),
                     bytes_total / 1024,
                     if failed > 0 { format!(", {failed} FAILED") } else { String::new() },

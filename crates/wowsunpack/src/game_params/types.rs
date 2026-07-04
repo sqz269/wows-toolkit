@@ -17,9 +17,15 @@ use super::provider::GameMetadataProvider;
 /// Conversion factor: 1 BigWorld unit = 30 meters.
 const BW_TO_METERS: f32 = 30.0;
 
-/// Conversion factor: 1 BigWorld unit = 15 ship-model units.
-/// Ship geometry (armor meshes, hull models) uses this coordinate space
-/// where 1 ship-model unit = 2 real meters (= 30 / 15).
+/// Conversion factor: 1 BigWorld unit = 15 ship-model units (1 ship-model unit
+/// = 30 / 15 = 2 real meters).
+///
+/// NOTE (RE 2026-06-07, build 12506899): this "ship-model unit" is a physics-domain
+/// BW subdivision, NOT the unit hull/armor MESHES are in. Mesh `.geometry` verts are
+/// authored in NATIVE units and exported at `NATIVE_TO_METRES = 15` (1 native unit =
+/// 15 real m). The engine places that native geometry 1:1 into BigWorld space while
+/// measuring distances at 30 m/BW, so ships RENDER at 2× real size relative to ranges
+/// (`BW_TO_BALLISTIC / BW_TO_SHIP = 30/15`). See `docs/BALLISTICS.md` §5.
 const BW_TO_SHIP: f32 = 15.0;
 
 /// Per-material armor thickness map.
@@ -45,9 +51,11 @@ pub struct Meters(f32);
 pub struct BigWorldDistance(f32);
 
 /// Distance in ship-model coordinate units (1 unit = 2 meters).
-/// Ship geometry (armor meshes, hull visual models) uses this coordinate space.
-/// The game defines BW_TO_SHIP = 15, meaning 1 BigWorld unit = 15 ship-model units,
-/// so 1 ship-model unit = BW_TO_METERS / BW_TO_SHIP = 30 / 15 = 2 meters.
+/// A physics-domain BW subdivision (BW_TO_SHIP = 15 → 1 BW = 15 ship-model units →
+/// 1 ship-model unit = 30 / 15 = 2 meters). NOTE: this is NOT the unit hull/armor
+/// MESHES are in — those are NATIVE units exported at `NATIVE_TO_METRES = 15` (1 native
+/// unit = 15 m real); the engine renders that geometry 2× real-size vs ranges (30/15).
+/// This type is currently unused (no call sites); kept for parity with the engine domains.
 #[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]

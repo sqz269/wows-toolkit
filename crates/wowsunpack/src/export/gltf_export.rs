@@ -502,8 +502,9 @@ pub struct MapModelInstance {
     /// `models.bin` record index of the prototype when it is MAP-LOCAL
     /// (no `assets.bin` identity, so no `model_path`). Keys the standalone
     /// per-map GLB written by the export driver
-    /// (`map_local/local_<index>.glb`) and the `local_mesh` instance
-    /// extras. `None` for prototypes resolvable through `assets.bin`.
+    /// (`map_local/<space>/local_<index>.glb`) and the `local_mesh`
+    /// instance extras. `None` for prototypes resolvable through
+    /// `assets.bin`.
     pub local_prototype: Option<usize>,
     /// Engine `isLandscape` flag from the ModelInstance record. Identifies
     /// LNR* / TILEDLAND backdrop landmass proxies that the engine renders
@@ -719,7 +720,7 @@ pub struct MapPrototypeInfo {
     pub model_path: Option<String>,
     /// `models.bin` record index — stable per-map key. For map-local
     /// prototypes (`name == None`) this keys the standalone GLB
-    /// (`map_local/local_<index>.glb`).
+    /// (`map_local/<space>/local_<index>.glb`).
     pub model_index: usize,
     pub instance_count: u32,
     pub landscape_instance_count: u32,
@@ -1724,9 +1725,9 @@ fn build_instance_extras(inst: &MapModelInstance, dyed_material_indices: &[u32])
     if let Some(local_idx) = inst.local_prototype {
         // Map-local prototype identity (no assets.bin path): keys the
         // per-map standalone GLB written by the export driver at
-        // `map_local/<local_mesh>.glb`. The mesh stays in the map frame
-        // (Z-negated RH, NATIVE units, no ×15 bake), so consumers place it
-        // with this node's matrix exactly like the embedded copy.
+        // `map_local/<space>/<local_mesh>.glb`. The mesh stays in the map
+        // frame (Z-negated RH, NATIVE units, no ×15 bake), so consumers
+        // place it with this node's matrix exactly like the embedded copy.
         value["local_mesh"] = serde_json::json!(format!("local_{local_idx}"));
     }
     if !dyes.is_empty() {
