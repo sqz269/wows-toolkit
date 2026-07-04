@@ -663,9 +663,12 @@ pub struct MapScene {
     /// parseable. Webview drives `THREE.FogExp2` from this; on `None`, the
     /// webview falls back to a hardcoded default.
     pub fog: Option<SpaceFog>,
-    /// GPU-instanced vegetation: `(mesh_idx, positions)` per species.
-    /// Exported as `EXT_mesh_gpu_instancing` nodes (one node per species).
-    pub vegetation_instances: Vec<(usize, usize, Vec<[f32; 3]>)>,
+    /// GPU-instanced vegetation: `(mesh_idx, layer_idx, records)` per
+    /// species×layer, record = `[x, y, z, yaw, scale]` in the map (glTF)
+    /// frame — positions Z-negated from BW, `yaw` already conjugated
+    /// (= −BW yaw, radians about +Y), `scale` uniform. Exported as
+    /// `EXT_mesh_gpu_instancing` nodes with TRANSLATION+ROTATION+SCALE.
+    pub vegetation_instances: Vec<(usize, usize, Vec<[f32; 5]>)>,
     /// Engine ObstacleInstance placements from `space.bin`'s obstacles[] sub-array.
     pub obstacles: Vec<MapObstacleInstance>,
     /// Engine ParticleInstance placements from `space.bin`'s particles[] sub-array.
@@ -799,12 +802,15 @@ pub struct VegetationSpecies {
 /// Vegetation data: species meshes + positioned instances per forest layer.
 pub struct VegetationData {
     pub species: Vec<VegetationSpecies>,
-    /// Per-layer `(species_index, world_position [x, y, z])` instances,
-    /// indexed per [`crate::models::forest::LAYER_NAMES`] (Primary /
-    /// PrimaryRare / Underwater / UnderwaterRare). "Rare" layers are
-    /// far-density companions of their base layer — consumers draw base OR
-    /// rare per distance, never both additively.
-    pub layers: [Vec<(usize, [f32; 3])>; 4],
+    /// Per-layer `(species_index, [x, y, z, yaw, scale])` instances in the
+    /// NATIVE BW frame (yaw = radians about +Y as authored; scale =
+    /// per-tree uniform multiplier), indexed per
+    /// [`crate::models::forest::LAYER_NAMES`] (Primary / PrimaryRare /
+    /// Underwater / UnderwaterRare). "Rare" layers are far-density
+    /// companions of their base layer — consumers draw base OR rare per
+    /// distance, never both additively. Frame conversion (z → −z,
+    /// yaw → −yaw) happens at the export sites.
+    pub layers: [Vec<(usize, [f32; 5])>; 4],
 }
 
 /// Build a complete map scene from parsed data.
@@ -1011,7 +1017,7 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
     // Build model instances from space.bin transforms.
     let mut model_instances: Vec<MapModelInstance> = Vec::new();
     // `(mesh_idx, forest_layer_idx, positions)` per species×layer group.
-    let mut vegetation_instances: Vec<(usize, usize, Vec<[f32; 3]>)> = Vec::new();
+    let mut vegetation_instances: Vec<(usize, usize, Vec<[f32; 5]>)> = Vec::new();
     // Dye application: tint materials dedup by tint .mfm selfId. Baking goes
     // through the SAME texture_cache as regular primitives, so a tint .mfm
     // that some undyed model already uses shares its texture.
@@ -1249,11 +1255,13 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
 
         for (layer_idx, layer) in veg.layers.iter().enumerate() {
             total += layer.len();
-            let mut per_species: Vec<Vec<[f32; 3]>> = vec![Vec::new(); num_species];
+            let mut per_species: Vec<Vec<[f32; 5]>> = vec![Vec::new(); num_species];
+            // BW→map frame: z negated; yaw conjugated (S·R_y(θ)·S = R_y(−θ)
+            // for S = diag(1,1,−1)); scale frame-independent.
             if vegetation_density > 0.0 {
                 let inv_cell = 1.0 / vegetation_density;
                 let mut occupied: HashSet<(usize, i32, i32)> = HashSet::new();
-                for &(sp_idx, [x, y, z]) in layer {
+                for &(sp_idx, [x, y, z, yaw, scale]) in layer {
                     if species_mesh_ranges.get(sp_idx).and_then(|v| *v).is_none() {
                         continue;
                     }
@@ -1262,15 +1270,15 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                     if !occupied.insert((sp_idx, cx, cz)) {
                         continue;
                     }
-                    per_species[sp_idx].push([x, y, -z]);
+                    per_species[sp_idx].push([x, y, -z, -yaw, scale]);
                     kept += 1;
                 }
             } else {
-                for &(sp_idx, [x, y, z]) in layer {
+                for &(sp_idx, [x, y, z, yaw, scale]) in layer {
                     if species_mesh_ranges.get(sp_idx).and_then(|v| *v).is_none() {
                         continue;
                     }
-                    per_species[sp_idx].push([x, y, -z]);
+                    per_species[sp_idx].push([x, y, -z, -yaw, scale]);
                     kept += 1;
                 }
             }
@@ -2427,8 +2435,8 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
     {
         root.extensions_used.push("EXT_mesh_gpu_instancing".to_string());
     }
-    for (mesh_idx, layer_idx, positions) in &scene.vegetation_instances {
-        if positions.is_empty() {
+    for (mesh_idx, layer_idx, records) in &scene.vegetation_instances {
+        if records.is_empty() {
             continue;
         }
         let layer_name = crate::models::forest::LAYER_NAMES.get(*layer_idx).copied().unwrap_or("Unknown");
@@ -2442,15 +2450,42 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
             m
         };
 
+        // Records are [x, y, z, yaw, scale] in the map frame. Split into
+        // the three EXT_mesh_gpu_instancing attribute streams: yaw becomes
+        // a +Y quaternion (0, sin(θ/2), 0, cos(θ/2)); scale is uniform.
+        let positions: Vec<[f32; 3]> = records.iter().map(|r| [r[0], r[1], r[2]]).collect();
+        let rotations: Vec<[f32; 4]> = records
+            .iter()
+            .map(|r| {
+                let (s, c) = (r[3] * 0.5).sin_cos();
+                [0.0, s, 0.0, c]
+            })
+            .collect();
+        let scales: Vec<[f32; 3]> = records.iter().map(|r| [r[4], r[4], r[4]]).collect();
+
         let translation_accessor = append_vec3_accessor(
             &mut root,
             &mut bin_data,
-            positions,
+            &positions,
             Some(format!("Tree_{mesh_idx}_{layer_name}_translations")),
+        );
+        let rotation_accessor = append_vec4_accessor(
+            &mut root,
+            &mut bin_data,
+            &rotations,
+            Some(format!("Tree_{mesh_idx}_{layer_name}_rotations")),
+        );
+        let scale_accessor = append_vec3_accessor(
+            &mut root,
+            &mut bin_data,
+            &scales,
+            Some(format!("Tree_{mesh_idx}_{layer_name}_scales")),
         );
 
         let mut attributes = serde_json::Map::new();
         attributes.insert("TRANSLATION".to_string(), serde_json::json!(translation_accessor.value()));
+        attributes.insert("ROTATION".to_string(), serde_json::json!(rotation_accessor.value()));
+        attributes.insert("SCALE".to_string(), serde_json::json!(scale_accessor.value()));
 
         let mut instancing = serde_json::Map::new();
         instancing.insert("attributes".to_string(), serde_json::Value::Object(attributes));
@@ -2468,7 +2503,7 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
             extras: serde_json::value::to_raw_value(&serde_json::json!({
                 "vegetation_species_mesh": mesh_idx,
                 "vegetation_layer": layer_name,
-                "instance_count": positions.len(),
+                "instance_count": records.len(),
             }))
             .ok()
             .map(Box::from),
@@ -5517,6 +5552,48 @@ fn append_vec3_accessor(
         type_: Valid(json::accessor::Type::Vec3),
         min: Some(json::Value::from(min.to_vec())),
         max: Some(json::Value::from(max.to_vec())),
+        name,
+        normalized: false,
+        sparse: None,
+        extensions: Default::default(),
+        extras: Default::default(),
+    })
+}
+
+fn append_vec4_accessor(
+    root: &mut json::Root,
+    bin_data: &mut Vec<u8>,
+    values: &[[f32; 4]],
+    name: Option<String>,
+) -> json::Index<json::Accessor> {
+    let byte_offset = bin_data.len();
+    for value in values {
+        for v in value {
+            bin_data.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    pad_to_4(bin_data);
+    let byte_length = bin_data.len() - byte_offset;
+
+    let bv = root.push(json::buffer::View {
+        buffer: json::Index::new(0),
+        byte_length: USize64::from(byte_length),
+        byte_offset: Some(USize64::from(byte_offset)),
+        byte_stride: None,
+        target: Some(Valid(json::buffer::Target::ArrayBuffer)),
+        name: None,
+        extensions: Default::default(),
+        extras: Default::default(),
+    });
+
+    root.push(json::Accessor {
+        buffer_view: Some(bv),
+        byte_offset: Some(USize64(0)),
+        count: USize64::from(values.len()),
+        component_type: Valid(json::accessor::GenericComponentType(json::accessor::ComponentType::F32)),
+        type_: Valid(json::accessor::Type::Vec4),
+        min: None,
+        max: None,
         name,
         normalized: false,
         sparse: None,

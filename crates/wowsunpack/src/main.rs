@@ -3109,8 +3109,11 @@ fn run_export_map(
                         }
                     }
 
-                    let layers: [Vec<(usize, [f32; 3])>; 4] = forest_data.layers.map(|layer| {
-                        layer.iter().map(|inst| (inst.species_index, [inst.x, inst.y, inst.z])).collect()
+                    let layers: [Vec<(usize, [f32; 5])>; 4] = forest_data.layers.map(|layer| {
+                        layer
+                            .iter()
+                            .map(|inst| (inst.species_index, [inst.x, inst.y, inst.z, inst.yaw, inst.scale]))
+                            .collect()
                     });
 
                     Some(gltf_export::VegetationData { species: species_list, layers })
@@ -3260,18 +3263,21 @@ fn run_export_map(
             }));
         }
 
-        // Per-layer instance blobs: f32le (x, y, −BW z) triples sorted by
-        // species; per-species (start, count) ranges live in the manifest.
+        // Per-layer instance blobs: f32le (x, y, −BW z, yaw, scale) —
+        // 20-byte records sorted by species; per-species (start, count)
+        // ranges live in the manifest. Positions are map-GLB frame; yaw is
+        // already conjugated into it (map yaw = −BW yaw; S·R_y·S identity),
+        // radians about +Y; scale = per-tree uniform multiplier.
         // Instances of mesh-less species are dropped (mirrors the GLB path).
         let layer_entries: Vec<serde_json::Value> = veg
             .layers
             .iter()
             .enumerate()
             .map(|(li, layer)| {
-                let mut per_species: Vec<Vec<[f32; 3]>> = vec![Vec::new(); veg.species.len()];
-                for &(sp, [x, y, z]) in layer {
+                let mut per_species: Vec<Vec<[f32; 5]>> = vec![Vec::new(); veg.species.len()];
+                for &(sp, [x, y, z, yaw, scale]) in layer {
                     if has_mesh.get(sp).copied().unwrap_or(false) {
-                        per_species[sp].push([x, y, -z]);
+                        per_species[sp].push([x, y, -z, -yaw, scale]);
                     }
                 }
                 let mut blob: Vec<u8> = Vec::new();
@@ -3326,8 +3332,9 @@ fn run_export_map(
             eprintln!("Warning: failed to write vegetation_meshes.bin: {e}");
         }
         let manifest = serde_json::json!({
-            "schema": "wows_map_vegetation/v1",
+            "schema": "wows_map_vegetation/v2",
             "frame": "map-GLB frame: x = BW x, z = -BW z, y up; native BW units (apply the consumer's BW->metre ruler)",
+            "record": "f32le x, y, z, yaw, scale (20 bytes): yaw = radians about +Y in the map frame (already conjugated from BW; DXBC-proven per-tree rotation), scale = uniform per-tree multiplier (~0.57-1.59). v1 records were 12-byte positions only.",
             "meshes_file": "vegetation_meshes.bin",
             "species": species_entries,
             "layers": layer_entries,

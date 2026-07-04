@@ -29,7 +29,12 @@
 //!   ...followed by null-terminated string data...
 //!
 //! Instance Data (per-layer; reached via Layer.buffer_relptr):
-//!   Dense array of 16-byte records (f32 x, f32 y, f32 z, f32 w).
+//!   Dense array of 16-byte records:
+//!     f32 x, f32 y, f32 z, u32 packed { hi16 = f16 yaw (radians, BW
+//!     frame, [−π, π]), lo16 = f16 uniform scale (~0.57–1.59) }.
+//!   The 4th dword was previously misread as an f32 (±50 range) — the
+//!   tree VS (`wg_spt_tree_mesh.fx`) decodes the two halves with
+//!   `f16tof32`; DXBC-proven 2026-07-04.
 //!   Layer 0's records typically start right after the string pool.
 //! ```
 //!
@@ -51,6 +56,7 @@ use thiserror::Error;
 use winnow::Parser;
 use winnow::binary::le_f32;
 use winnow::binary::le_i64;
+use winnow::binary::le_u32;
 use winnow::binary::le_u64;
 use winnow::combinator::repeat;
 
@@ -77,6 +83,17 @@ pub struct ForestInstance {
     pub x: f32,
     pub y: f32,
     pub z: f32,
+    /// Per-tree yaw in RADIANS about +Y, native BigWorld (left-handed)
+    /// frame, uniform in [−π, π]. Decoded from the record's 4th dword
+    /// (HIGH 16 bits as IEEE f16) — DXBC-proven against
+    /// `wg_spt_tree_mesh.fx` (`ushr 16 → f16tof32 → ×0.5 → sincos`
+    /// quaternion yaw). Consumers in a Z-negated (right-handed) frame
+    /// must conjugate: yaw' = −yaw.
+    pub yaw: f32,
+    /// Per-tree uniform scale multiplier (corpus ≈ 0.57–1.59, median
+    /// ≈ 1.06). Decoded from the record's 4th dword (LOW 16 bits as
+    /// IEEE f16) — `and 0xffff → f16tof32` in the same shader.
+    pub scale: f32,
 }
 
 /// Layer names in file order (engine-fixed).
@@ -103,14 +120,45 @@ struct RawInstance {
     x: f32,
     y: f32,
     z: f32,
+    yaw: f32,
+    scale: f32,
+}
+
+/// IEEE 754 binary16 → f32 (no `half` crate dependency). Subnormals and
+/// infinities/NaNs follow the standard mapping; shipped forest data stays
+/// well inside normal range (yaw ≤ π, scale ≈ 0.5–1.6).
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let frac = (bits & 0x3ff) as u32;
+    let f32_bits = match (exp, frac) {
+        (0, 0) => sign << 31,
+        (0, _) => {
+            // Subnormal: normalize into f32.
+            let shift = frac.leading_zeros() - 21;
+            let frac = (frac << (shift + 1)) & 0x3ff;
+            (sign << 31) | ((127 - 15 - shift) << 23) | (frac << 13)
+        }
+        (0x1f, _) => (sign << 31) | 0x7f80_0000 | (frac << 13),
+        _ => (sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13),
+    };
+    f32::from_bits(f32_bits)
 }
 
 fn parse_raw_instance(input: &mut &[u8]) -> WResult<RawInstance> {
     let x = le_f32.parse_next(input)?;
     let y = le_f32.parse_next(input)?;
     let z = le_f32.parse_next(input)?;
-    let _w = le_f32.parse_next(input)?;
-    Ok(RawInstance { x, y, z })
+    // 4th dword is NOT an f32: packed pair of f16s consumed by the tree
+    // vertex shader — high half = yaw (radians), low half = scale.
+    let w = le_u32.parse_next(input)?;
+    Ok(RawInstance {
+        x,
+        y,
+        z,
+        yaw: f16_to_f32((w >> 16) as u16),
+        scale: f16_to_f32((w & 0xffff) as u16),
+    })
 }
 
 // Layer offsets in the file (4 layers, 0x90 bytes each, starting at 0x10).
@@ -214,7 +262,14 @@ fn parse_layer_instances(
             continue;
         }
         for raw in &raw_instances[start..end] {
-            instances.push(ForestInstance { species_index: sp_idx, x: raw.x, y: raw.y, z: raw.z });
+            instances.push(ForestInstance {
+                species_index: sp_idx,
+                x: raw.x,
+                y: raw.y,
+                z: raw.z,
+                yaw: raw.yaw,
+                scale: raw.scale,
+            });
         }
     }
     Ok(instances)
