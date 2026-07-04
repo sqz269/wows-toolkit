@@ -214,6 +214,13 @@ enum Commands {
         #[arg(long)]
         all_render_sets: bool,
 
+        /// Export EVERY authored LOD as its own collapsed mesh under a node
+        /// named `LOD<i>` (consumers assemble native LOD groups from the
+        /// names + the authored per-LOD extents). Ignores `--lod`; mutually
+        /// exclusive with `--all-render-sets`.
+        #[arg(long)]
+        lod_chain: bool,
+
         /// If set, write textures as PNG files into this directory and
         /// reference them via URIs in the glTF instead of embedding them
         /// in the GLB's BIN chunk. Directory is created if missing.
@@ -1450,6 +1457,7 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
             no_textures,
             damaged,
             all_render_sets,
+            lod_chain,
             textures_dir,
             textures_uri_prefix,
             raw_dds_dir,
@@ -1465,6 +1473,7 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
                 no_textures,
                 damaged,
                 all_render_sets,
+                lod_chain,
                 textures_dir: textures_dir.as_deref(),
                 textures_uri_prefix: textures_uri_prefix.as_deref(),
                 raw_dds_dir: raw_dds_dir.as_deref(),
@@ -2182,6 +2191,7 @@ struct ExportModelParams<'a> {
     no_textures: bool,
     damaged: bool,
     all_render_sets: bool,
+    lod_chain: bool,
     textures_dir: Option<&'a Path>,
     textures_uri_prefix: Option<&'a str>,
     raw_dds_dir: Option<&'a Path>,
@@ -2200,6 +2210,7 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
         no_textures,
         damaged,
         all_render_sets,
+        lod_chain,
         textures_dir,
         textures_uri_prefix,
         raw_dds_dir,
@@ -2223,6 +2234,7 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
         no_textures,
         damaged,
         all_render_sets,
+        lod_chain,
         textures_dir,
         textures_uri_prefix,
         raw_dds_dir,
@@ -2259,6 +2271,7 @@ fn export_one_model(
     no_textures: bool,
     damaged: bool,
     all_render_sets: bool,
+    lod_chain: bool,
     textures_dir: Option<&Path>,
     textures_uri_prefix: Option<&str>,
     raw_dds_dir: Option<&Path>,
@@ -2384,6 +2397,7 @@ fn export_one_model(
             &texture_set,
             damaged,
             all_render_sets,
+            lod_chain,
             &hitboxes,
             &mut tex_out,
             &mut out_file,
@@ -2492,6 +2506,8 @@ struct BatchSharedOptions {
     #[serde(default)]
     all_render_sets: bool,
     #[serde(default)]
+    lod_chain: bool,
+    #[serde(default)]
     no_textures: bool,
     #[serde(default)]
     damaged: bool,
@@ -2524,7 +2540,14 @@ struct BatchManifest {
 
 impl Default for BatchSharedOptions {
     fn default() -> Self {
-        Self { all_render_sets: false, no_textures: false, damaged: false, lod: 0, textures_uri_prefix: None }
+        Self {
+            all_render_sets: false,
+            lod_chain: false,
+            no_textures: false,
+            damaged: false,
+            lod: 0,
+            textures_uri_prefix: None,
+        }
     }
 }
 
@@ -2565,6 +2588,7 @@ fn run_batch_export_model(manifest_path: &Path, keep_going: bool, vfs: &VfsPath)
             shared.no_textures,
             shared.damaged,
             shared.all_render_sets,
+            shared.lod_chain,
             item.textures_dir.as_deref(),
             tex_prefix,
             item.raw_dds_dir.as_deref(),

@@ -105,6 +105,10 @@ pub fn export_glb(
     texture_set: &TextureSet,
     damaged: bool,
     all_render_sets: bool,
+    // Export EVERY authored LOD as its own `LOD<i>`-named node (native
+    // LOD-group assembly downstream). Ignored when `all_render_sets` is
+    // true (that mode bundles per render set instead).
+    lod_chain: bool,
     // Per-mount splash-box AABBs from the model's sibling `.splash` (secondary
     // / AA / torpedo per-gun hit volumes). Emitted as a "Hitboxes" group, like
     // the hull export. Empty for the ~most accessories that ship no `.splash`.
@@ -165,44 +169,68 @@ pub fn export_glb(
             return Err(Report::new(ExportError::LodOutOfRange(lod, visual.lods.len() - 1)));
         }
 
-        let lod_entry = &visual.lods[lod];
-        let primitives =
-            collect_primitives(visual, geometry, Some(db), Some(&self_id_index), lod_entry, damaged, None, None, true)?;
+        // `lod_chain`: one collapsed mesh PER authored LOD, each under a
+        // node named `LOD<i>` — consumers assemble native LOD groups from
+        // the node names + the authored per-LOD extents (which ship in the
+        // map instance manifests). Default (false): the single requested
+        // LOD, unnamed node — historical behaviour.
+        let lod_range = if lod_chain { 0..visual.lods.len() } else { lod..lod + 1 };
+        for lod_idx in lod_range {
+            let lod_entry = &visual.lods[lod_idx];
+            let primitives = collect_primitives(
+                visual,
+                geometry,
+                Some(db),
+                Some(&self_id_index),
+                lod_entry,
+                damaged,
+                None,
+                None,
+                true,
+            )?;
 
-        if primitives.is_empty() {
-            eprintln!("Warning: no primitives found for LOD {lod}");
-        }
+            if primitives.is_empty() {
+                eprintln!("Warning: no primitives found for LOD {lod_idx}");
+                // Keep the node anyway when chaining so LOD indices stay
+                // aligned with the authored extents.
+                if !lod_chain {
+                    continue;
+                }
+            }
 
-        let mut gltf_primitives = Vec::new();
-        for prim in &primitives {
-            let gltf_prim =
-                add_primitive_to_root(&mut root, &mut bin_data, tex_out, prim, texture_set, &mut mat_cache)?;
-            gltf_primitives.push(gltf_prim);
-        }
+            let mut gltf_primitives = Vec::new();
+            for prim in &primitives {
+                let gltf_prim =
+                    add_primitive_to_root(&mut root, &mut bin_data, tex_out, prim, texture_set, &mut mat_cache)?;
+                gltf_primitives.push(gltf_prim);
+            }
 
-        // Single collapsed mesh (historical behaviour).
-        let mesh = root.push(json::Mesh {
-            primitives: gltf_primitives,
-            weights: None,
-            name: None,
-            extensions: Default::default(),
-            extras: Default::default(),
-        });
-        let root_node = root.push(json::Node { mesh: Some(mesh), ..Default::default() });
-        scene_nodes.push(root_node);
-        // Collapsed-mesh path: every primitive shares one parent Node so
-        // they must share a Skin. Pick the first non-empty palette and
-        // verify the rest match — divergent palettes can't be served by
-        // a single Skin without remapping JOINTS_0 (deferred).
-        let palettes: Vec<&Vec<u32>> = primitives.iter().filter_map(|p| p.bone_palette.as_ref()).collect();
-        if let Some(first) = palettes.first() {
-            if palettes.iter().all(|p| p == first) {
-                skinned_mesh_nodes.push((root_node, (*first).clone(), "lod_mesh".to_string()));
-            } else {
-                eprintln!(
-                    "Warning: collapsed-mesh export saw {} divergent bone palettes — skipping skin emit",
-                    palettes.len()
-                );
+            let node_name = lod_chain.then(|| format!("LOD{lod_idx}"));
+            // Single collapsed mesh per LOD (historical behaviour for the
+            // non-chained single-LOD export).
+            let mesh = root.push(json::Mesh {
+                primitives: gltf_primitives,
+                weights: None,
+                name: node_name.clone(),
+                extensions: Default::default(),
+                extras: Default::default(),
+            });
+            let root_node = root.push(json::Node { mesh: Some(mesh), name: node_name, ..Default::default() });
+            scene_nodes.push(root_node);
+            // Collapsed-mesh path: every primitive shares one parent Node so
+            // they must share a Skin. Pick the first non-empty palette and
+            // verify the rest match — divergent palettes can't be served by
+            // a single Skin without remapping JOINTS_0 (deferred).
+            let palettes: Vec<&Vec<u32>> = primitives.iter().filter_map(|p| p.bone_palette.as_ref()).collect();
+            if let Some(first) = palettes.first() {
+                if palettes.iter().all(|p| p == first) {
+                    skinned_mesh_nodes.push((root_node, (*first).clone(), format!("lod_mesh_{lod_idx}")));
+                } else {
+                    eprintln!(
+                        "Warning: collapsed-mesh export saw {} divergent bone palettes — skipping skin emit",
+                        palettes.len()
+                    );
+                }
             }
         }
     }
