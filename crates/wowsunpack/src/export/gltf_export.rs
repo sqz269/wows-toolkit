@@ -2570,6 +2570,43 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
     Ok(())
 }
 
+/// Shared texture store for a map's `map_local/` prototype GLBs: each
+/// referenced [`MapScene::textures`] entry is written ONCE to
+/// `<dir>/texture_<sceneIdx>.png` and every GLB references it by relative
+/// URI (`textures/texture_<sceneIdx>.png`). Embedding a private copy per
+/// GLB multiplied the same dressing atlases across hundreds of files
+/// (526 MB / 1.6 GB per map) AND kept them out of the consumer's texture
+/// import pipeline (no size cap, no BC compression, no cross-GLB
+/// dedup) — external files give consumers ONE texture asset per source
+/// texture.
+pub struct MapLocalTextureStore {
+    dir: std::path::PathBuf,
+    uri_prefix: String,
+    written: std::collections::HashSet<usize>,
+}
+
+impl MapLocalTextureStore {
+    /// `dir` receives the PNGs; `uri_prefix` is prepended to filenames in
+    /// the glTF (relative to the GLB location, trailing slash included).
+    pub fn new(dir: impl Into<std::path::PathBuf>, uri_prefix: impl Into<String>) -> Self {
+        let dir = dir.into();
+        let _ = std::fs::create_dir_all(&dir);
+        Self { dir, uri_prefix: uri_prefix.into(), written: std::collections::HashSet::new() }
+    }
+
+    /// Write-once + return the URI for a scene texture index.
+    fn uri_for(&mut self, scene: &MapScene, tex_idx: usize) -> String {
+        let filename = format!("texture_{tex_idx}.png");
+        if self.written.insert(tex_idx) {
+            let path = self.dir.join(&filename);
+            if let Err(e) = std::fs::write(&path, &scene.textures[tex_idx]) {
+                eprintln!("Warning: failed to write {}: {e}", path.display());
+            }
+        }
+        format!("{}{filename}", self.uri_prefix)
+    }
+}
+
 /// Export ONE map-local prototype (`vri == 0`, no `assets.bin` identity) as a
 /// standalone GLB, so consumers that spawn prototypes from a shared library
 /// (instead of the whole-map GLB) can place map-local instances too.
@@ -2582,10 +2619,12 @@ pub fn export_map_scene_glb(scene: &MapScene, writer: &mut impl Write) -> Result
 /// Static-node part matrices are already baked into the vertices at decode.
 ///
 /// All parts become primitives of a single mesh/node named `local_<index>`.
-/// Only the textures this prototype references are embedded.
+/// Textures are NOT embedded — they reference the map's shared store by
+/// relative URI (see [`MapLocalTextureStore`]).
 pub fn export_map_local_prototype_glb(
     scene: &MapScene,
     model_index: usize,
+    textures: &mut MapLocalTextureStore,
     writer: &mut impl Write,
 ) -> Result<(), Report<ExportError>> {
     let Some(range) = scene.model_mesh_ranges.get(model_index) else {
@@ -2608,8 +2647,8 @@ pub fn export_map_local_prototype_glb(
     };
     let mut bin_data: Vec<u8> = Vec::new();
 
-    // Embed only the textures this prototype's meshes reference, keyed by
-    // the scene-wide texture index so shared parts dedup within the file.
+    // Reference this prototype's textures from the map's shared store —
+    // written once per map, resolved by relative URI from the GLB.
     let mut gltf_texture_cache: HashMap<usize, json::Index<json::Texture>> = HashMap::new();
     for mesh_idx in range.clone() {
         let Some(tex_idx) = scene.model_meshes[mesh_idx].albedo_texture else {
@@ -2618,24 +2657,11 @@ pub fn export_map_local_prototype_glb(
         if gltf_texture_cache.contains_key(&tex_idx) {
             continue;
         }
-        let png_bytes = &scene.textures[tex_idx];
-        let byte_offset = bin_data.len();
-        bin_data.extend_from_slice(png_bytes);
-        pad_to_4(&mut bin_data);
-        let bv = root.push(json::buffer::View {
-            buffer: json::Index::new(0),
-            byte_length: USize64::from(png_bytes.len()),
-            byte_offset: Some(USize64::from(byte_offset)),
-            byte_stride: None,
-            target: None,
-            name: None,
-            extensions: Default::default(),
-            extras: Default::default(),
-        });
+        let uri = textures.uri_for(scene, tex_idx);
         let image = root.push(json::Image {
-            buffer_view: Some(bv),
+            buffer_view: None,
             mime_type: Some(json::image::MimeType("image/png".to_string())),
-            uri: None,
+            uri: Some(uri),
             name: Some(format!("texture_{tex_idx}")),
             extensions: Default::default(),
             extras: Default::default(),

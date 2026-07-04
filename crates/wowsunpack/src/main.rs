@@ -3471,13 +3471,19 @@ fn run_export_map(
             if let Err(e) = std::fs::create_dir_all(&local_dir) {
                 eprintln!("Warning: failed to create map_local/{space_stem}/: {e}");
             } else {
+                // One shared texture store per map: every GLB references
+                // `textures/texture_<idx>.png` siblings instead of
+                // embedding a private copy (cross-GLB dedup + lets the
+                // consumer's texture import pipeline cap/compress them).
+                let mut tex_store =
+                    gltf_export::MapLocalTextureStore::new(local_dir.join("textures"), "textures/");
                 let (mut written, mut failed, mut bytes_total) = (0usize, 0usize, 0u64);
                 for &model_index in &local_indices {
                     let path = local_dir.join(format!("local_{model_index}.glb"));
                     let result = std::fs::File::create(&path)
                         .map_err(|e| e.to_string())
                         .and_then(|mut f| {
-                            gltf_export::export_map_local_prototype_glb(&scene, model_index, &mut f)
+                            gltf_export::export_map_local_prototype_glb(&scene, model_index, &mut tex_store, &mut f)
                                 .map_err(|e| e.to_string())
                         });
                     match result {
