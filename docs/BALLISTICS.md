@@ -161,7 +161,19 @@ From these: **1 ship-model unit = 2 meters** (since 30/15 = 2).
 |-------|-------------|-----------------|-------|
 | BigWorld (BW) | 1 | 30 | Entity positions, map coordinates |
 | Ballistic (meters) | 1/30 | 1 | Physics sim, ISA model, drag |
-| Ship-model | 1/15 | 2 | Ship geometry/armor meshes |
+| Ship-model (`BW_TO_SHIP`) | 1/15 | 2 | **Physics-domain BW subdivision (buoyancy volume etc.) — NOT the mesh-geometry unit.** Hull/armor `.geometry` verts are NATIVE units; `wowsunpack` exports them at `NATIVE_TO_METRES = 15` (real metres). |
+
+> **CORRECTION (RE 2026-06-07, live build 12506899, Montana/Yamato/Shimakaze):** earlier
+> revisions of this table said the *Ship-model* row's "2 m" unit is what "ship geometry /
+> armor meshes" are in. **That is wrong.** Hull/armor meshes are authored in **native units**
+> and the engine places them **1:1 into BigWorld space** (1 native unit = 1 BW unit), while
+> measuring DISTANCES at `BW_TO_BALLISTIC = 30 m/BW`. So **ship models render at exactly 2×
+> their real-world size relative to ranges** (`BW_TO_BALLISTIC / BW_TO_SHIP = 30/15`). The
+> toolkit's `NATIVE_TO_METRES = 15` normalizes the exported GLB to **real-world** size
+> (Montana 281.9 m) — which is *half* the in-game render proportion. Consumers that want
+> WG-faithful on-screen proportions must apply their own ×2 model presentation scale.
+> The `ShipModelDistance` / `to_ship_model` "2 m" type in `types.rs` is a separate
+> physics-domain quantity and is currently **unused** (zero call sites).
 
 ### Ballistic scale (30.0 at runtime)
 
