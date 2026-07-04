@@ -3223,6 +3223,32 @@ fn run_export_map(
     })
     .context("Failed to build map scene")?;
 
+    // 9b. Prototype-list sidecar: the unique models this map's instances
+    // reference, keyed by VFS path — drives standalone `batch-export-model`
+    // runs that build a shared (cross-map) prototype library.
+    if !scene.prototypes.is_empty() {
+        let out_dir = output.parent().unwrap_or_else(|| Path::new("."));
+        let doc = serde_json::json!({
+            "schema": "wows_map_model_prototypes/v1",
+            "space": dir_str,
+            "prototype_count": scene.prototypes.len(),
+            "prototypes": scene.prototypes.iter().map(|p| serde_json::json!({
+                "name": p.name,
+                "model_path": p.model_path,
+                "instance_count": p.instance_count,
+                "landscape_instance_count": p.landscape_instance_count,
+            })).collect::<Vec<_>>(),
+        });
+        let path = out_dir.join("map_model_prototypes.json");
+        match serde_json::to_vec_pretty(&doc) {
+            Ok(bytes) => match std::fs::write(&path, bytes) {
+                Ok(()) => println!("  Prototype sidecar: {} unique models", scene.prototypes.len()),
+                Err(e) => eprintln!("Warning: failed to write map_model_prototypes.json: {e}"),
+            },
+            Err(e) => eprintln!("Warning: prototype sidecar serialize failed: {e}"),
+        }
+    }
+
     if let Some(path) = collision_manifest_json {
         let mut file = std::fs::File::create(path).context("Failed to create collision manifest JSON")?;
         gltf_export::write_map_collision_manifest_json(&scene, &geom, &dir_str, &mut file)

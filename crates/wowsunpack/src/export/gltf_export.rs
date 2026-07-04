@@ -493,6 +493,12 @@ pub struct MapModelInstance {
     /// map-local prototypes (vri == 0 or unresolvable). When set, downstream
     /// GLB export uses it as the node name instead of the generic `Instance_N`.
     pub asset_name: Option<String>,
+    /// Resolved prototype VFS path WITHOUT extension (e.g.
+    /// `content/location/nature/rock/LNR392_Okinawa/LNR392_Okinawa`) —
+    /// names the `.geometry`/`.visual` sibling pair so consumers can
+    /// batch-export the prototype standalone. `None` for map-local
+    /// prototypes (vri == 0 or unresolvable).
+    pub model_path: Option<String>,
     /// Engine `isLandscape` flag from the ModelInstance record. Identifies
     /// LNR* / TILEDLAND backdrop landmass proxies that the engine renders
     /// with a coarser LOD policy + distance-fog attenuation.
@@ -674,6 +680,10 @@ pub struct MapScene {
     /// to the GLB by the export driver). `None` when terrain is disabled or
     /// `terrain.bin` is absent.
     pub terrain_heightmap: Option<TerrainHeightmapData>,
+    /// Unique model prototypes referenced by `model_instances`, aggregated
+    /// for the `map_model_prototypes.json` sidecar (drives standalone
+    /// `batch-export-model` runs building a shared prototype library).
+    pub prototypes: Vec<MapPrototypeInfo>,
     /// Per-weather-preset environment blocks parsed from
     /// `space.ubersettings` (fog, wind, sun, sun disk, sky dome asset paths,
     /// PBS cubemapsPath + packed SH, HDR environment), emitted verbatim as
@@ -684,6 +694,20 @@ pub struct MapScene {
     /// referenced by the `vegetation_tint` scene extras. Texture order is
     /// preserved into the GLB, so this equals the glTF texture index.
     pub vegetation_tint_texture: Option<usize>,
+}
+
+/// One unique model prototype with usage counts, for the prototype-list
+/// sidecar (`map_model_prototypes.json`).
+#[derive(Clone)]
+pub struct MapPrototypeInfo {
+    /// Resolved asset stem (`LNR392_Okinawa`); `None` for map-local
+    /// prototypes without an `assets.bin` identity.
+    pub name: Option<String>,
+    /// VFS path sans extension naming the `.geometry`/`.visual` pair;
+    /// `None` for map-local prototypes.
+    pub model_path: Option<String>,
+    pub instance_count: u32,
+    pub landscape_instance_count: u32,
 }
 
 /// Shoreline signed-distance-field sidecar description.
@@ -835,10 +859,13 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
     // `content/ports/building/city/OBC008/OBC008.visual`). Map-local
     // prototypes (vri == 0 or unresolvable) get `None` and the GLB exporter
     // falls back to `Instance_N` for those.
-    let asset_names: Vec<Option<String>> = merged
+    // Resolved as `(stem, full VFS path sans extension)` — the path names
+    // the prototype's `.geometry`/`.visual` sibling pair, letting consumers
+    // batch-export prototypes standalone (`export-model <path>.geometry`).
+    let asset_resolved: Vec<Option<(String, String)>> = merged
         .models
         .iter()
-        .map(|record| -> Option<String> {
+        .map(|record| -> Option<(String, String)> {
             let vri = record.model_proto.visual_resource_id;
             if vri == 0 {
                 return None;
@@ -850,15 +877,19 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
             if path.is_empty() {
                 return None;
             }
-            let basename = path.rsplit('/').next().unwrap_or(&path);
-            let stem = basename
+            let path_stem = path
                 .strip_suffix(".visual")
-                .or_else(|| basename.strip_suffix(".geometry"))
-                .or_else(|| basename.strip_suffix(".model"))
-                .unwrap_or(basename);
-            if stem.is_empty() { None } else { Some(stem.to_string()) }
+                .or_else(|| path.strip_suffix(".geometry"))
+                .or_else(|| path.strip_suffix(".model"))
+                .unwrap_or(&path);
+            let basename = path_stem.rsplit('/').next().unwrap_or(path_stem);
+            if basename.is_empty() { None } else { Some((basename.to_string(), path_stem.to_string())) }
         })
         .collect();
+    let asset_names: Vec<Option<String>> =
+        asset_resolved.iter().map(|r| r.as_ref().map(|(stem, _)| stem.clone())).collect();
+    let asset_paths: Vec<Option<String>> =
+        asset_resolved.iter().map(|r| r.as_ref().map(|(_, path)| path.clone())).collect();
     let resolved_count = asset_names.iter().filter(|n| n.is_some()).count();
     println!(
         "  Resolved names for {}/{} prototypes (rest are map-local with vri=0)",
@@ -971,6 +1002,9 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
     let mut dyed_materials: Vec<MapDyedMaterial> = Vec::new();
     let mut dyed_mat_by_selfid: HashMap<u64, Option<usize>> = HashMap::new();
     let (mut dye_refs_total, mut dye_refs_resolved) = (0usize, 0usize);
+    // Per-prototype usage counts (instance_count, landscape_count) for the
+    // prototype-list sidecar.
+    let mut proto_counts: HashMap<usize, (u32, u32)> = HashMap::new();
     if let Some(space) = space {
         for inst in &space.instances {
             let Some(&model_idx) = path_to_model.get(&inst.path_id) else {
@@ -979,6 +1013,13 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
             let range = &model_mesh_ranges[model_idx];
             if range.is_empty() {
                 continue;
+            }
+            {
+                let e = proto_counts.entry(model_idx).or_default();
+                e.0 += 1;
+                if inst.is_landscape {
+                    e.1 += 1;
+                }
             }
 
             // Resolve instance dye pairs {matter_id, tint_name_id} against the
@@ -1073,6 +1114,7 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                 // a Z-axis position mirror. Mirrors the ship/accessory path.
                 transform: negate_z_transform(inst.transform.0),
                 asset_name: asset_names[model_idx].clone(),
+                model_path: asset_paths[model_idx].clone(),
                 is_landscape: inst.is_landscape,
                 min_quality_level: inst.min_quality_level,
                 stable_guid: inst.stable_guid.clone(),
@@ -1095,10 +1137,12 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
             if range.is_empty() {
                 continue;
             }
+            proto_counts.entry(model_idx).or_default().0 += 1;
             model_instances.push(MapModelInstance {
                 mesh_range: range.clone(),
                 transform: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
                 asset_name: asset_names[model_idx].clone(),
+                model_path: asset_paths[model_idx].clone(),
                 is_landscape: false,
                 min_quality_level: 0,
                 stable_guid: None,
@@ -1420,6 +1464,19 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         dyed_materials,
         shoreline: shoreline.clone(),
         terrain_heightmap: terrain_heightmap.clone(),
+        prototypes: {
+            let mut prototypes: Vec<MapPrototypeInfo> = proto_counts
+                .into_iter()
+                .map(|(model_idx, (count, landscape))| MapPrototypeInfo {
+                    name: asset_names[model_idx].clone(),
+                    model_path: asset_paths[model_idx].clone(),
+                    instance_count: count,
+                    landscape_instance_count: landscape,
+                })
+                .collect();
+            prototypes.sort_by(|a, b| a.name.cmp(&b.name));
+            prototypes
+        },
         weathers: weathers.clone(),
         vegetation_tint_texture,
     })
@@ -1640,6 +1697,11 @@ fn build_instance_extras(inst: &MapModelInstance, dyed_material_indices: &[u32])
         "min_quality_level": inst.min_quality_level,
         "lod_extents": inst.lod_extents,
     });
+    if let Some(model_path) = &inst.model_path {
+        // Prototype identity: VFS path sans extension, naming the
+        // `.geometry`/`.visual` pair for standalone `export-model` runs.
+        value["model_path"] = serde_json::json!(model_path);
+    }
     if !dyes.is_empty() {
         value["dyes"] = serde_json::json!(dyes);
     }
