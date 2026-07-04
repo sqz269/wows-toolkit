@@ -729,6 +729,10 @@ pub struct TerrainHeightmapData {
     /// Height range (metres, sea level = 0) used for u16 normalization.
     pub min_height: f32,
     pub max_height: f32,
+    /// Optional baked sun×sky lightmap PNG sidecar (also embedded in the
+    /// GLB as the terrain baseColor). Rows match the heightmap grid
+    /// (row 0 = min_z).
+    pub lightmap_file: Option<String>,
 }
 
 /// Cache key for deduplicating map materials by visual parameters.
@@ -1889,6 +1893,10 @@ fn build_scene_extras(
         //   z(row) = min_z + row * (max_z - min_z) / (height - 1)  [BW frame;
         //       glTF z = -z, so row 0 = min_z — OPPOSITE the shoreline /
         //       vegetation_tint v_origin=max_z frame]
+        // `bounds` is duplicated inside the block so the sidecar contract
+        // is self-contained for consumers that read it out of export.json
+        // (the export-record echo lifts only this dict, not the top-level
+        // scene extras).
         "terrain_heightmap": terrain_heightmap.map(|t| serde_json::json!({
             "file": t.file,
             "width": t.width,
@@ -1899,6 +1907,15 @@ fn build_scene_extras(
             "max_height": t.max_height,
             "sea_level": 0.0,
             "row0": "min_z",
+            "bounds": {
+                "min_x": bounds.min_x,
+                "max_x": bounds.max_x,
+                "min_z": bounds.min_z,
+                "max_z": bounds.max_z,
+            },
+            // Baked sun×sky lightmap PNG (grayscale in RGB, sRGB-encoded);
+            // rows match the heightmap grid (row 0 = min_z).
+            "lightmap_file": t.lightmap_file,
         })),
         // Per-weather-preset environment blocks (fog/wind/sun/sun_disk/
         // sky_dome/pbs/spherical_harmonics/hdr_environment/forest), first =

@@ -2997,12 +2997,44 @@ fn run_export_map(
             return None;
         }
         println!("  Terrain heightmap sidecar: {}×{} u16, range [{min_h:.2}, {max_h:.2}] m", t.width, t.height);
+
+        // Baked sun×sky lightmap as a PNG sidecar (it is also embedded in
+        // the GLB): native consumers that skip the GLB still need the only
+        // shading data the terrain has. flip_rows=true matches the GLB
+        // bake, so PNG rows land in the heightmap grid frame (row 0 =
+        // min_z).
+        let lightmap_file = match (&lightmap_shadow_dds, &lightmap_indirection_dds) {
+            (Some(shadow), Some(indirection)) => {
+                match texture::bake_terrain_lightmap(shadow, indirection, lightmap_density, true) {
+                    Ok(png) => {
+                        let name = "terrain_lightmap.png".to_string();
+                        match std::fs::write(out_dir.join(&name), &png) {
+                            Ok(()) => {
+                                println!("  Terrain lightmap sidecar: {name} ({} bytes)", png.len());
+                                Some(name)
+                            }
+                            Err(e) => {
+                                eprintln!("Warning: failed to write {name}: {e}");
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: terrain lightmap sidecar bake failed: {e}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         Some(gltf_export::TerrainHeightmapData {
             file,
             width: t.width,
             height: t.height,
             min_height: min_h,
             max_height: max_h,
+            lightmap_file,
         })
     });
 
