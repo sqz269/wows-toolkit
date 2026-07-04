@@ -3201,6 +3201,152 @@ fn run_export_map(
         None
     };
 
+    // 8d. Vegetation sidecars for native consumers: species mesh blob +
+    // per-layer instance blobs + manifest (+ the decoded tint map as a
+    // PNG). The map GLB embeds the same data as EXT_mesh_gpu_instancing
+    // nodes; standalone consumers rebuild meshes/instancing at runtime
+    // from these instead of parsing the GLB. All coordinates are the
+    // map-GLB frame (x = BW x, z = −BW z, y up), native BW units.
+    if let Some(veg) = &vegetation_data {
+        let out_dir = output.parent().unwrap_or_else(|| Path::new("."));
+        let mut mesh_blob: Vec<u8> = Vec::new();
+        let mut species_entries: Vec<serde_json::Value> = Vec::new();
+        let mut has_mesh: Vec<bool> = Vec::with_capacity(veg.species.len());
+        for (sp_idx, sp) in veg.species.iter().enumerate() {
+            if sp.mesh.positions.is_empty() || sp.mesh.indices.is_empty() {
+                species_entries.push(serde_json::Value::Null);
+                has_mesh.push(false);
+                continue;
+            }
+            has_mesh.push(true);
+            let positions_offset = mesh_blob.len();
+            for p in &sp.mesh.positions {
+                for v in p {
+                    mesh_blob.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            let normals_offset = mesh_blob.len();
+            for n in &sp.mesh.normals {
+                for v in n {
+                    mesh_blob.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            let uvs_offset = mesh_blob.len();
+            for uv in &sp.mesh.uvs {
+                for v in uv {
+                    mesh_blob.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            let indices_offset = mesh_blob.len();
+            for i in &sp.mesh.indices {
+                mesh_blob.extend_from_slice(&i.to_le_bytes());
+            }
+            let albedo_file = sp.albedo_png.as_ref().map(|png| {
+                let name = format!("veg_albedo_{sp_idx}.png");
+                if let Err(e) = std::fs::write(out_dir.join(&name), png) {
+                    eprintln!("Warning: failed to write {name}: {e}");
+                }
+                name
+            });
+            species_entries.push(serde_json::json!({
+                "index": sp_idx,
+                "vertex_count": sp.mesh.positions.len(),
+                "index_count": sp.mesh.indices.len(),
+                "positions_offset": positions_offset,
+                "normals_offset": normals_offset,
+                "uvs_offset": uvs_offset,
+                "indices_offset": indices_offset,
+                "albedo_file": albedo_file,
+            }));
+        }
+
+        // Per-layer instance blobs: f32le (x, y, −BW z) triples sorted by
+        // species; per-species (start, count) ranges live in the manifest.
+        // Instances of mesh-less species are dropped (mirrors the GLB path).
+        let layer_entries: Vec<serde_json::Value> = veg
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(li, layer)| {
+                let mut per_species: Vec<Vec<[f32; 3]>> = vec![Vec::new(); veg.species.len()];
+                for &(sp, [x, y, z]) in layer {
+                    if has_mesh.get(sp).copied().unwrap_or(false) {
+                        per_species[sp].push([x, y, -z]);
+                    }
+                }
+                let mut blob: Vec<u8> = Vec::new();
+                let mut ranges: Vec<serde_json::Value> = Vec::new();
+                let mut cursor = 0usize;
+                for (sp, list) in per_species.iter().enumerate() {
+                    if list.is_empty() {
+                        continue;
+                    }
+                    ranges.push(serde_json::json!({"species": sp, "start": cursor, "count": list.len()}));
+                    for p in list {
+                        for v in p {
+                            blob.extend_from_slice(&v.to_le_bytes());
+                        }
+                    }
+                    cursor += list.len();
+                }
+                let file = format!("forest_layer{li}.bin");
+                if let Err(e) = std::fs::write(out_dir.join(&file), &blob) {
+                    eprintln!("Warning: failed to write {file}: {e}");
+                }
+                serde_json::json!({
+                    "name": forest::LAYER_NAMES[li],
+                    "file": file,
+                    "count": cursor,
+                    "ranges": ranges,
+                })
+            })
+            .collect();
+
+        let tint = vegetation_tint_png.as_ref().map(|png| {
+            let name = "vegetation_tintmap.png".to_string();
+            if let Err(e) = std::fs::write(out_dir.join(&name), png) {
+                eprintln!("Warning: failed to write {name}: {e}");
+            }
+            serde_json::json!({
+                "file": name,
+                // World-XZ mapping over `bounds` in the BW frame:
+                //   u = (x − min_x) / span_x
+                //   v = (max_z − z_bw) / span_z   [minimap / North-up]
+                "v_origin": "max_z",
+                "bounds": {
+                    "min_x": bounds.min_x,
+                    "max_x": bounds.max_x,
+                    "min_z": bounds.min_z,
+                    "max_z": bounds.max_z,
+                },
+            })
+        });
+
+        if let Err(e) = std::fs::write(out_dir.join("vegetation_meshes.bin"), &mesh_blob) {
+            eprintln!("Warning: failed to write vegetation_meshes.bin: {e}");
+        }
+        let manifest = serde_json::json!({
+            "schema": "wows_map_vegetation/v1",
+            "frame": "map-GLB frame: x = BW x, z = -BW z, y up; native BW units (apply the consumer's BW->metre ruler)",
+            "meshes_file": "vegetation_meshes.bin",
+            "species": species_entries,
+            "layers": layer_entries,
+            "layer_semantics": "Primary/Underwater = near ring; *Rare = far-density companions drawn INSTEAD of their base layer beyond a swap distance, never additively",
+            "tint": tint,
+        });
+        match serde_json::to_vec_pretty(&manifest) {
+            Ok(bytes) => match std::fs::write(out_dir.join("vegetation_manifest.json"), bytes) {
+                Ok(()) => println!(
+                    "  Vegetation sidecars: {} species, mesh blob {} KiB",
+                    has_mesh.iter().filter(|&&b| b).count(),
+                    mesh_blob.len() / 1024,
+                ),
+                Err(e) => eprintln!("Warning: failed to write vegetation_manifest.json: {e}"),
+            },
+            Err(e) => eprintln!("Warning: vegetation manifest serialize failed: {e}"),
+        }
+    }
+
     // 9. Build the format-agnostic MapScene.
     let vfs_for_textures = if no_textures { None } else { vfs };
     let scene = gltf_export::build_map_scene(&gltf_export::BuildMapSceneParams {
