@@ -267,6 +267,15 @@ enum Commands {
         #[arg(long)]
         list_textures: bool,
 
+        /// Evaluate WG's legacy-PBS response curve into the emitted
+        /// metallicRoughness maps (per-material MFM constants over
+        /// shader-family defaults), so stock glTF PBR consumers render
+        /// the engine's material response. Leave OFF for exports whose
+        /// consumers implement the legacy-PBS transform in their own
+        /// shaders (the ship pipeline does) — they would double-apply.
+        #[arg(long)]
+        bake_legacy_pbs: bool,
+
         /// Read file from disk instead of VFS
         #[clap(long)]
         no_vfs: bool,
@@ -1464,6 +1473,7 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
             material_mappings_json,
             skel_ext_candidates_json,
             list_textures,
+            bake_legacy_pbs,
             no_vfs,
         } => {
             run_export_model(&ExportModelParams {
@@ -1480,6 +1490,7 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
                 material_mappings_json: material_mappings_json.as_deref(),
                 skel_ext_candidates_json: skel_ext_candidates_json.as_deref(),
                 list_textures,
+                bake_legacy_pbs,
                 no_vfs,
                 vfs: vfs.as_ref(),
             })?;
@@ -2198,6 +2209,7 @@ struct ExportModelParams<'a> {
     material_mappings_json: Option<&'a Path>,
     skel_ext_candidates_json: Option<&'a Path>,
     list_textures: bool,
+    bake_legacy_pbs: bool,
     no_vfs: bool,
     vfs: Option<&'a VfsPath>,
 }
@@ -2217,6 +2229,7 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
         material_mappings_json,
         skel_ext_candidates_json,
         list_textures,
+        bake_legacy_pbs,
         no_vfs,
         vfs,
     } = *params;
@@ -2241,6 +2254,7 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
         material_mappings_json,
         skel_ext_candidates_json,
         list_textures,
+        bake_legacy_pbs,
         no_vfs,
         vfs,
         db.as_ref(),
@@ -2278,6 +2292,7 @@ fn export_one_model(
     material_mappings_json: Option<&Path>,
     skel_ext_candidates_json: Option<&Path>,
     list_textures: bool,
+    bake_legacy_pbs: bool,
     no_vfs: bool,
     vfs: Option<&VfsPath>,
     db: Option<&wowsunpack::models::assets_bin::PrototypeDatabase<'_>>,
@@ -2361,7 +2376,10 @@ fn export_one_model(
         let load_textures = !no_textures || raw_dds_dir.is_some();
         let texture_set = if load_textures {
             let mfm_infos = collect_mfm_info(vp, db);
-            let tex_set = build_texture_set(&mfm_infos, vfs, db, raw_dds_dir);
+            let mut tex_set = build_texture_set(&mfm_infos, vfs, db, raw_dds_dir);
+            if bake_legacy_pbs && !no_textures {
+                wowsunpack::export::ship::bake_legacy_pbs_into_texture_set(&mut tex_set, &mfm_infos, db);
+            }
             if no_textures { gltf_export::TextureSet::empty() } else { tex_set }
         } else {
             gltf_export::TextureSet::empty()
@@ -2515,6 +2533,11 @@ struct BatchSharedOptions {
     lod: usize,
     #[serde(default)]
     textures_uri_prefix: Option<String>,
+    /// Evaluate WG's legacy-PBS response curve into the emitted
+    /// metallicRoughness maps (see the `export-model --bake-legacy-pbs`
+    /// flag). For batches consumed by stock glTF PBR renderers.
+    #[serde(default)]
+    bake_legacy_pbs: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -2547,6 +2570,7 @@ impl Default for BatchSharedOptions {
             damaged: false,
             lod: 0,
             textures_uri_prefix: None,
+            bake_legacy_pbs: false,
         }
     }
 }
@@ -2595,6 +2619,7 @@ fn run_batch_export_model(manifest_path: &Path, keep_going: bool, vfs: &VfsPath)
             item.material_mappings_json.as_deref(),
             item.skel_ext_candidates_json.as_deref(),
             /* list_textures: */ false,
+            shared.bake_legacy_pbs,
             /* no_vfs: */ false,
             Some(vfs),
             Some(&db),

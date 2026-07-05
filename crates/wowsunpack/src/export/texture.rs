@@ -1354,6 +1354,126 @@ pub fn repack_wg_mg_to_gltf_mr(png_bytes: &[u8]) -> Result<Vec<u8>, Report<Textu
     Ok(out)
 }
 
+/// Per-material constants of WG's "legacy PBS" response curve — the
+/// transform every `PBS*` pixel shader applies between the raw
+/// `metallicGlossMap` channels and the BRDF inputs:
+///
+/// ```text
+///   roughness = 1 − gloss^glossRemap                      (gloss = mg.R, raw sample)
+///   metallic  = min(1, (degamma(mg.G) · specMul)^specPow) (degamma = ^2.2 via g_gammaCorrection)
+/// ```
+///
+/// DXBC-proven on build 12506899 (`PBS_landscape_detail.win.dx11.fxo`
+/// chunk001 PS: `log/mul/exp` chain on mg.R with `cb0[2].x =
+/// g_legacyGlossRemap`; mg.G^`g_gammaCorrection` × `g_legacySpecularMul`
+/// raised to `g_legacySpecularPow`, `min 1`, then F0 =
+/// `lerp(0.04, chroma·g_legacyAlbedoToSpecular, metallic)`).
+///
+/// The constants come from the material's `.mfm` property bag when
+/// authored (e.g. `LBC020_025.mfm` sets `g_legacySpecularMul = 2.9`),
+/// otherwise from the effect's `$Globals` defaults, which differ per
+/// shader family (RDEF defaults, same build):
+///
+/// | family                     | specMul | specPow | glossRemap |
+/// |----------------------------|---------|---------|------------|
+/// | std `PBS*` (props, misc)   | 3.0     | 4.0     | 0.75       |
+/// | `PBS_landscape_detail*`    | **0.0** | 4.0     | 1.5        |
+///
+/// Landscape materials therefore render **dielectric** (metallic ≡ 0)
+/// unless their MFM authors `g_legacySpecularMul` — passing the raw
+/// mg.G through as glTF metallic (as the plain conformant repack does)
+/// over-lights them badly in stock glTF PBR consumers.
+#[derive(Debug, Clone, Copy)]
+pub struct LegacyPbsParams {
+    pub spec_mul: f32,
+    pub spec_pow: f32,
+    pub gloss_remap: f32,
+}
+
+impl LegacyPbsParams {
+    /// `$Globals` defaults of the std `PBS` effect family (props/misc).
+    pub const STD_PBS: Self = Self { spec_mul: 3.0, spec_pow: 4.0, gloss_remap: 0.75 };
+    /// `$Globals` defaults of the `PBS_landscape_detail` effect family.
+    pub const LANDSCAPE_DETAIL: Self = Self { spec_mul: 0.0, spec_pow: 4.0, gloss_remap: 1.5 };
+}
+
+/// Resolve a material's legacy-PBS constants: family defaults selected by
+/// the render-set material identifier (`PBSLD*` → landscape-detail family,
+/// anything else → std PBS), overridden by any `g_legacy*` floats the MFM
+/// authors. `mfm_path_id == 0` or an unparseable MFM yields pure family
+/// defaults.
+pub fn resolve_legacy_pbs_params(
+    db: &PrototypeDatabase<'_>,
+    mfm_path_id: u64,
+    material_identifier: &str,
+) -> LegacyPbsParams {
+    let mut p = if material_identifier.contains("PBSLD") {
+        LegacyPbsParams::LANDSCAPE_DETAIL
+    } else {
+        LegacyPbsParams::STD_PBS
+    };
+    if mfm_path_id != 0 {
+        if let Some(mat) = parse_mfm_from_db(db, mfm_path_id) {
+            if let Some(v) = mat.get_float("g_legacySpecularMul") {
+                p.spec_mul = v;
+            }
+            if let Some(v) = mat.get_float("g_legacySpecularPow") {
+                p.spec_pow = v;
+            }
+            if let Some(v) = mat.get_float("g_legacyGlossRemap") {
+                p.gloss_remap = v;
+            }
+        }
+    }
+    p
+}
+
+/// Evaluate WG's legacy-PBS response into a conformant metallicRoughness
+/// PNG (the output of [`repack_wg_mg_to_gltf_mr`]), so the *values* — not
+/// just the channel layout — match what the engine feeds its BRDF. Stock
+/// glTF PBR consumers can then render the material faithfully with no
+/// game-specific knowledge.
+///
+/// Input channels (conformant repack): R = gloss (raw, preserved),
+/// G = 255−R (linear roughness), B = raw mg.G ("metallic" source).
+/// Output: R preserved, G = `255·(1 − (R/255)^glossRemap)`,
+/// B = `255·min(1, (((B/255)^2.2)·specMul)^specPow)`, A = 255.
+///
+/// Do NOT apply this to exports whose downstream consumers already
+/// implement the legacy-PBS transform in their own shaders (the ship
+/// pipeline does) — they would double-apply the curve.
+pub fn bake_legacy_pbs_mr(png_bytes: &[u8], params: LegacyPbsParams) -> Result<Vec<u8>, Report<TextureError>> {
+    use image_dds::image::ImageReader;
+
+    let reader = ImageReader::new(Cursor::new(png_bytes))
+        .with_guessed_format()
+        .map_err(|e| Report::new(TextureError::DdsDecode(e.to_string())))?;
+    let img = reader.decode().map_err(|e| Report::new(TextureError::DdsDecode(e.to_string())))?;
+    let mut rgba = img.into_rgba8();
+
+    // 256-entry LUTs — the transform is per-channel-value.
+    let mut rough_lut = [0u8; 256];
+    let mut metal_lut = [0u8; 256];
+    for v in 0..256usize {
+        let x = v as f32 / 255.0;
+        let rough = 1.0 - x.powf(params.gloss_remap);
+        rough_lut[v] = (rough.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let metal = (x.powf(2.2) * params.spec_mul).powf(params.spec_pow).min(1.0);
+        metal_lut[v] = (metal.clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+
+    for pixel in rgba.pixels_mut() {
+        let [r, _g, b, _a] = pixel.0;
+        pixel.0 = [r, rough_lut[r as usize], metal_lut[b as usize], 255];
+    }
+
+    let mut out = Vec::new();
+    PngEncoder::new(&mut out)
+        .write_image(rgba.as_raw(), rgba.width(), rgba.height(), ExtendedColorType::Rgba8)
+        .map_err(|e| Report::new(TextureError::PngEncode(e.to_string())))?;
+    Ok(out)
+}
+
 /// Replace WG's categorical-mask `B` channel in a normal map PNG with the
 /// reconstructed Z (`sqrt(1 - X² - Y²)`), so the result is a glTF-conformant
 /// tangent-space normal map.
@@ -1802,6 +1922,48 @@ pub fn load_or_bake_albedo_with_alpha(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Encode a tiny RGBA PNG for the bake tests.
+    fn png_rgba(pixels: &[[u8; 4]], w: u32, h: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        let flat: Vec<u8> = pixels.iter().flatten().copied().collect();
+        PngEncoder::new(&mut out).write_image(&flat, w, h, ExtendedColorType::Rgba8).unwrap();
+        out
+    }
+
+    fn decode_rgba(png: &[u8]) -> Vec<[u8; 4]> {
+        use image_dds::image::ImageReader;
+        let img = ImageReader::new(Cursor::new(png)).with_guessed_format().unwrap().decode().unwrap();
+        img.into_rgba8().pixels().map(|p| p.0).collect()
+    }
+
+    #[test]
+    fn bake_legacy_pbs_landscape_kills_metallic() {
+        // Conformant input pixel modelled on the LNC639 cliff average:
+        // R=72 gloss, G=183 (=255−72), B=65 raw metallic source.
+        let png = png_rgba(&[[72, 183, 65, 255]], 1, 1);
+        let out = decode_rgba(&bake_legacy_pbs_mr(&png, LegacyPbsParams::LANDSCAPE_DETAIL).unwrap());
+        let [r, g, b, a] = out[0];
+        assert_eq!(r, 72, "gloss channel must be preserved");
+        // roughness = 1 − (72/255)^1.5 = 0.85 → 217
+        assert_eq!(g, 217);
+        // landscape default specMul = 0 → metallic ≡ 0 whatever B says
+        assert_eq!(b, 0);
+        assert_eq!(a, 255);
+    }
+
+    #[test]
+    fn bake_legacy_pbs_std_pbs_curve() {
+        // std PBS family: metallic = min(1, ((B/255)^2.2 · 3)^4).
+        // B=255 → (1·3)^4 clamps to 1; B=128 evaluated below.
+        let png = png_rgba(&[[255, 0, 255, 255], [255, 0, 128, 255]], 2, 1);
+        let out = decode_rgba(&bake_legacy_pbs_mr(&png, LegacyPbsParams::STD_PBS).unwrap());
+        assert_eq!(out[0][2], 255);
+        let expect = (((128.0f32 / 255.0).powf(2.2) * 3.0).powf(4.0).min(1.0) * 255.0).round() as u8;
+        assert_eq!(out[1][2], expect);
+        // gloss=255 → roughness = 1 − 1^0.75 = 0
+        assert_eq!(out[0][1], 0);
+    }
 
     #[test]
     fn strip_year_token_middle() {

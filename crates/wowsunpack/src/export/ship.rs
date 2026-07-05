@@ -2891,6 +2891,41 @@ pub fn build_texture_set(
     }
 }
 
+/// Evaluate WG's legacy-PBS response curve into every metallicRoughness
+/// PNG of a [`TextureSet`] (see [`texture::bake_legacy_pbs_mr`]): per
+/// material, constants resolve from its MFM property bag over the shader
+/// family's `$Globals` defaults ([`texture::resolve_legacy_pbs_params`]).
+///
+/// Opt-in (`--bake-legacy-pbs`) because the correct choice depends on the
+/// downstream consumer: stock glTF PBR consumers need baked values; the
+/// ship pipeline's own shaders implement the curve themselves and must
+/// receive the raw conformant channels.
+pub fn bake_legacy_pbs_into_texture_set(
+    texture_set: &mut TextureSet,
+    mfm_infos: &[MfmInfo],
+    db: &PrototypeDatabase<'_>,
+) {
+    let mut baked = 0usize;
+    for info in mfm_infos {
+        let Some(png) = texture_set.metallic_roughness_base.get(&info.stem) else {
+            continue;
+        };
+        let params = texture::resolve_legacy_pbs_params(db, info.material_mfm_path_id, &info.material_identifier);
+        match texture::bake_legacy_pbs_mr(png, params) {
+            Ok(out) => {
+                texture_set.metallic_roughness_base.insert(info.stem.clone(), out);
+                baked += 1;
+            }
+            Err(e) => {
+                eprintln!("  Warning: legacy-PBS bake failed for {}: {e}", info.stem);
+            }
+        }
+    }
+    if baked > 0 {
+        eprintln!("  Baked legacy-PBS response into {baked} metallicRoughness map(s)");
+    }
+}
+
 /// Resolve a compound hardpoint (e.g. `HP_AGM_3_HP_AGA_1`) by finding the
 /// longest hull HP name that prefixes the mount's HP name, then looking up
 /// the child HP in the parent turret's visual node tree.
