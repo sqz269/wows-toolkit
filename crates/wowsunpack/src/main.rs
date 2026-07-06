@@ -512,6 +512,23 @@ enum Commands {
         #[arg(long)]
         collision_manifest_json: Option<PathBuf>,
     },
+    /// Export a space's static-decal textures as PNGs.
+    ///
+    /// Parses `space.bin` staticDecals[] (sub-array 5), reads every unique
+    /// referenced texture (`maps/decals/**.tga|.dds`) from the VFS, decodes it
+    /// alpha-preserving, and writes flattened PNGs plus a
+    /// `decal_textures.json` mapping (VFS path -> file name) to the output
+    /// directory. Decal placement/records stay in the map GLB scene extras
+    /// (and the pipeline's static_decal_manifest.json); this command only
+    /// materializes the texture payload those records reference.
+    ExportDecals {
+        /// Path to a space directory (e.g. "spaces/40_Okinawa")
+        space_dir: PathBuf,
+
+        /// Output directory for the PNG store + decal_textures.json
+        #[arg(short, long)]
+        out_dir: PathBuf,
+    },
     /// Inspect armor model geometry and GameParams thickness data for a ship
     Armor {
         /// Ship name — either a model directory name (e.g. "JSB039_Yamato_1945")
@@ -1578,6 +1595,13 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
                 lightmap_density,
                 collision_manifest_json.as_deref(),
             )?;
+        }
+        Commands::ExportDecals { space_dir, out_dir } => {
+            let Some(vfs) = &vfs else {
+                bail!("VFS required for decal export. Use --game-dir to specify a game install.");
+            };
+
+            run_export_decals(&space_dir, &out_dir, vfs)?;
         }
         Commands::Armor { name, vehicle, hull, json } => {
             let Some(vfs) = &vfs else {
@@ -2862,6 +2886,137 @@ fn parse_space_fog(xml: &str) -> Option<gltf_export::SpaceFog> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Flatten a decal-texture VFS path into a store file name.
+///
+/// `maps/decals/40_Okinawa/40_Okinawa_LA_01_n.tga` -> `40_Okinawa_LA_01_n.png`
+/// `maps/decals/Dock/a.dds` -> `Dock__a.png`
+///
+/// The common `maps/decals/` prefix is stripped; remaining separators become
+/// `__` so distinct VFS dirs cannot collide. The WG channel suffix (`_n`,
+/// `_mg`, `_alpha_a`) stays at the END of the stem so suffix-driven import
+/// rules in consumers keep working.
+fn decal_store_file_name(vfs_path: &str) -> String {
+    let norm = vfs_path.replace('\\', "/");
+    let trimmed = norm.strip_prefix("maps/decals/").unwrap_or(&norm);
+    let stem = match trimmed.rsplit_once('.') {
+        Some((s, _ext)) => s,
+        None => trimmed,
+    };
+    format!("{}.png", stem.replace('/', "__"))
+}
+
+fn run_export_decals(space_dir: &Path, out_dir: &Path, vfs: &VfsPath) -> Result<(), Report> {
+    use wowsunpack::export::texture;
+    use wowsunpack::models::merged_models;
+
+    let dir_str = space_dir.to_string_lossy().replace('\\', "/");
+    let space_name = dir_str.rsplit('/').next().unwrap_or(&dir_str).to_string();
+    println!("Space: {dir_str}");
+
+    let space_bin_path = PathBuf::from(format!("{dir_str}/space.bin"));
+    let data = read_file_data(&space_bin_path, false, Some(vfs)).context("Failed to load space.bin")?;
+    let space = merged_models::parse_space_instances(&data).context("Failed to parse space.bin")?;
+    println!("  {} static decals", space.static_decals.len());
+
+    // Unique referenced texture paths across all records/slots.
+    let mut paths: Vec<String> = space
+        .static_decals
+        .iter()
+        .flat_map(|d| d.texture_paths.iter())
+        .filter_map(|p| p.as_deref())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_string())
+        .collect();
+    paths.sort();
+    paths.dedup();
+
+    std::fs::create_dir_all(out_dir).context("Failed to create output directory")?;
+
+    let mut textures = serde_json::Map::new();
+    let mut sources = serde_json::Map::new();
+    let mut errors = serde_json::Map::new();
+    for path in &paths {
+        let file_name = decal_store_file_name(path);
+        let result: Result<(Vec<u8>, String), String> = (|| {
+            // space.bin stores AUTHORING-time references (typically `.tga`);
+            // the shipped client carries build-time DDS conversions with the
+            // WG split mip chain (`.dd0` = top mip … `.dds` = mip tail).
+            // Resolve highest-resolution-first, falling back to the stored
+            // path verbatim for anything packed unconverted.
+            let stem = match path.rsplit_once('.') {
+                Some((s, _)) => s.to_string(),
+                None => path.clone(),
+            };
+            let mut candidates: Vec<String> =
+                texture::DDS_MIP_SUFFIXES.iter().map(|suf| format!("{stem}{suf}")).collect();
+            if !candidates.iter().any(|c| c == path) {
+                candidates.push(path.clone());
+            }
+            let mut last_decode_err: Option<String> = None;
+            for cand in &candidates {
+                let Some(bytes) = texture::load_dds_from_vfs(vfs, cand) else { continue };
+                let decoded = if cand.to_ascii_lowercase().ends_with(".tga") {
+                    texture::tga_to_png(&bytes).map_err(|e| e.to_string())
+                } else {
+                    texture::dds_to_png(&bytes).map_err(|e| e.to_string())
+                };
+                match decoded {
+                    Ok(png) => return Ok((png, cand.clone())),
+                    Err(e) => {
+                        // A corrupt candidate (e.g. truncated .dd0) shouldn't
+                        // sink the texture — a lower-mip sibling may decode.
+                        eprintln!("Warning: {cand}: decode failed ({e}); trying next candidate");
+                        last_decode_err = Some(format!("{cand}: {e}"));
+                    }
+                }
+            }
+            match last_decode_err {
+                Some(e) => Err(format!("all candidates failed to decode; last: {e}")),
+                None => Err(format!("no VFS candidate found (tried {})", candidates.join(", "))),
+            }
+        })();
+        match result {
+            Ok((png, source)) => {
+                texture::atomic_write(&out_dir.join(&file_name), &png)
+                    .context_with(|| format!("Failed to write {file_name}"))?;
+                textures.insert(path.clone(), serde_json::Value::String(file_name));
+                sources.insert(path.clone(), serde_json::Value::String(source));
+            }
+            Err(msg) => {
+                eprintln!("Warning: {path}: {msg}");
+                errors.insert(path.clone(), serde_json::Value::String(msg));
+            }
+        }
+    }
+
+    let (texture_count, error_count) = (textures.len(), errors.len());
+    // Distinct output files can be fewer than mapping entries: the same
+    // texture is often referenced under both `.tga` and `.dds` authoring
+    // extensions and flattens to one store file (verified same source).
+    let file_count = {
+        let mut files: Vec<&str> = textures.values().filter_map(|v| v.as_str()).collect();
+        files.sort_unstable();
+        files.dedup();
+        files.len()
+    };
+    let doc = serde_json::json!({
+        "schema": "wows.map.decal_textures.v1",
+        "space": space_name,
+        "decal_count": space.static_decals.len(),
+        "texture_count": texture_count,
+        "file_count": file_count,
+        "textures": textures,
+        "sources": sources,
+        "errors": errors,
+    });
+    let json_path = out_dir.join("decal_textures.json");
+    texture::atomic_write(&json_path, serde_json::to_string_pretty(&doc)?.as_bytes())
+        .context("Failed to write decal_textures.json")?;
+
+    println!("  {texture_count} textures written, {error_count} errors -> {}", out_dir.display());
+    Ok(())
+}
+
 fn run_export_map(
     space_dir: &Path,
     output: &Path,

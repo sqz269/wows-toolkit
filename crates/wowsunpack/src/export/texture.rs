@@ -16,7 +16,7 @@ use thiserror::Error;
 /// rather than being truncated-in-place and aliased. Also crash-safe: a
 /// kill mid-write leaves the original file untouched (the partial write is
 /// in the temp file). Produces byte-identical output to a plain write.
-fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(format!(".tmp{}", std::process::id()));
     let tmp = std::path::PathBuf::from(tmp);
@@ -256,6 +256,24 @@ pub fn dds_to_png(dds_bytes: &[u8]) -> Result<Vec<u8>, Report<TextureError>> {
     let mut png_buf = Vec::new();
     PngEncoder::new(&mut png_buf)
         .write_image(rgba_image.as_raw(), rgba_image.width(), rgba_image.height(), ExtendedColorType::Rgba8)
+        .map_err(|e| Report::new(TextureError::PngEncode(e.to_string())))?;
+
+    Ok(png_buf)
+}
+
+/// Decode TGA bytes to PNG bytes (RGBA8), alpha-preserving.
+///
+/// Map static-decal textures (`maps/decals/**`) ship as `.tga` (uncompressed
+/// or RLE) with the decal mask in ALPHA — do not route these through
+/// `force_png_opaque`.
+pub fn tga_to_png(tga_bytes: &[u8]) -> Result<Vec<u8>, Report<TextureError>> {
+    let img = image::load_from_memory_with_format(tga_bytes, image::ImageFormat::Tga)
+        .map_err(|e| Report::new(TextureError::DdsDecode(format!("TGA decode: {e}"))))?;
+    let rgba = img.to_rgba8();
+
+    let mut png_buf = Vec::new();
+    PngEncoder::new(&mut png_buf)
+        .write_image(rgba.as_raw(), rgba.width(), rgba.height(), ExtendedColorType::Rgba8)
         .map_err(|e| Report::new(TextureError::PngEncode(e.to_string())))?;
 
     Ok(png_buf)

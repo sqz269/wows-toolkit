@@ -73,6 +73,7 @@ const FEATURES: &[&str] = &[
     "ammo.json",
     "dump_bones.json",
     "texture.swizzle_dir",
+    "export_decals",
 ];
 
 /// Schema identifiers emitted in toolkit JSON outputs. Keyed by contract
@@ -84,6 +85,8 @@ const SCHEMAS: &[(&str, &str)] = &[
     ("armor_json", "wowsunpack.armor/v1"),
     ("ammo_json", "wowsunpack.ammo/v1"),
     ("dump_bones_json", "wowsunpack.visual_bones/v1"),
+    // Byte-matches the `schema` field the subcommand emits (dot form).
+    ("export_decals", "wows.map.decal_textures.v1"),
 ];
 
 #[derive(Debug, Serialize)]
@@ -156,8 +159,8 @@ mod tests {
     fn contract_count_matches_spec() {
         let caps = build();
         assert_eq!(caps.contracts.len(), 11);
-        assert_eq!(caps.features.len(), 13);
-        assert_eq!(caps.schemas.len(), 6);
+        assert_eq!(caps.features.len(), 14);
+        assert_eq!(caps.schemas.len(), 7);
     }
 
     #[test]
