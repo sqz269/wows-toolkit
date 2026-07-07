@@ -765,6 +765,10 @@ pub struct MapPrototypeInfo {
     pub model_index: usize,
     pub instance_count: u32,
     pub landscape_instance_count: u32,
+    /// Camera-medium visibility gate from the prototype VisualProto
+    /// (+0x38/+0x39) — see [`MapModelInstance::underwater_model`].
+    pub underwater_model: bool,
+    pub abovewater_model: bool,
 }
 
 /// Shoreline signed-distance-field sidecar description.
@@ -1558,6 +1562,8 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                     model_index: model_idx,
                     instance_count: count,
                     landscape_instance_count: landscape,
+                    underwater_model: model_water_flags[model_idx].0,
+                    abovewater_model: model_water_flags[model_idx].1,
                 })
                 .collect();
             prototypes.sort_by(|a, b| a.name.cmp(&b.name).then(a.model_index.cmp(&b.model_index)));

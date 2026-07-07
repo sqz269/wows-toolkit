@@ -3696,6 +3696,8 @@ fn run_export_map(
                 "local_mesh": p.name.is_none().then(|| format!("local_{}", p.model_index)),
                 "instance_count": p.instance_count,
                 "landscape_instance_count": p.landscape_instance_count,
+                "underwater_model": p.underwater_model,
+                "abovewater_model": p.abovewater_model,
             })).collect::<Vec<_>>(),
         });
         let path = out_dir.join("map_model_prototypes.json");
