@@ -6046,6 +6046,11 @@ pub fn collision_hit_locations_sub_models(
 
     let mut armor = empty_sub("Armor_Hull".to_string());
     let mut hitboxes: Vec<ArmorSubModel> = Vec::with_capacity(parsed.objects.len());
+    // Legacy collision magic 0x26092011 carries NO field_30 at all (per-model,
+    // all-or-nothing). Track whether ANY face had an id — folding None to
+    // mat_id 0 across the board would silently ship _MATERIAL_ID=0 and the
+    // consumer would resolve every plate to 0 mm (paper fort). See below.
+    let mut any_armor_ids = false;
 
     for (oi, obj) in parsed.objects.iter().enumerate() {
         let mut hb = empty_sub(format!("CM_SB_Hull_{oi}"));
@@ -6056,6 +6061,7 @@ pub fn collision_hit_locations_sub_models(
             if verts.len() < 3 {
                 continue;
             }
+            any_armor_ids |= face.field_30.is_some();
             let raw = face.field_30.unwrap_or(0);
             let mat_id = raw & 0xFFFF;
             let layer = (raw >> 16) & 0xFFFF;
@@ -6088,6 +6094,18 @@ pub fn collision_hit_locations_sub_models(
     if armor.positions.is_empty() {
         eprintln!("Warning: hit_locations collision model parsed but produced no triangles");
         return None;
+    }
+    if !any_armor_ids {
+        // Keep the meshes (the building stays HITTABLE; shells resolve 0 mm
+        // and always pen — wrong armor, functional target) but drop the
+        // all-zero attribute so the "no data" state is unambiguous downstream.
+        eprintln!(
+            "Warning: hit_locations collision model carries no field_30 armor ids \
+             (legacy 0x26092011 magic?) — _MATERIAL_ID omitted; consumer armor \
+             thickness will resolve to 0 mm"
+        );
+        armor.material_ids.clear();
+        armor.colors.clear();
     }
     flip_triangle_winding(&mut armor.indices);
     scale_positions_to_metres(&mut armor.positions);
