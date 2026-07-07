@@ -74,6 +74,9 @@ const FEATURES: &[&str] = &[
     "dump_bones.json",
     "texture.swizzle_dir",
     "export_decals",
+    // Map-GLB instance-node extras carry the prototype VisualProto
+    // camera-medium visibility flags (`underwater_model`/`abovewater_model`).
+    "export_map.instance_water_flags",
 ];
 
 /// Schema identifiers emitted in toolkit JSON outputs. Keyed by contract
@@ -159,7 +162,7 @@ mod tests {
     fn contract_count_matches_spec() {
         let caps = build();
         assert_eq!(caps.contracts.len(), 11);
-        assert_eq!(caps.features.len(), 14);
+        assert_eq!(caps.features.len(), 15);
         assert_eq!(caps.schemas.len(), 7);
     }
 

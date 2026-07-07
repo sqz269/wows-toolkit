@@ -547,6 +547,16 @@ pub struct MapModelInstance {
     pub min_quality_level: u8,
     /// Stable authoring GUID string from the ModelInstance descriptor, when present.
     pub stable_guid: Option<String>,
+    /// Prototype `VisualProto` camera-medium visibility gate (+0x38): the
+    /// engine draws the model only when the camera is UNDER water. LNU*
+    /// seafloor/island proxies are `underwater=true, abovewater=false` —
+    /// never drawn from an above-water camera. Prototype-level fact,
+    /// replicated per instance to keep the extras schema flat.
+    pub underwater_model: bool,
+    /// Prototype `VisualProto` camera-medium visibility gate (+0x39): the
+    /// engine draws the model when the camera is ABOVE water (the normal
+    /// battle camera). See `underwater_model`.
+    pub abovewater_model: bool,
     /// Per-LOD extent in metres from the prototype's `VisualProto.lods`.
     /// Last value is typically the asset's "draw distance" cap; engine
     /// LOD-switches the mesh by camera distance against these values.
@@ -1050,6 +1060,14 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
     let model_lod_extents: Vec<Vec<f32>> =
         merged.models.iter().map(|r| r.visual_proto.lods.iter().map(|l| l.extent).collect()).collect();
 
+    // Per-prototype camera-medium visibility flags (VisualProto +0x38/+0x39),
+    // cached once per model like the LOD extents: `(underwater, abovewater)`.
+    let model_water_flags: Vec<(bool, bool)> = merged
+        .models
+        .iter()
+        .map(|r| (r.visual_proto.underwater_model, r.visual_proto.abovewater_model))
+        .collect();
+
     // Build model instances from space.bin transforms.
     let mut model_instances: Vec<MapModelInstance> = Vec::new();
     // `(mesh_idx, forest_layer_idx, positions)` per species×layer group.
@@ -1177,6 +1195,8 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                 is_landscape: inst.is_landscape,
                 min_quality_level: inst.min_quality_level,
                 stable_guid: inst.stable_guid.clone(),
+                underwater_model: model_water_flags[model_idx].0,
+                abovewater_model: model_water_flags[model_idx].1,
                 lod_extents: model_lod_extents[model_idx].clone(),
                 model_dyes: inst.model_dyes.clone(),
                 material_instance_count: inst.material_instance_count,
@@ -1206,6 +1226,8 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                 is_landscape: false,
                 min_quality_level: 0,
                 stable_guid: None,
+                underwater_model: model_water_flags[model_idx].0,
+                abovewater_model: model_water_flags[model_idx].1,
                 lod_extents: model_lod_extents[model_idx].clone(),
                 model_dyes: Vec::new(),
                 material_instance_count: 0,
@@ -1746,6 +1768,8 @@ fn generate_water_mesh(cfg: &WaterConfig<'_>) -> MapMesh {
 /// {
 ///   "is_landscape": false,
 ///   "min_quality_level": 0,
+///   "underwater_model": false,
+///   "abovewater_model": true,
 ///   "lod_extents": [70.0, 160.0, 260.0, 500.0, 50000.0]
 /// }
 /// ```
@@ -1759,6 +1783,14 @@ fn build_instance_extras(inst: &MapModelInstance, dyed_material_indices: &[u32])
     let mut value = serde_json::json!({
         "is_landscape": inst.is_landscape,
         "min_quality_level": inst.min_quality_level,
+        // Camera-medium visibility gate from the prototype VisualProto
+        // (+0x38/+0x39): the engine draws the model only when the camera
+        // is under / above the water surface respectively. Consumers that
+        // render an above-water camera must hide `abovewater_model: false`
+        // instances (LNU* underwater proxies) or a coarse phantom island
+        // renders over the real one.
+        "underwater_model": inst.underwater_model,
+        "abovewater_model": inst.abovewater_model,
         "lod_extents": inst.lod_extents,
     });
     if let Some(model_path) = &inst.model_path {
