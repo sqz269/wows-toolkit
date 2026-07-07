@@ -276,6 +276,22 @@ enum Commands {
         #[arg(long)]
         bake_legacy_pbs: bool,
 
+        /// Emit the named static node tree (hardpoints) even when the visual
+        /// skins no mesh and carries no muzzle locator. Buildings (GameParams
+        /// `Building` models, e.g. LYB030) mount guns on static `HP_GUN_*` /
+        /// `HP_AIR_*` nodes that the default gates would drop from the GLB.
+        #[arg(long)]
+        emit_hardpoints: bool,
+
+        /// Synthesize ship-convention `Armor` + `Hitboxes` GLB groups from the
+        /// `.geometry` `hit_locations` collision model. For shore structures
+        /// (GameParams `Building`), which ship no armor BVH / `.splash`: the
+        /// collision payload's per-face `field_30` = `(layer<<16)|material_id`
+        /// matches GameParams `hull.armor` keys and becomes the per-vertex
+        /// `_MATERIAL_ID` (folded to the low 16 bits).
+        #[arg(long)]
+        collision_hitbox_groups: bool,
+
         /// Read file from disk instead of VFS
         #[clap(long)]
         no_vfs: bool,
@@ -1491,6 +1507,8 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
             skel_ext_candidates_json,
             list_textures,
             bake_legacy_pbs,
+            emit_hardpoints,
+            collision_hitbox_groups,
             no_vfs,
         } => {
             run_export_model(&ExportModelParams {
@@ -1508,6 +1526,8 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
                 skel_ext_candidates_json: skel_ext_candidates_json.as_deref(),
                 list_textures,
                 bake_legacy_pbs,
+                emit_hardpoints,
+                collision_hitbox_groups,
                 no_vfs,
                 vfs: vfs.as_ref(),
             })?;
@@ -2015,7 +2035,8 @@ fn write_collision_json(
             "vertices, edge_pairs, and face loops are direct loader-level cmData records",
             "debug_fan_triangles triangulate each face loop as a simple fan for visualization",
             "native_postload_triangle_candidate mirrors the observed no-zero face condition in FUN_1403d9ea0",
-            "this manifest does not prove movement, projectile, navigation, LOS, or broad-phase solver parity"
+            "this manifest does not prove movement, projectile, navigation, LOS, or broad-phase solver parity",
+            "hit_locations face field_30 = (layer<<16)|material_id armor key, numerically matching GameParams hull.armor keys (verified LYB011 vs PCBA001 Building entry)"
         ],
         "models": models,
     });
@@ -2234,6 +2255,8 @@ struct ExportModelParams<'a> {
     skel_ext_candidates_json: Option<&'a Path>,
     list_textures: bool,
     bake_legacy_pbs: bool,
+    emit_hardpoints: bool,
+    collision_hitbox_groups: bool,
     no_vfs: bool,
     vfs: Option<&'a VfsPath>,
 }
@@ -2254,6 +2277,8 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
         skel_ext_candidates_json,
         list_textures,
         bake_legacy_pbs,
+        emit_hardpoints,
+        collision_hitbox_groups,
         no_vfs,
         vfs,
     } = *params;
@@ -2279,6 +2304,8 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
         skel_ext_candidates_json,
         list_textures,
         bake_legacy_pbs,
+        emit_hardpoints,
+        collision_hitbox_groups,
         no_vfs,
         vfs,
         db.as_ref(),
@@ -2317,6 +2344,8 @@ fn export_one_model(
     skel_ext_candidates_json: Option<&Path>,
     list_textures: bool,
     bake_legacy_pbs: bool,
+    emit_hardpoints: bool,
+    collision_hitbox_groups: bool,
     no_vfs: bool,
     vfs: Option<&VfsPath>,
     db: Option<&wowsunpack::models::assets_bin::PrototypeDatabase<'_>>,
@@ -2441,6 +2470,8 @@ fn export_one_model(
             all_render_sets,
             lod_chain,
             &hitboxes,
+            emit_hardpoints,
+            collision_hitbox_groups,
             &mut tex_out,
             &mut out_file,
         )
@@ -2562,6 +2593,13 @@ struct BatchSharedOptions {
     /// flag). For batches consumed by stock glTF PBR renderers.
     #[serde(default)]
     bake_legacy_pbs: bool,
+    /// Emit named static node trees (see `export-model --emit-hardpoints`).
+    #[serde(default)]
+    emit_hardpoints: bool,
+    /// Synthesize Armor/Hitboxes groups from the `hit_locations` collision
+    /// model (see `export-model --collision-hitbox-groups`).
+    #[serde(default)]
+    collision_hitbox_groups: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -2595,6 +2633,8 @@ impl Default for BatchSharedOptions {
             lod: 0,
             textures_uri_prefix: None,
             bake_legacy_pbs: false,
+            emit_hardpoints: false,
+            collision_hitbox_groups: false,
         }
     }
 }
@@ -2644,6 +2684,8 @@ fn run_batch_export_model(manifest_path: &Path, keep_going: bool, vfs: &VfsPath)
             item.skel_ext_candidates_json.as_deref(),
             /* list_textures: */ false,
             shared.bake_legacy_pbs,
+            shared.emit_hardpoints,
+            shared.collision_hitbox_groups,
             /* no_vfs: */ false,
             Some(vfs),
             Some(&db),

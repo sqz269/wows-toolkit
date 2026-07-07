@@ -113,6 +113,15 @@ pub fn export_glb(
     // / AA / torpedo per-gun hit volumes). Emitted as a "Hitboxes" group, like
     // the hull export. Empty for the ~most accessories that ship no `.splash`.
     hitboxes: &[Hitbox],
+    // Emit the named static node tree even for visuals with no skinned mesh
+    // and no muzzle locator. Buildings (GameParams `Building` models) carry
+    // static gun hardpoints (`HP_GUN_1`, `HP_AIR_*`) that the default gates
+    // drop from the GLB; consumers need them as named nodes to mount guns.
+    emit_hardpoints: bool,
+    // Synthesize `Armor` + `Hitboxes` groups from the `.geometry`
+    // `hit_locations` collision model (shore structures ship no armor BVH and
+    // no `.splash`). See `collision_hit_locations_sub_models`.
+    collision_hitbox_groups: bool,
     tex_out: &mut TextureOutput,
     writer: &mut impl Write,
 ) -> Result<(), Report<ExportError>> {
@@ -267,14 +276,16 @@ pub fn export_glb(
             let value = mesh_node.value();
             root.nodes[value].skin = Some(skin);
         }
-    } else if visual.has_muzzle_locator(&db.strings) {
+    } else if visual.has_muzzle_locator(&db.strings) || emit_hardpoints {
         // Static weapon mounts (notably torpedo tubes) carry `HP_gunFire<N>`
         // launch locators in the visual but skin no mesh, so the branch above
         // skips them and the locators would be dropped from the GLB. Emit the
         // bone node tree anyway — there is no skin to attach — so consumers can
         // read the per-tube launch points (position + forward) exactly as they
         // read gun muzzles. Scoped to visuals that actually carry a muzzle
-        // locator, so every other static accessory still exports mesh-only.
+        // locator, so every other static accessory still exports mesh-only —
+        // unless `emit_hardpoints` forces it (buildings: static `HP_GUN_*` /
+        // `HP_AIR_*` mount nodes with no muzzle locator in the hull visual).
         let skin_tree = emit_bone_node_tree(&mut root, visual, db);
         armor_y180 = skin_tree.root_premul;
         for &root_node in &skin_tree.scene_roots {
@@ -311,6 +322,31 @@ pub fn export_glb(
                 ..Default::default()
             });
             armor_nodes.push(node);
+        }
+    }
+    // Buildings (opt-in): synthesize Armor content from the `hit_locations`
+    // collision model — shore structures ship no armor BVH; their hit
+    // partition lives in the collision payload (per-face `field_30` =
+    // GameParams `hull.armor` key). Hitbox meshes from the same source are
+    // collected here and emitted under the "Hitboxes" group below. See
+    // `collision_hit_locations_sub_models` for the frame + naming contract.
+    let mut collision_hitbox_subs: Vec<ArmorSubModel> = Vec::new();
+    if collision_hitbox_groups {
+        if let Some((armor_sub, hb_subs)) = collision_hit_locations_sub_models(geometry) {
+            let gltf_prim = add_armor_primitive_to_root(&mut root, &mut bin_data, &armor_sub)?;
+            let mesh = root.push(json::Mesh {
+                primitives: vec![gltf_prim],
+                weights: None,
+                name: Some(armor_sub.name.clone()),
+                extensions: Default::default(),
+                extras: Default::default(),
+            });
+            let node =
+                root.push(json::Node { mesh: Some(mesh), name: Some(armor_sub.name.clone()), ..Default::default() });
+            armor_nodes.push(node);
+            collision_hitbox_subs = hb_subs;
+        } else {
+            eprintln!("Warning: collision_hitbox_groups set but no usable hit_locations collision model");
         }
     }
     if !armor_nodes.is_empty() {
@@ -351,6 +387,23 @@ pub fn export_glb(
             matrix: None,
             ..Default::default()
         });
+        hitbox_nodes.push(node);
+    }
+    // Collision-derived hit volumes (buildings): one convex mesh per
+    // `hit_locations` collision object, named `CM_SB_Hull_<i>` so consumers
+    // route them exactly like ship splash boxes (single "Hull" section).
+    // Plain meshes — `add_armor_primitive_to_root` skips COLOR_0 /
+    // `_MATERIAL_ID` when the sub-model carries none.
+    for sub in &collision_hitbox_subs {
+        let gltf_prim = add_armor_primitive_to_root(&mut root, &mut bin_data, sub)?;
+        let mesh = root.push(json::Mesh {
+            primitives: vec![gltf_prim],
+            weights: None,
+            name: Some(sub.name.clone()),
+            extensions: Default::default(),
+            extras: Default::default(),
+        });
+        let node = root.push(json::Node { mesh: Some(mesh), name: Some(sub.name.clone()), ..Default::default() });
         hitbox_nodes.push(node);
     }
     if !hitbox_nodes.is_empty() {
@@ -5936,6 +5989,109 @@ impl ArmorSubModel {
 
         Self { name: armor.name.clone(), positions, normals, indices, colors, material_ids, transform: None }
     }
+}
+
+/// Build Armor/Hitboxes sub-models from the `.geometry` `hit_locations`
+/// collision model (shore structures — GameParams `Building` models).
+///
+/// Buildings ship NO armor BVH and no `.splash`; their hit partition is the
+/// `hit_locations` collision model: convex objects whose per-face `field_30`
+/// carries `(layer << 16) | material_id`, numerically matching the GameParams
+/// `hull.armor` keys (verified LYB011 ↔ PCBA001: 65613/65614/131149/131150/
+/// 196685/196686 → the building's per-material mm). Face loops are planar
+/// convex polygons, so fan triangulation is exact.
+///
+/// Returns `(armor, hitboxes)`:
+/// - `armor`: ONE merged `Armor_Hull` sub-model; per-vertex `_MATERIAL_ID` =
+///   `field_30 & 0xFFFF` — the id space a consumer's `armor.materials_table`
+///   must be keyed by (GameParams keys folded with the same mask).
+/// - `hitboxes`: one plain mesh per collision object (`CM_SB_Hull_<i>`), no
+///   colors / material ids — consumers wrap them as convex trigger volumes.
+///
+/// Both run the armor-BVH frame chain (Z-negate → flip winding → ×15 metres),
+/// landing in the render-mesh frame — including the shipped-inverted winding
+/// convention consumers already compensate on `Armor_*` / `CM_SB_*` meshes.
+pub fn collision_hit_locations_sub_models(
+    geometry: &crate::models::geometry::MergedGeometry,
+) -> Option<(ArmorSubModel, Vec<ArmorSubModel>)> {
+    use crate::models::geometry::parse_collision_model_data;
+
+    let cm = geometry.collision_models.iter().find(|m| m.name == "hit_locations")?;
+    let parsed = match parse_collision_model_data(cm.data) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Warning: hit_locations collision model failed to parse: {e}");
+            return None;
+        }
+    };
+
+    fn empty_sub(name: String) -> ArmorSubModel {
+        ArmorSubModel {
+            name,
+            positions: Vec::new(),
+            normals: Vec::new(),
+            indices: Vec::new(),
+            colors: Vec::new(),
+            material_ids: Vec::new(),
+            transform: None,
+        }
+    }
+    fn face_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
+        let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        if len > 1e-12 { [n[0] / len, n[1] / len, n[2] / len] } else { [0.0, 1.0, 0.0] }
+    }
+
+    let mut armor = empty_sub("Armor_Hull".to_string());
+    let mut hitboxes: Vec<ArmorSubModel> = Vec::with_capacity(parsed.objects.len());
+
+    for (oi, obj) in parsed.objects.iter().enumerate() {
+        let mut hb = empty_sub(format!("CM_SB_Hull_{oi}"));
+        for face in &obj.faces {
+            // Defensive: drop out-of-range loop indices rather than panic.
+            let verts: Vec<[f32; 3]> =
+                face.vertex_indices.iter().filter_map(|&i| obj.vertices.get(i as usize).copied()).collect();
+            if verts.len() < 3 {
+                continue;
+            }
+            let raw = face.field_30.unwrap_or(0);
+            let mat_id = raw & 0xFFFF;
+            let layer = (raw >> 16) & 0xFFFF;
+            // No armor map at export time (thickness lives in GameParams on
+            // the consumer side) → neutral COLOR_0, same as accessory armor.
+            let color = thickness_to_color(lookup_thickness(mat_id, layer, None, None));
+            // Face normal in native frame (faces are planar); Z-negated below
+            // alongside positions, exactly like `from_armor_model`.
+            let n = face_normal(verts[0], verts[1], verts[2]);
+            for t in 1..verts.len() - 1 {
+                for &v in &[verts[0], verts[t], verts[t + 1]] {
+                    armor.indices.push(armor.positions.len() as u32);
+                    armor.positions.push([v[0], v[1], -v[2]]);
+                    armor.normals.push([n[0], n[1], -n[2]]);
+                    armor.colors.push(color);
+                    armor.material_ids.push(mat_id as u16);
+                    hb.indices.push(hb.positions.len() as u32);
+                    hb.positions.push([v[0], v[1], -v[2]]);
+                    hb.normals.push([n[0], n[1], -n[2]]);
+                }
+            }
+        }
+        if !hb.positions.is_empty() {
+            flip_triangle_winding(&mut hb.indices);
+            scale_positions_to_metres(&mut hb.positions);
+            hitboxes.push(hb);
+        }
+    }
+
+    if armor.positions.is_empty() {
+        eprintln!("Warning: hit_locations collision model parsed but produced no triangles");
+        return None;
+    }
+    flip_triangle_winding(&mut armor.indices);
+    scale_positions_to_metres(&mut armor.positions);
+    Some((armor, hitboxes))
 }
 
 /// A hull visual mesh for interactive viewers (positions, normals, indices + render set name).

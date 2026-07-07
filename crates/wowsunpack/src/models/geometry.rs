@@ -183,6 +183,12 @@ pub struct CollisionFace {
     pub edge_pair_indices: Vec<u32>,
     /// Present for magic `0x24022012`; absent for `0x26092011`.
     /// Native post-load storage writes it near face-record offset `+0x30`.
+    ///
+    /// For `hit_locations` collision models this is the armor material key:
+    /// `(layer << 16) | material_id`, numerically matching the GameParams
+    /// `hull.armor` map keys of the owning `Building` entry (verified
+    /// LYB011 ↔ PCBA001: 65613/65614/131149/131150/196685/196686 → 5 mm).
+    /// The `default` (physical) collision model carries 0 here.
     pub field_30: Option<u32>,
 }
 

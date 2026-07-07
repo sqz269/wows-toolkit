@@ -77,6 +77,13 @@ const FEATURES: &[&str] = &[
     // Map-GLB instance-node extras carry the prototype VisualProto
     // camera-medium visibility flags (`underwater_model`/`abovewater_model`).
     "export_map.instance_water_flags",
+    // Static node tree (HP_* hardpoints) emitted for skin-less visuals on
+    // request — building gun mounts (`--emit-hardpoints`, batch `shared`).
+    "export_model.emit_hardpoints",
+    // Armor/Hitboxes GLB groups synthesized from the `hit_locations`
+    // collision model — shore-structure hit partition
+    // (`--collision-hitbox-groups`, batch `shared`).
+    "export_model.collision_hitbox_groups",
 ];
 
 /// Schema identifiers emitted in toolkit JSON outputs. Keyed by contract
@@ -162,7 +169,7 @@ mod tests {
     fn contract_count_matches_spec() {
         let caps = build();
         assert_eq!(caps.contracts.len(), 11);
-        assert_eq!(caps.features.len(), 15);
+        assert_eq!(caps.features.len(), 17);
         assert_eq!(caps.schemas.len(), 7);
     }
 
