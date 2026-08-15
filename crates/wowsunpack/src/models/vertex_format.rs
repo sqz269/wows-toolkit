@@ -229,11 +229,19 @@ pub fn parse_vertex_format(format_name: &str) -> VertexFormat {
 
 /// Unpack a 4-byte packed normal into `[f32; 3]`.
 ///
-/// The packed format is 4 signed bytes: `[x, y, z, w]` where each component
-/// is mapped from `[-127, 127]` to `[-1.0, 1.0]`.
+/// The packed format is 4 *biased unsigned* bytes `[x, y, z, w]`: each
+/// component decodes as `(byte - 128) / 127`, mapping `1..=255` to
+/// `[-1.0, 1.0]` with `128` = 0. Not two's-complement signed bytes — that
+/// reading shifts every component by ±128/127 and yields non-unit vectors
+/// pointing essentially at random (50% outwardness on closed hulls vs
+/// >95% axis correlation with winding-derived normals for this decode).
 pub fn unpack_normal(packed: u32) -> [f32; 3] {
     let bytes = packed.to_le_bytes();
-    [(bytes[0] as i8) as f32 / 127.0, (bytes[1] as i8) as f32 / 127.0, (bytes[2] as i8) as f32 / 127.0]
+    [
+        ((bytes[0] as f32 - 128.0) / 127.0).max(-1.0),
+        ((bytes[1] as f32 - 128.0) / 127.0).max(-1.0),
+        ((bytes[2] as f32 - 128.0) / 127.0).max(-1.0),
+    ]
 }
 
 /// Unpack a 4-byte packed UV into `[f32; 2]`.
@@ -319,11 +327,17 @@ mod tests {
 
     #[test]
     fn test_unpack_normal() {
-        // All-positive unit vector approximation
-        let packed = u32::from_le_bytes([127, 0, 0, 0]);
+        // +X unit vector: byte 255 = +1.0, byte 128 = 0.0
+        let packed = u32::from_le_bytes([255, 128, 128, 0]);
         let n = unpack_normal(packed);
         assert!((n[0] - 1.0).abs() < 0.01);
         assert!(n[1].abs() < 0.01);
+        assert!(n[2].abs() < 0.01);
+        // -Y unit vector: byte 1 = -1.0 (byte 0 clamps to -1.0 too)
+        let packed = u32::from_le_bytes([128, 1, 128, 0]);
+        let n = unpack_normal(packed);
+        assert!(n[0].abs() < 0.01);
+        assert!((n[1] + 1.0).abs() < 0.01);
         assert!(n[2].abs() < 0.01);
     }
 }
