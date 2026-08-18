@@ -148,7 +148,7 @@ pub fn export_glb(
         // Bundle every render set as its own named mesh (all LODs + both damage
         // states). See `collect_all_render_set_primitives` for the full rationale.
         let named_primitives =
-            collect_all_render_set_primitives(visual, geometry, Some(db), Some(&self_id_index), None)?;
+            collect_all_render_set_primitives(visual, geometry, Some(db), Some(&self_id_index), None, false)?;
 
         if named_primitives.is_empty() {
             eprintln!("Warning: no render sets found in visual");
@@ -196,6 +196,7 @@ pub fn export_glb(
                 None,
                 None,
                 true,
+                false,
             )?;
 
             if primitives.is_empty() {
@@ -1053,6 +1054,7 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
             false,
             None,
             static_nodes,
+            false,
             false,
         ) {
             Ok(p) => p,
@@ -3243,6 +3245,7 @@ pub fn export_merged_models_glb(
             None,
             static_nodes,
             false,
+            false,
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -3606,6 +3609,7 @@ fn collect_all_render_set_primitives(
     db: Option<&PrototypeDatabase<'_>>,
     self_id_index: Option<&HashMap<u64, usize>>,
     barrel_pitch: Option<&BarrelPitch>,
+    bake_rest_skin: bool,
 ) -> Result<Vec<(String, DecodedPrimitive)>, Report<ExportError>> {
     let mut result = Vec::new();
 
@@ -3620,7 +3624,7 @@ fn collect_all_render_set_primitives(
             continue;
         }
 
-        match decode_render_set_primitive(visual, geometry, db, self_id_index, rs, barrel_pitch) {
+        match decode_render_set_primitive(visual, geometry, db, self_id_index, rs, barrel_pitch, bake_rest_skin) {
             Ok(Some(prim)) => result.push((rs_name, prim)),
             Ok(None) => {}
             Err(e) => return Err(e),
@@ -3643,6 +3647,16 @@ fn decode_render_set_primitive(
     self_id_index: Option<&HashMap<u64, usize>>,
     rs: &crate::models::visual::RenderSet,
     barrel_pitch: Option<&BarrelPitch>,
+    // Bake the Z-mirror rest frame of `*_BlendBone`-skinned render sets
+    // into vertex positions/normals and emit the mesh STATIC (no skin
+    // attributes). Ship-hull exports want this: hull sub-models place at
+    // identity, no consumer skins them, and a skinned part authored in
+    // the mirrored bind frame (animated themed hulls — leviathan faces,
+    // flippers) otherwise renders Z-mirrored (bow swapped onto the
+    // stern; Montana HW19). Mount/model exports keep this `false` — they
+    // emit a real glTF Skin and their placement conjugation handles the
+    // mirror (schema_v6).
+    bake_rest_skin: bool,
 ) -> Result<Option<DecodedPrimitive>, Report<ExportError>> {
     let vertices_mapping_id = rs.vertices_mapping_id;
     let indices_mapping_id = rs.indices_mapping_id;
@@ -3747,6 +3761,28 @@ fn decode_render_set_primitive(
     if let Some(bp) = barrel_pitch {
         apply_barrel_pitch(&mut verts.positions, &mut verts.normals, vert_slice, stride, &format, bp);
     }
+    // Rest-frame bake for Z-mirror skinned render sets (see the
+    // `bake_rest_skin` parameter doc). The mirrored bind frame is the
+    // shared `*_BlendBone` local (det<0, zero translation); conjugate it
+    // into the glTF frame the same way node transforms are and push it
+    // through the vertices. Winding: these sets already skip
+    // `flip_triangle_winding` above, and the baked mirror inverts the
+    // triangle orientation in the data — net result matches the standard
+    // flipped static path, so the existing gate stays correct.
+    let mut skin_mirror_baked = false;
+    if bake_rest_skin && rs.skinned && zmirror_skin {
+        if let Some(mirror) = db.and_then(|db| visual.find_root_blendbone_local_matrix(&db.strings)) {
+            let gltf_mirror = negate_z_transform(mirror);
+            transform_positions_normals(&mut verts.positions, &mut verts.normals, &gltf_mirror);
+            // A det<0 bake inverts triangle orientation IN THE DATA
+            // (cross(Mb-Ma, Mc-Ma) = det(M)*M*cross(b-a, c-a)); with no
+            // runtime mirror left to flip the apparent front face, the
+            // winding must be flipped here to stay consistent with the
+            // (correctly) mirrored normals.
+            flip_triangle_winding(&mut indices);
+            skin_mirror_baked = true;
+        }
+    }
     // Scale AFTER barrel pitch: the pitch matrix's translation is a
     // native-space pivot and must see native positions to rotate about
     // the right point. Once rotated, a uniform 15× lift into metres is
@@ -3780,9 +3816,11 @@ fn decode_render_set_primitive(
     // When `barrel_pitch` is set the export bakes the rotation into the
     // vertex positions above — emitting skin alongside that would let a
     // skinning consumer rotate the barrels a second time, so we drop the
-    // skin attributes whenever a pitch was baked.
+    // skin attributes whenever a pitch was baked. Same rule for the
+    // rest-frame mirror bake: baked positions + skin attributes would
+    // double-apply the mirror on a skinning consumer.
     let baked_barrel_pitch = barrel_pitch.is_some();
-    let (bones, weights, bone_palette) = if rs.skinned && !baked_barrel_pitch {
+    let (bones, weights, bone_palette) = if rs.skinned && !baked_barrel_pitch && !skin_mirror_baked {
         (verts.bones, verts.weights, Some(rs.node_name_ids.clone()))
     } else {
         (None, None, None)
@@ -3826,6 +3864,10 @@ fn collect_primitives(
     // map geometry (LNR landmass proxies blow up from ~558m to ~8500m
     // world-space).
     apply_metric_scale: bool,
+    // Bake the Z-mirror rest frame of skinned render sets into vertices
+    // and emit them static — ship-hull exports only. See
+    // `decode_render_set_primitive`'s parameter doc.
+    bake_rest_skin: bool,
 ) -> Result<Vec<DecodedPrimitive>, Report<ExportError>> {
     let mut result = Vec::new();
     let exclude = if damaged { DAMAGED_EXCLUDE } else { INTACT_EXCLUDE };
@@ -3974,6 +4016,24 @@ fn collect_primitives(
         if let Some(bp) = barrel_pitch {
             apply_barrel_pitch(&mut verts.positions, &mut verts.normals, vert_slice, stride, &format, bp);
         }
+        // Rest-frame bake for Z-mirror skinned render sets (ship-hull
+        // path only) — see `decode_render_set_primitive` for the full
+        // rationale. Winding stays source (gate above), matching the
+        // baked mirror's orientation inversion.
+        let mut skin_mirror_baked = false;
+        if bake_rest_skin && rs.skinned && zmirror_skin {
+            if let Some(mirror) = db.and_then(|db| visual.find_root_blendbone_local_matrix(&db.strings)) {
+                let gltf_mirror = negate_z_transform(mirror);
+                transform_positions_normals(&mut verts.positions, &mut verts.normals, &gltf_mirror);
+                // A det<0 bake inverts triangle orientation IN THE DATA
+                // (cross(Mb-Ma, Mc-Ma) = det(M)*M*cross(b-a, c-a)); with no
+                // runtime mirror left to flip the apparent front face, the
+                // winding must be flipped here to stay consistent with the
+                // (correctly) mirrored normals.
+                flip_triangle_winding(&mut indices);
+                skin_mirror_baked = true;
+            }
+        }
         if let Some(node_matrix) = static_render_set_world_matrix(static_nodes, rs) {
             // Map-local static prototypes can bind each unskinned render set
             // to a shared skeleton node. The instance matrix places the
@@ -4014,9 +4074,10 @@ fn collect_primitives(
         // The LOD-filtered path bakes barrel pitch into vertex positions
         // before this point (see `apply_barrel_pitch` above). Treat the
         // mesh as static — emitting skin data alongside baked positions
-        // would double-rotate the barrels on the consumer side.
+        // would double-rotate the barrels on the consumer side. Same for
+        // the rest-frame mirror bake.
         let baked_barrel_pitch = barrel_pitch.is_some();
-        let (bones, weights, bone_palette) = if rs.skinned && !baked_barrel_pitch {
+        let (bones, weights, bone_palette) = if rs.skinned && !baked_barrel_pitch && !skin_mirror_baked {
             (verts.bones, verts.weights, Some(rs.node_name_ids.clone()))
         } else {
             (None, None, None)
@@ -6164,6 +6225,13 @@ pub fn collect_hull_meshes(
 
     let self_id_index = db.build_self_id_index();
 
+    // Same Z-mirror-skin det gate as the GLB decoders: skinned hull parts
+    // of animated themed hulls are authored in the mirrored `*_BlendBone`
+    // bind frame and must be rest-frame baked here too (this path never
+    // emits skins).
+    let zmirror_skin =
+        visual.find_any_blendbone_local_matrix(&db.strings).is_some_and(|m| mat3_det(&m) < 0.0);
+
     for &rs_name_id in &lod_entry.render_set_names {
         let rs = visual
             .render_sets
@@ -6256,13 +6324,28 @@ pub fn collect_hull_meshes(
                 return Err(Report::new(ExportError::IndexDecode(format!("unsupported index size: {index_size}"))));
             }
         };
-        flip_triangle_winding(&mut indices);
+        // Z-mirror skinned sets keep source winding — the rest-frame bake
+        // below inverts triangle orientation in the data (same gate as the
+        // GLB decoders).
+        if !(zmirror_skin && rs.skinned) {
+            flip_triangle_winding(&mut indices);
+        }
 
         let mut verts = unpack_vertices(vert_slice, stride, &format);
 
         // Apply per-vertex barrel pitch rotation if configured.
         if let Some(bp) = barrel_pitch {
             apply_barrel_pitch(&mut verts.positions, &mut verts.normals, vert_slice, stride, &format, bp);
+        }
+        // Rest-frame bake for Z-mirror skinned hull parts (see gate above).
+        if zmirror_skin && rs.skinned {
+            if let Some(mirror) = visual.find_root_blendbone_local_matrix(&db.strings) {
+                let gltf_mirror = negate_z_transform(mirror);
+                transform_positions_normals(&mut verts.positions, &mut verts.normals, &gltf_mirror);
+                // Baked det<0 mirror inverts triangle orientation in the
+                // data — flip winding to match (see the GLB decoders).
+                flip_triangle_winding(&mut indices);
+            }
         }
         scale_positions_to_metres(&mut verts.positions);
 
@@ -7161,6 +7244,7 @@ pub fn export_ship_glb(
                 Some(db),
                 Some(&self_id_index),
                 sub.barrel_pitch.as_ref(),
+                true, // ship export: bake Z-mirror skinned hull parts static
             )?;
 
             if named_primitives.is_empty() {
@@ -7214,6 +7298,7 @@ pub fn export_ship_glb(
             sub.barrel_pitch.as_ref(),
             None,
             true, // ship export: apply NATIVE_TO_METRES to vertex positions
+            true, // ship export: bake Z-mirror skinned hull parts static
         )?;
 
         if primitives.is_empty() {

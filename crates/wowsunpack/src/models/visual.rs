@@ -439,6 +439,53 @@ impl VisualPrototype {
         None
     }
 
+    /// Local matrix of the ROOT `*_BlendBone` — the topmost BlendBone in
+    /// the skeleton (no BlendBone ancestor). This is the SHARED bind
+    /// frame of the whole skin: for Z-mirror-authored skins it is the
+    /// pure mirror (`diag(1,1,-1)`, zero translation) that maps stored
+    /// vertices into model space at rest.
+    /// `find_any_blendbone_local_matrix` is only safe for the det SIGN
+    /// (uniform across the set) — child BlendBones (articulated
+    /// sub-bones: animated-hull faces, flippers) carry their own rest
+    /// offsets and must NOT be used as a rest-bake frame.
+    pub fn find_root_blendbone_local_matrix(&self, strings: &StringsSection<'_>) -> Option<[f32; 16]> {
+        let count = self.nodes.matrices.len();
+        let mut is_blendbone = vec![false; count];
+        for (i, &name_id) in self.nodes.name_map_name_ids.iter().enumerate() {
+            if let Some(resolved) = strings.get_string_by_id(name_id)
+                && resolved.contains("BlendBone")
+            {
+                let node_idx = self.nodes.name_map_node_ids[i] as usize;
+                if node_idx < count {
+                    is_blendbone[node_idx] = true;
+                }
+            }
+        }
+        for node_idx in 0..count {
+            if !is_blendbone[node_idx] {
+                continue;
+            }
+            // Reject if any ancestor is itself a BlendBone.
+            let mut cur = node_idx;
+            let mut root = true;
+            for _ in 0..count {
+                let parent = match self.nodes.parent_ids.get(cur) {
+                    Some(&p) if p != 0xFFFF && (p as usize) < count => p as usize,
+                    _ => break,
+                };
+                if is_blendbone[parent] {
+                    root = false;
+                    break;
+                }
+                cur = parent;
+            }
+            if root {
+                return Some(self.nodes.matrices[node_idx].0);
+            }
+        }
+        None
+    }
+
     /// Check whether `node_idx` is a descendant of `ancestor_idx` in the
     /// skeleton hierarchy.
     pub fn is_descendant_of(&self, mut node_idx: u16, ancestor_idx: u16) -> bool {
