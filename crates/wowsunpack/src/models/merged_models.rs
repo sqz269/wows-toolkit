@@ -351,9 +351,11 @@ fn parse_visual_proto_inline_fields(input: &mut &[u8]) -> WResult<VisualProtoInl
 // across every space present in both builds): the stableGuid descriptor is
 // gone, the remaining V1 fields move up 0x10, and five new
 // (u64 count, i64 relptr) array descriptors follow. Their relptrs resolve
-// from the descriptor's own address. They carry per-instance child objects
-// (records with their own matrices and `content/...` paths) and are not
-// decoded yet.
+// from the descriptor's own address. They are the instance's decor
+// components, which V1 clients loaded from a separate per-space
+// `decor.bin` keyed by stableGuid (removed in 13357625), in the same
+// order: animations (.seq/.fbx), effects (particles), linkedProbes
+// (always empty), sounds, waterPhysics. Not decoded yet.
 //   +0x00  16× f32   transform
 //   +0x40  u64       resourceId
 //   +0x48  u8 ×4     isLandscape, modelDyesCount, materialInstanceCount,
@@ -361,7 +363,7 @@ fn parse_visual_proto_inline_fields(input: &mut &[u8]) -> WResult<VisualProtoInl
 //   +0x4c  4 bytes   pad
 //   +0x50  i64       modelDyes relptr          (record-relative, as V1)
 //   +0x58  i64       materialInstances relptr  (record-relative, as V1)
-//   +0x60  5 × {u64 count, i64 relptr}         (undecoded child arrays)
+//   +0x60  5 × {u64 count, i64 relptr}         (decor components, undecoded)
 
 /// Parse a single ModelInstance record into a fully-resolved
 /// `SpaceInstance`. The modelDyes / materialInstances relptrs resolve
@@ -531,7 +533,8 @@ const SPACE_USER_OBJECT_SIZE: usize = 0x70;
 /// - `V1`: clients up to build 13187581. ModelInstance 0x70, particle 0x68,
 ///   point light 0xc0, user object descriptors (guid, type, properties).
 /// - `V2`: client build 13357625 onward. The GUID fields were dropped:
-///   ModelInstance 0xb0 (no stableGuid, five new child-array descriptors),
+///   ModelInstance 0xb0 (no stableGuid; five decor-component arrays that
+///   replace the removed `decor.bin`),
 ///   particle 0x58 (no 16-byte GUID blob), point light 0xb0 (16 bytes
 ///   before colorAnimation removed), user object descriptors reordered to
 ///   (type, properties, guid). Obstacles, probes and static decals are
