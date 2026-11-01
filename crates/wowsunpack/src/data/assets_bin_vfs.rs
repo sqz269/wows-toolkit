@@ -386,6 +386,7 @@ fn decoded_hash(proto_type: PrototypeType, record_data: &[u8]) -> Option<u64> {
             Some(fnv1a64(&[&serde_json::to_vec(&m).ok()?]))
         }
         PrototypeType::SkeletonExtender => skeleton_extender_hash(record_data),
+        PrototypeType::AtlasContour => atlas_contour_hash(record_data),
         _ => None,
     }
 }
@@ -458,6 +459,46 @@ fn skeleton_extender_hash(buf: &[u8]) -> Option<u64> {
     let matrices_end = p2.checked_add(count * 64)?.min(buf.len());
     let matrices = buf.get(p2..matrices_end)?;
     Some(fnv1a64(&[&kind.to_le_bytes(), &(count as u16).to_le_bytes(), ids, parents, matrices]))
+}
+
+/// AtlasContour record (0x10 bytes): `u64 frame_count` and an offset (from
+/// the record) to `frame_count` frames. Each frame (0x10 bytes) is
+/// `u64 point_count` and an offset (from the frame) to that many `(f32, f32)`
+/// contour points. Only the counts and points are hashed: the offsets move
+/// whenever an earlier record grows, and are the same in every record with
+/// the same frame layout.
+fn atlas_contour_hash(buf: &[u8]) -> Option<u64> {
+    const FRAME_SIZE: usize = 0x10;
+    const POINT_SIZE: usize = 8;
+    const MAX_FRAMES: usize = 1 << 16;
+    const MAX_POINTS: usize = 1 << 16;
+    let u64_at = |o: usize| buf.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+    let target = |base: usize| -> Option<usize> {
+        let rel = i64::from_le_bytes(buf.get(base + 8..base + 16)?.try_into().ok()?);
+        usize::try_from(i64::try_from(base).ok()?.checked_add(rel)?).ok()
+    };
+    let frames = usize::try_from(u64_at(0)?).ok()?;
+    if frames > MAX_FRAMES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(8 + frames * (8 + 8 * POINT_SIZE));
+    bytes.extend_from_slice(&(frames as u64).to_le_bytes());
+    if frames > 0 {
+        let frames_at = target(0)?;
+        for i in 0..frames {
+            let frame = frames_at.checked_add(i * FRAME_SIZE)?;
+            let points = usize::try_from(u64_at(frame)?).ok()?;
+            if points > MAX_POINTS {
+                return None;
+            }
+            bytes.extend_from_slice(&(points as u64).to_le_bytes());
+            if points > 0 {
+                let at = target(frame)?;
+                bytes.extend_from_slice(buf.get(at..at.checked_add(points * POINT_SIZE)?)?);
+            }
+        }
+    }
+    Some(fnv1a64(&[&bytes]))
 }
 
 fn lookup_key(path: &str) -> &str {

@@ -91,7 +91,7 @@ const FEATURES: &[&str] = &[
     // assets.bin entries, plus `source` / `prototype_type` fields.
     "metadata.content_hashes",
     // `game-params --entity-hashes <file>`: one build-stable hash per
-    // top-level entity (`wowsunpack.gameparams_hashes/v1`).
+    // top-level entity (`wowsunpack.gameparams_hashes/v2`).
     "game_params.entity_hashes",
 ];
 
@@ -107,7 +107,11 @@ const SCHEMAS: &[(&str, &str)] = &[
     // Byte-matches the `schema` field the subcommand emits (dot form).
     ("export_decals", "wows.map.decal_textures.v1"),
     ("deps_out", "wowsunpack.deps/v1"),
-    ("game_params.entity_hashes", "wowsunpack.gameparams_hashes/v1"),
+    ("game_params.entity_hashes", "wowsunpack.gameparams_hashes/v2"),
+    // Version of the per-record hashes `metadata --content-hashes` reports.
+    // v2: atlas_contour records hash their frame point lists, not the fixed
+    // bytes (whose offsets move whenever an earlier record grows).
+    ("metadata.content_hashes", "wowsunpack.content_hashes/v2"),
 ];
 
 #[derive(Debug, Serialize)]
@@ -181,7 +185,7 @@ mod tests {
         let caps = build();
         assert_eq!(caps.contracts.len(), 11);
         assert_eq!(caps.features.len(), 20);
-        assert_eq!(caps.schemas.len(), 9);
+        assert_eq!(caps.schemas.len(), 10);
     }
 
     #[test]

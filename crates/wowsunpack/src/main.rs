@@ -160,7 +160,9 @@ enum Commands {
         id: String,
 
         /// Instead of dumping JSON, write one build-stable content hash per
-        /// top-level entity to this file (`wowsunpack.gameparams_hashes/v1`).
+        /// top-level entity to this file (`wowsunpack.gameparams_hashes/v2`).
+        /// Fields holding a default value (false, 0, empty) are left out of
+        /// the hash, so a field WG adds to every entity doesn't change them.
         /// Two builds' hash files show which entities changed without
         /// writing or parsing the multi-GB full dump.
         #[clap(long)]
@@ -4884,11 +4886,42 @@ struct GameParamsHashes {
     entities: BTreeMap<String, String>,
 }
 
+/// Drop dict entries whose value is "unset": null, false, 0, "", [], or a
+/// dict that is empty once pruned. List elements are kept (position
+/// matters), but dicts inside them are pruned too.
+///
+/// Updates routinely add a field to every entity of a type with a default
+/// value (build 13357625 added `isKillTagEnabled: false` to all 1260
+/// Exteriors). Without pruning, each such addition changes every entity's
+/// hash and hides the handful of real edits.
+fn prune_unset(value: &mut serde_json::Value) -> bool {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            map.retain(|_, v| !prune_unset(v));
+            map.is_empty()
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                prune_unset(item);
+            }
+            items.is_empty()
+        }
+        Value::Null => true,
+        Value::Bool(b) => !*b,
+        Value::Number(n) => n.as_f64() == Some(0.0),
+        Value::String(s) => s.is_empty(),
+    }
+}
+
 /// Hash every top-level GameParams entity (see `game-params --entity-hashes`).
 ///
 /// The root is `{realm: {entity_id: entity}}`. Entities in the default realm
-/// (`""`) are keyed by id; any other realm prefixes `<realm>:`. Dicts are
-/// ordered maps, so the JSON form, and the hash, is the same every run.
+/// (`""`) are keyed by id; any other realm prefixes `<realm>:`. Each entity
+/// is converted to JSON, pruned of unset fields (see [`prune_unset`]), and
+/// hashed with FNV-1a 64. JSON objects have sorted keys, so the hash is the
+/// same every run. Adding or removing a field that holds a default value
+/// doesn't change the hash; any other edit does.
 fn write_gameparams_entity_hashes(
     pickle: &pickled::Value,
     out: &Path,
@@ -4915,8 +4948,10 @@ fn write_gameparams_entity_hashes(
             };
             let id = id.inner().to_string();
             let name = if realm.is_empty() { id } else { format!("{realm}:{id}") };
+            let mut json = serde_json::to_value(entity)?;
+            prune_unset(&mut json);
             bytes.clear();
-            serde_json::to_writer(&mut bytes, entity)?;
+            serde_json::to_writer(&mut bytes, &json)?;
             let mut h: u64 = 0xcbf2_9ce4_8422_2325;
             for &b in &bytes {
                 h ^= b as u64;
@@ -4927,7 +4962,7 @@ fn write_gameparams_entity_hashes(
     }
     let count = hashed.len();
     let doc = GameParamsHashes {
-        schema: "wowsunpack.gameparams_hashes/v1",
+        schema: "wowsunpack.gameparams_hashes/v2",
         build: game_version,
         entities: hashed,
     };
