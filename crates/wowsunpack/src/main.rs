@@ -159,6 +159,13 @@ enum Commands {
         #[clap(long, default_value = "")]
         id: String,
 
+        /// Instead of dumping JSON, write one build-stable content hash per
+        /// top-level entity to this file (`wowsunpack.gameparams_hashes/v1`).
+        /// Two builds' hash files show which entities changed without
+        /// writing or parsing the multi-GB full dump.
+        #[clap(long)]
+        entity_hashes: Option<PathBuf>,
+
         #[clap(default_value = "GameParams.json")]
         out_file: PathBuf,
     },
@@ -1271,12 +1278,18 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
                 }
             };
         }
-        Commands::GameParams { out_file, ugly, id, print_ids: ids, full } => {
+        Commands::GameParams { out_file, ugly, id, print_ids: ids, full, entity_hashes } => {
             let Some(vfs) = &vfs else {
                 bail!("Package file loader is unavailable. Check that the pkg_dir exists.");
             };
 
             let pickle = load_game_params(vfs)?;
+
+            if let Some(hashes_out) = entity_hashes {
+                let count = write_gameparams_entity_hashes(&pickle, &hashes_out, game_version)?;
+                println!("GameParams entity hashes ({count}) written to {hashes_out:?}");
+                return Ok(());
+            }
 
             fn print_ids(params_dict: &BTreeMap<pickled::HashableValue, pickled::Value>) {
                 for key in params_dict.keys() {
@@ -4862,6 +4875,70 @@ fn emit_ammo_json(
 static DEPS_PROTOTYPE_PATHS: std::sync::OnceLock<HashMap<(usize, usize), Vec<String>>> = std::sync::OnceLock::new();
 /// Build number the command ran against, for `--deps-out`.
 static DEPS_GAME_VERSION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+#[derive(Serialize)]
+struct GameParamsHashes {
+    schema: &'static str,
+    build: Option<u64>,
+    /// Top-level entity id -> 16-hex-digit hash of its JSON form.
+    entities: BTreeMap<String, String>,
+}
+
+/// Hash every top-level GameParams entity (see `game-params --entity-hashes`).
+///
+/// The root is `{realm: {entity_id: entity}}`. Entities in the default realm
+/// (`""`) are keyed by id; any other realm prefixes `<realm>:`. Dicts are
+/// ordered maps, so the JSON form, and the hash, is the same every run.
+fn write_gameparams_entity_hashes(
+    pickle: &pickled::Value,
+    out: &Path,
+    game_version: Option<u64>,
+) -> Result<usize, Report> {
+    let pickled::Value::Dict(root) = pickle else {
+        bail!("Unexpected GameParams root element type");
+    };
+    let root = root.inner();
+    // `pickled::Value` isn't `Sync`, so this runs on one thread (~seconds).
+    let mut hashed: BTreeMap<String, String> = BTreeMap::new();
+    let mut bytes = Vec::new();
+    for (realm, value) in root.iter() {
+        let realm = match realm {
+            HashableValue::String(s) => s.inner().to_string(),
+            other => format!("{other:?}"),
+        };
+        let pickled::Value::Dict(inner) = value else {
+            continue;
+        };
+        for (key, entity) in inner.inner().iter() {
+            let HashableValue::String(id) = key else {
+                continue;
+            };
+            let id = id.inner().to_string();
+            let name = if realm.is_empty() { id } else { format!("{realm}:{id}") };
+            bytes.clear();
+            serde_json::to_writer(&mut bytes, entity)?;
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for &b in &bytes {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            hashed.insert(name, format!("{h:016x}"));
+        }
+    }
+    let count = hashed.len();
+    let doc = GameParamsHashes {
+        schema: "wowsunpack.gameparams_hashes/v1",
+        build: game_version,
+        entities: hashed,
+    };
+    if let Some(parent) = out.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    serde_json::to_writer(BufWriter::new(File::create(out)?), &doc)?;
+    Ok(count)
+}
 
 /// Content hashes for every assets.bin record, keyed by VFS path.
 fn compute_record_hashes(assets_vfs: &AssetsBinVfs) -> HashMap<String, (RecordHash, PrototypeType)> {

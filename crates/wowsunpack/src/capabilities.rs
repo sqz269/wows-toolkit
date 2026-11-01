@@ -90,6 +90,9 @@ const FEATURES: &[&str] = &[
     // `metadata --content-hashes`: per-record build-stable hashes for
     // assets.bin entries, plus `source` / `prototype_type` fields.
     "metadata.content_hashes",
+    // `game-params --entity-hashes <file>`: one build-stable hash per
+    // top-level entity (`wowsunpack.gameparams_hashes/v1`).
+    "game_params.entity_hashes",
 ];
 
 /// Schema identifiers emitted in toolkit JSON outputs. Keyed by contract
@@ -104,6 +107,7 @@ const SCHEMAS: &[(&str, &str)] = &[
     // Byte-matches the `schema` field the subcommand emits (dot form).
     ("export_decals", "wows.map.decal_textures.v1"),
     ("deps_out", "wowsunpack.deps/v1"),
+    ("game_params.entity_hashes", "wowsunpack.gameparams_hashes/v1"),
 ];
 
 #[derive(Debug, Serialize)]
@@ -176,8 +180,8 @@ mod tests {
     fn contract_count_matches_spec() {
         let caps = build();
         assert_eq!(caps.contracts.len(), 11);
-        assert_eq!(caps.features.len(), 19);
-        assert_eq!(caps.schemas.len(), 8);
+        assert_eq!(caps.features.len(), 20);
+        assert_eq!(caps.schemas.len(), 9);
     }
 
     #[test]
