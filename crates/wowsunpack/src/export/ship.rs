@@ -880,8 +880,20 @@ impl ShipAssets {
     /// Load a complete ship model, ready for export.
     pub fn load_ship(&self, name: &str, options: &ShipExportOptions) -> Result<ShipModelContext, Report> {
         let info = self.find_ship(name)?;
-        let vehicle = self.find_vehicle(&info.model_dir).ok();
+        // A name that resolved to a specific param (index or display name)
+        // keeps that param's vehicle; only a bare model directory falls back
+        // to the model-dir first match.
+        let vehicle =
+            self.vehicle_for_param_index(&info.param_index).or_else(|| self.find_vehicle(&info.model_dir).ok());
         self.load_ship_inner(info, vehicle, options)
+    }
+
+    /// The Vehicle of the param with this short index (e.g. "PASC108").
+    fn vehicle_for_param_index(&self, param_index: &str) -> Option<&Vehicle> {
+        if param_index.is_empty() {
+            return None;
+        }
+        self.metadata.params().iter().find(|p| p.index() == param_index).and_then(|p| p.vehicle())
     }
 
     /// Load a ship by an EXPLICIT GameParams vehicle id (param name like
@@ -926,11 +938,18 @@ impl ShipAssets {
         let dir = model_path.rsplit_once('/').map(|(d, _)| d).unwrap_or(model_path);
         let model_dir = dir.rsplit('/').next().unwrap_or(dir);
 
-        let param = self
-            .metadata
-            .params()
-            .iter()
-            .find(|p| p.vehicle().and_then(|v| v.model_path()).map(|mp| mp.contains(model_dir)).unwrap_or(false));
+        // Identity (display name, index, tier) comes from the param that OWNS
+        // this vehicle. Several params can share one model directory
+        // (Baltimore's PASC108 and the legacy PASC017 "Baltimore (old)");
+        // a model-dir first match would label the export as the other ship,
+        // and instance ids are built from the display name. The model-dir
+        // match stays as the fallback for a Vehicle not held by any param.
+        let params = self.metadata.params();
+        let param = params.iter().find(|p| p.vehicle().is_some_and(|v| std::ptr::eq(v, vehicle))).or_else(|| {
+            params
+                .iter()
+                .find(|p| p.vehicle().and_then(|v| v.model_path()).map(|mp| mp.contains(model_dir)).unwrap_or(false))
+        });
 
         let (nation, species, tier) = ship_identity_from_param(param.map(|p| p.as_ref()));
         let info = ShipInfo {
@@ -977,10 +996,16 @@ impl ShipAssets {
         let turret_models = loaded.turret_models;
         let mounts = loaded.mounts;
 
-        // Resolve material-based camouflage schemes (ship-specific + universal).
-        let ship_index = self.find_ship_index(&info.model_dir);
+        // Resolve material-based camouflage schemes (ship-specific + universal)
+        // for the ship being exported: its own param index and permoflages,
+        // not whichever param first matches the shared model directory.
+        let ship_index = if info.param_index.is_empty() {
+            self.find_ship_index(&info.model_dir)
+        } else {
+            Some(info.param_index.clone())
+        };
         let ship_idx = ship_index.as_deref();
-        let mut mat_camo_schemes = self.discover_mat_camo_schemes(&info.model_dir, ship_idx);
+        let mut mat_camo_schemes = self.discover_mat_camo_schemes_for(&info.model_dir, vehicle, ship_idx);
         mat_camo_schemes.extend(self.discover_universal_camo_schemes(ship_idx));
 
         // Extract armor thickness map and hit locations from GameParams.
@@ -1009,11 +1034,22 @@ impl ShipAssets {
     /// Follows: Vehicle.permoflages → Exterior.camouflage → camouflages.xml entry.
     /// Returns owned `MatCamoScheme` data (no lifetimes).
     fn discover_mat_camo_schemes(&self, model_dir: &str, ship_index: Option<&str>) -> Vec<MatCamoScheme> {
+        self.discover_mat_camo_schemes_for(model_dir, None, ship_index)
+    }
+
+    /// [`Self::discover_mat_camo_schemes`] for a known vehicle; `None` finds
+    /// it by model directory.
+    fn discover_mat_camo_schemes_for(
+        &self,
+        model_dir: &str,
+        vehicle: Option<&Vehicle>,
+        ship_index: Option<&str>,
+    ) -> Vec<MatCamoScheme> {
         let camo_db = match &self.camo_db {
             Some(db) => db,
             None => return Vec::new(),
         };
-        let vehicle = match self.find_vehicle(model_dir) {
+        let vehicle = match vehicle.map(Ok).unwrap_or_else(|| self.find_vehicle(model_dir)) {
             Ok(v) => v,
             Err(_) => return Vec::new(),
         };
