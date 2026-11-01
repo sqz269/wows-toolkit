@@ -167,6 +167,25 @@ pub struct SpaceInstance {
     pub material_instance_count: u8,
     /// Decoded 0x70-stride `MaterialInstancePrototype` overrides.
     pub material_instances: Vec<MaterialPrototype>,
+    /// Particle effects the engine attaches to this instance (the decor
+    /// `effects` component). V2 files only; older clients kept them in a
+    /// separate `decor.bin`, which is not read.
+    pub decor_effects: Vec<SpaceDecorEffect>,
+}
+
+/// One `fx::decor::EffectComponent`: a particle effect attached to a model
+/// instance.
+#[derive(Debug, Clone)]
+pub struct SpaceDecorEffect {
+    /// Placement relative to the owning instance (column-major, same
+    /// convention as [`SpaceInstance::transform`]); world placement is
+    /// `instance.transform * local_transform`.
+    pub local_transform: Matrix4x4,
+    /// Effect path, e.g. `particles/env_dynamic_foam_2.xml`.
+    pub particle_path: String,
+    /// Effect channel intensities, as in [`SpaceParticle::intensity_values`]
+    /// (six on every shipped record).
+    pub intensity_values: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -355,7 +374,8 @@ fn parse_visual_proto_inline_fields(input: &mut &[u8]) -> WResult<VisualProtoInl
 // components, which V1 clients loaded from a separate per-space
 // `decor.bin` keyed by stableGuid (removed in 13357625), in the same
 // order: animations (.seq/.fbx), effects (particles), linkedProbes
-// (always empty), sounds, waterPhysics. Not decoded yet.
+// (always empty), sounds, waterPhysics. Only effects is decoded
+// (`parse_decor_effects`).
 //   +0x00  16× f32   transform
 //   +0x40  u64       resourceId
 //   +0x48  u8 ×4     isLandscape, modelDyesCount, materialInstanceCount,
@@ -363,7 +383,7 @@ fn parse_visual_proto_inline_fields(input: &mut &[u8]) -> WResult<VisualProtoInl
 //   +0x4c  4 bytes   pad
 //   +0x50  i64       modelDyes relptr          (record-relative, as V1)
 //   +0x58  i64       materialInstances relptr  (record-relative, as V1)
-//   +0x60  5 × {u64 count, i64 relptr}         (decor components, undecoded)
+//   +0x60  5 × {u64 count, i64 relptr}         (decor components)
 
 /// Parse a single ModelInstance record into a fully-resolved
 /// `SpaceInstance`. The modelDyes / materialInstances relptrs resolve
@@ -434,7 +454,73 @@ fn parse_space_instance_record(file_data: &[u8], rec_base: usize, layout: SpaceL
         model_dyes,
         material_instance_count,
         material_instances,
+        decor_effects: match layout {
+            SpaceLayout::V1 => Vec::new(),
+            SpaceLayout::V2 => parse_decor_effects(file_data, rec_base),
+        },
     })
+}
+
+/// V2 ModelInstance decor descriptors start at +0x60, one
+/// `{u64 count, i64 relptr}` per component in engine order: animations,
+/// effects, linkedProbes, sounds, waterPhysics. Each relptr resolves from
+/// its own descriptor.
+const DECOR_EFFECTS_DESCRIPTOR: usize = 0x70;
+const DECOR_EFFECT_SIZE: usize = 0x60;
+const MAX_DECOR_EFFECTS: u64 = 4096;
+const MAX_DECOR_EFFECT_INTENSITIES: u64 = 64;
+
+/// Decode an instance's `effects` decor component. Records are 0x60 bytes:
+///   +0x00  16× f32  local transform
+///   +0x40  u64 len (incl. NUL), i64 relptr   particle path (relptr from
+///                                            this descriptor)
+///   +0x50  u64 count, i64 relptr             f32 intensities (relptr from
+///                                            the record start)
+/// Malformed records are skipped rather than failing the space.
+fn parse_decor_effects(file_data: &[u8], rec_base: usize) -> Vec<SpaceDecorEffect> {
+    let desc = rec_base + DECOR_EFFECTS_DESCRIPTOR;
+    let (Some(count), Some(relptr)) = (read_u64_at(file_data, desc), read_u64_at(file_data, desc + 8)) else {
+        return Vec::new();
+    };
+    if count == 0 || count > MAX_DECOR_EFFECTS {
+        return Vec::new();
+    }
+    let Some(first) = (desc as i64).checked_add(relptr as i64).filter(|v| *v >= 0) else {
+        return Vec::new();
+    };
+    let mut effects = Vec::with_capacity(count as usize);
+    for i in 0..count as usize {
+        let rec = first as usize + i * DECOR_EFFECT_SIZE;
+        let Some(record) = file_data.get(rec..rec + DECOR_EFFECT_SIZE) else {
+            break;
+        };
+        let Ok(local_transform) = parser_utils::parse_matrix4x4(&mut &record[..0x40]) else {
+            continue;
+        };
+        let (Some(path_len), Some(path_relptr)) =
+            (read_u64_at(file_data, rec + 0x40), read_u64_at(file_data, rec + 0x48))
+        else {
+            continue;
+        };
+        let Some(particle_path) = read_string_descriptor(file_data, rec + 0x40, path_len, path_relptr as i64) else {
+            continue;
+        };
+        let (Some(value_count), Some(values_relptr)) =
+            (read_u64_at(file_data, rec + 0x50), read_u64_at(file_data, rec + 0x58))
+        else {
+            continue;
+        };
+        let mut intensity_values = Vec::new();
+        if (1..=MAX_DECOR_EFFECT_INTENSITIES).contains(&value_count) {
+            let start = rec as i64 + values_relptr as i64;
+            if start >= 0 {
+                intensity_values =
+                    (0..value_count as usize).map_while(|k| read_f32_at(file_data, start as usize + k * 4)).collect();
+            }
+        }
+        effects.push(SpaceDecorEffect { local_transform, particle_path, intensity_values });
+    }
+    effects
 }
 
 // ── Helper: parse array at offset, wrapping winnow errors ───────────────────
@@ -2020,6 +2106,42 @@ mod tests {
         assert_eq!(parsed.instances[1].transform.0[12], -10.026);
         assert_eq!(parsed.instances[1].model_dyes[0].matter_id, 0x46f1_b231);
         assert_eq!(parsed.instances[1].model_dyes[0].replaces_id, 0x955d_be29);
+    }
+
+    /// A V2 model record whose `effects` decor descriptor (+0x70) points at
+    /// one 0x60-byte effect: local transform, path string (relptr from its
+    /// descriptor), six intensities (relptr from the effect record).
+    #[test]
+    fn parses_v2_decor_effects() {
+        let rec = SPACE_HEADER_SIZE;
+        let effect = rec + SpaceLayout::V2.instance_size();
+        let path_at = effect + 0x60;
+        let path = b"particles/env_dynamic_foam_2.xml\0";
+        let values_at = path_at + path.len();
+        let mut data = vec![0u8; values_at + 6 * 4];
+        put_u32(&mut data, 0x00, 1);
+        put_i64(&mut data, 0x20, rec as i64);
+        put_identity(&mut data, rec, [100.0, 0.0, -50.0]);
+        put_u64(&mut data, rec + 0x40, 0xceab_b910_ac94_e226);
+        put_u64(&mut data, rec + 0x70, 1);
+        put_i64(&mut data, rec + 0x78, effect as i64 - (rec + 0x70) as i64);
+        put_identity(&mut data, effect, [-0.02, 0.0, 0.311]);
+        put_u64(&mut data, effect + 0x40, path.len() as u64);
+        put_i64(&mut data, effect + 0x48, path_at as i64 - (effect + 0x40) as i64);
+        data[path_at..path_at + path.len()].copy_from_slice(path);
+        put_u64(&mut data, effect + 0x50, 6);
+        put_i64(&mut data, effect + 0x58, values_at as i64 - effect as i64);
+        let values = [0.9f32, 1.0, 1.0, 2.0, 1.0, 10.0];
+        for (k, v) in values.iter().enumerate() {
+            put_f32(&mut data, values_at + k * 4, *v);
+        }
+
+        let parsed = parse_space_instances_with_layout(&data, SpaceLayout::V2).expect("space instances");
+        let effects = &parsed.instances[0].decor_effects;
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].particle_path, "particles/env_dynamic_foam_2.xml");
+        assert_eq!(effects[0].intensity_values, values);
+        assert_eq!(effects[0].local_transform.0[14], 0.311);
     }
 
     #[test]

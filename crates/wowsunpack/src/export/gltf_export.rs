@@ -669,15 +669,24 @@ pub struct MapDyedMaterial {
     pub double_sided: bool,
 }
 
-/// A map-authored particle emitter anchor from `space.bin.particles[]`.
+/// A map-authored particle emitter anchor: a `space.bin.particles[]`
+/// record, or a decor effect attached to a model instance.
 pub struct MapParticleInstance {
+    /// World transform (for a decor effect: instance transform * local).
     pub transform: [f32; 16],
     pub position: [f32; 3],
     pub raw_guid_blob: [u8; 16],
-    pub resource_id: u64,
+    /// Effect resource id; `None` for decor effects, which name their
+    /// effect by path.
+    pub resource_id: Option<u64>,
     pub resource_path: Option<String>,
     pub intensity_count: u32,
     pub intensity_values: Vec<f32>,
+    /// Index into `space.bin.models[]` of the instance a decor effect is
+    /// attached to; `None` for `space.bin.particles[]` records.
+    pub model_instance_index: Option<usize>,
+    /// Decor effect placement relative to its instance.
+    pub local_transform: Option<[f32; 16]>,
 }
 
 /// A map-authored obstacle/collision-proxy record enriched with best-effort
@@ -1557,10 +1566,12 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
                         transform: p.transform.0,
                         position: p.position,
                         raw_guid_blob: p.raw_guid_blob,
-                        resource_id: p.resource_id,
+                        resource_id: Some(p.resource_id),
                         resource_path,
                         intensity_count: p.intensity_count,
                         intensity_values: p.intensity_values.clone(),
+                        model_instance_index: None,
+                        local_transform: None,
                     }
                 })
                 .collect()
@@ -1570,6 +1581,37 @@ pub fn build_map_scene(params: &BuildMapSceneParams<'_>) -> Result<MapScene, Rep
         let resolved = particles.iter().filter(|p| p.resource_path.is_some()).count();
         eprintln!("  {} particles ({resolved} resource paths resolved)", particles.len());
     }
+    // Decor effects ride along as more anchors, placed in world space so a
+    // consumer can treat every anchor alike.
+    let decor_effects: Vec<MapParticleInstance> = space
+        .map(|s| {
+            s.instances
+                .iter()
+                .enumerate()
+                .flat_map(|(index, inst)| {
+                    inst.decor_effects.iter().map(move |fx| {
+                        let world = mat4_mul_col(&inst.transform.0, &fx.local_transform.0);
+                        MapParticleInstance {
+                            transform: world,
+                            position: [world[12], world[13], world[14]],
+                            raw_guid_blob: [0; 16],
+                            resource_id: None,
+                            resource_path: Some(fx.particle_path.clone()),
+                            intensity_count: fx.intensity_values.len() as u32,
+                            intensity_values: fx.intensity_values.clone(),
+                            model_instance_index: Some(index),
+                            local_transform: Some(fx.local_transform.0),
+                        }
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !decor_effects.is_empty() {
+        eprintln!("  {} model-attached particle effects", decor_effects.len());
+    }
+    let mut particles = particles;
+    particles.extend(decor_effects);
 
     let static_decals = space.map(|s| s.static_decals.clone()).unwrap_or_default();
     if !static_decals.is_empty() {
@@ -1980,8 +2022,9 @@ fn build_scene_extras(
     let particles: Vec<_> = particles
         .iter()
         .map(|p| {
-            let resource_id_hex = format!("0x{:016X}", p.resource_id);
+            let resource_id_hex = p.resource_id.map(|id| format!("0x{id:016X}"));
             serde_json::json!({
+                "source": if p.model_instance_index.is_some() { "decor" } else { "space" },
                 "position": p.position,
                 "transform": p.transform,
                 "raw_guid_blob": p.raw_guid_blob,
@@ -1990,6 +2033,8 @@ fn build_scene_extras(
                 "resource_path": p.resource_path.as_deref(),
                 "intensity_count": p.intensity_count,
                 "intensity_values": &p.intensity_values,
+                "model_instance_index": p.model_instance_index,
+                "local_transform": p.local_transform,
             })
         })
         .collect();
