@@ -10,6 +10,19 @@ pub struct SerializedFile {
     compression_info: u64,
     unpacked_size: usize,
     crc32: u32,
+    /// `"pkg"` or `"assets_bin"`. Only set by `metadata --content-hashes`.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub source: Option<&'static str>,
+    /// Prototype type name for assets.bin records.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub prototype_type: Option<&'static str>,
+    /// Build-stable content hash for assets.bin records (16 hex digits).
+    /// Their `crc32` is always 0, because they aren't stored as files.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub content_hash: Option<String>,
+    /// `"decoded"` or `"shallow"`, see `assets_bin_vfs::HashKind`.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub hash_kind: Option<&'static str>,
 }
 
 impl SerializedFile {
@@ -64,6 +77,10 @@ pub fn tree_to_serialized_files(entries: &HashMap<String, VfsEntry>) -> Vec<Seri
             compression_info,
             unpacked_size,
             crc32,
+            source: None,
+            prototype_type: None,
+            content_hash: None,
+            hash_kind: None,
         });
     }
 

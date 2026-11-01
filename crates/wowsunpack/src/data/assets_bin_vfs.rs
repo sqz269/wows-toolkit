@@ -94,6 +94,10 @@ struct FileLocation {
     byte_end: usize,
     /// The prototype type this record belongs to.
     prototype_type: PrototypeType,
+    /// Index of the containing blob in `PrototypeDatabase::databases`.
+    blob_index: usize,
+    /// Index of the record within its blob.
+    record_index: usize,
 }
 
 /// A virtual filesystem backed by an assets.bin PrototypeDatabase.
@@ -194,7 +198,13 @@ impl AssetsBinVfs {
             let full_path = format!("/{raw_path}");
             files.insert(
                 full_path.clone(),
-                FileLocation { byte_offset: record_offset, byte_end: blob_end, prototype_type: proto_type },
+                FileLocation {
+                    byte_offset: record_offset,
+                    byte_end: blob_end,
+                    prototype_type: proto_type,
+                    blob_index: location.blob_index,
+                    record_index: location.record_index,
+                },
             );
 
             register_path_in_dirs(&full_path, &mut dir_children);
@@ -250,6 +260,204 @@ impl AssetsBinVfs {
     pub fn files_with_type(&self) -> impl Iterator<Item = (&str, usize, PrototypeType)> {
         self.files.iter().map(|(path, loc)| (path.as_str(), loc.byte_end - loc.byte_offset, loc.prototype_type))
     }
+
+    /// Map every `(blob_index, record_index)` back to the path(s) that name it.
+    ///
+    /// Used to turn prototype reads recorded by [`crate::data::deps`] into
+    /// paths. Several paths can share one record.
+    pub fn prototype_paths(&self) -> HashMap<(usize, usize), Vec<String>> {
+        let mut out: HashMap<(usize, usize), Vec<String>> = HashMap::new();
+        for (path, loc) in &self.files {
+            out.entry((loc.blob_index, loc.record_index)).or_default().push(path.clone());
+        }
+        for paths in out.values_mut() {
+            paths.sort();
+        }
+        out
+    }
+
+    /// Content hash of the record at `path`, stable across game builds.
+    ///
+    /// A virtual file's bytes run from the record to the end of its blob, so
+    /// they change whenever anything later in the blob changes. This hashes
+    /// what the record actually holds instead. See [`record_content_hash`].
+    pub fn content_hash(&self, path: &str) -> Option<RecordHash> {
+        let loc = self.files.get(lookup_key(path))?;
+        Some(record_content_hash(loc.prototype_type, &self.data[loc.byte_offset..loc.byte_end]))
+    }
+}
+
+impl PrototypeType {
+    /// Lower-case name used in JSON output.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Material => "material",
+            Self::Visual => "visual",
+            Self::SkeletonExtender => "skeleton_extender",
+            Self::Model => "model",
+            Self::PointLight => "point_light",
+            Self::Effect => "effect",
+            Self::VelocityField => "velocity_field",
+            Self::EffectPreset => "effect_preset",
+            Self::EffectMetadata => "effect_metadata",
+            Self::AtlasContour => "atlas_contour",
+        }
+    }
+}
+
+/// How a [`RecordHash`] was computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashKind {
+    /// Hash of the decoded record, including everything it points to.
+    /// Unchanged content gives the same hash in every build.
+    Decoded,
+    /// Hash of the fixed-size record bytes only. The record's relative
+    /// pointers move when earlier records grow or shrink, so this can report
+    /// a change that didn't happen, but never misses one in the fixed part.
+    /// Used for types the toolkit has no decoder for.
+    Shallow,
+}
+
+impl HashKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Decoded => "decoded",
+            Self::Shallow => "shallow",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordHash {
+    pub hash: u64,
+    pub kind: HashKind,
+}
+
+impl RecordHash {
+    /// 16-digit lower-case hex form used in JSON output.
+    pub fn hex(&self) -> String {
+        format!("{:016x}", self.hash)
+    }
+}
+
+/// 64-bit FNV-1a. Defined here so hashes never depend on the Rust version.
+fn fnv1a64(chunks: &[&[u8]]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for chunk in chunks {
+        for &b in *chunk {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// Hash a prototype record so the result only changes when its content does.
+///
+/// `record_data` runs from the record start to the end of its blob, the same
+/// slice the per-type parsers take.
+///
+/// - Visual and Material records are decoded and the decoded form is hashed,
+///   so pointer offsets drop out.
+/// - Model records hash their header, skeleton-extender ids, animation
+///   entries and decoded dyes.
+/// - SkeletonExtender records hash their three placement arrays.
+/// - Every other type, and any record that fails to decode, falls back to
+///   [`HashKind::Shallow`].
+pub fn record_content_hash(proto_type: PrototypeType, record_data: &[u8]) -> RecordHash {
+    if let Some(hash) = decoded_hash(proto_type, record_data) {
+        return RecordHash { hash, kind: HashKind::Decoded };
+    }
+    let fixed = &record_data[..proto_type.item_size().min(record_data.len())];
+    RecordHash { hash: fnv1a64(&[fixed]), kind: HashKind::Shallow }
+}
+
+fn decoded_hash(proto_type: PrototypeType, record_data: &[u8]) -> Option<u64> {
+    match proto_type {
+        #[cfg(feature = "json")]
+        PrototypeType::Visual => {
+            let v = crate::models::visual::parse_visual(record_data).ok()?;
+            Some(fnv1a64(&[&serde_json::to_vec(&v).ok()?]))
+        }
+        PrototypeType::Model => model_hash(record_data),
+        #[cfg(feature = "json")]
+        PrototypeType::Material => {
+            let m = crate::models::material::parse_material(record_data).ok()?;
+            Some(fnv1a64(&[&serde_json::to_vec(&m).ok()?]))
+        }
+        PrototypeType::SkeletonExtender => skeleton_extender_hash(record_data),
+        _ => None,
+    }
+}
+
+/// ModelPrototype record (0x28 bytes): `u64 visual_resource_id`, `u8
+/// skel_ext_count, misc_type, animations_count, dyes_count`, 4 pad bytes, then
+/// record-relative offsets to `u64[skel_ext_count]` ids, the animation entries
+/// (0x28 bytes each) and the dye entries (0x20 bytes each).
+///
+/// The animation entries aren't decoded (`parse_model` reads them as nested
+/// models, which fails), so their raw bytes are hashed.
+fn model_hash(buf: &[u8]) -> Option<u64> {
+    const MODEL_ITEM_SIZE: usize = 0x28;
+    const ANIMATION_ENTRY_SIZE: usize = 0x28;
+    let header = buf.get(..0x0c)?;
+    let skel_count = buf[8] as usize;
+    let anim_count = buf[10] as usize;
+    let dye_count = buf[11] as usize;
+    let i64_at = |o: usize| buf.get(o..o + 8).map(|b| i64::from_le_bytes(b.try_into().unwrap()));
+    let target = |o: usize| -> Option<usize> { usize::try_from(i64_at(o)?).ok() };
+    if buf.len() < MODEL_ITEM_SIZE {
+        return None;
+    }
+
+    let skel_ids: &[u8] = if skel_count > 0 {
+        let at = target(0x10)?;
+        buf.get(at..at.checked_add(skel_count * 8)?)?
+    } else {
+        &[]
+    };
+    let animations: &[u8] = if anim_count > 0 {
+        let at = target(0x18)?;
+        buf.get(at..at.checked_add(anim_count * ANIMATION_ENTRY_SIZE)?)?
+    } else {
+        &[]
+    };
+    let dyes: Vec<u8> = if dye_count > 0 {
+        let at = target(0x20)?;
+        dye_bytes(buf, at, dye_count)?
+    } else {
+        Vec::new()
+    };
+    Some(fnv1a64(&[header, skel_ids, animations, &dyes]))
+}
+
+#[cfg(feature = "json")]
+fn dye_bytes(buf: &[u8], at: usize, count: usize) -> Option<Vec<u8>> {
+    let dyes = crate::models::model::parse_dye_entries(buf, at, count).ok()?;
+    serde_json::to_vec(&dyes).ok()
+}
+
+#[cfg(not(feature = "json"))]
+fn dye_bytes(_buf: &[u8], _at: usize, _count: usize) -> Option<Vec<u8>> {
+    None
+}
+
+/// SkeletonExtender record (0x20 bytes): `u16 type, u16 count, u32 pad`, then
+/// three record-relative offsets to `u32[count]` placement ids, `u32[count]`
+/// parent-bone hashes and `count` 4x4 f32 matrices.
+fn skeleton_extender_hash(buf: &[u8]) -> Option<u64> {
+    let u16_at = |o: usize| buf.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let u64_at = |o: usize| buf.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+    let kind = u16_at(0)?;
+    let count = u16_at(2)? as usize;
+    let p0 = u64_at(8)? as usize;
+    let p1 = u64_at(16)? as usize;
+    let p2 = u64_at(24)? as usize;
+    let ids = buf.get(p0..p0.checked_add(count * 4)?)?;
+    let parents = buf.get(p1..p1.checked_add(count * 4)?)?;
+    let matrices_end = p2.checked_add(count * 64)?.min(buf.len());
+    let matrices = buf.get(p2..matrices_end)?;
+    Some(fnv1a64(&[&kind.to_le_bytes(), &(count as u16).to_le_bytes(), ids, parents, matrices]))
 }
 
 fn lookup_key(path: &str) -> &str {
@@ -270,6 +478,7 @@ impl FileSystem for AssetsBinVfs {
     fn open_file(&self, path: &str) -> vfs::VfsResult<Box<dyn vfs::SeekAndRead + Send>> {
         let key = lookup_key(path);
         let loc = self.files.get(key).ok_or_else(|| vfs::VfsError::from(VfsErrorKind::FileNotFound))?;
+        crate::data::deps::record_file(key);
         let data = self.data[loc.byte_offset..loc.byte_end].to_vec();
         Ok(Box::new(Cursor::new(data)))
     }

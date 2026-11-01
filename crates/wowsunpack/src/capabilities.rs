@@ -84,6 +84,12 @@ const FEATURES: &[&str] = &[
     // collision model — shore-structure hit partition
     // (`--collision-hitbox-groups`, batch `shared`).
     "export_model.collision_hitbox_groups",
+    // Global `--deps-out <file>`: write the VFS files and assets.bin records
+    // the command read (`wowsunpack.deps/v1`).
+    "deps_out",
+    // `metadata --content-hashes`: per-record build-stable hashes for
+    // assets.bin entries, plus `source` / `prototype_type` fields.
+    "metadata.content_hashes",
 ];
 
 /// Schema identifiers emitted in toolkit JSON outputs. Keyed by contract
@@ -97,6 +103,7 @@ const SCHEMAS: &[(&str, &str)] = &[
     ("dump_bones_json", "wowsunpack.visual_bones/v1"),
     // Byte-matches the `schema` field the subcommand emits (dot form).
     ("export_decals", "wows.map.decal_textures.v1"),
+    ("deps_out", "wowsunpack.deps/v1"),
 ];
 
 #[derive(Debug, Serialize)]
@@ -169,8 +176,8 @@ mod tests {
     fn contract_count_matches_spec() {
         let caps = build();
         assert_eq!(caps.contracts.len(), 11);
-        assert_eq!(caps.features.len(), 17);
-        assert_eq!(caps.schemas.len(), 7);
+        assert_eq!(caps.features.len(), 19);
+        assert_eq!(caps.schemas.len(), 8);
     }
 
     #[test]

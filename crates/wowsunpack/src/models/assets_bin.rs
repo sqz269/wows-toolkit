@@ -203,6 +203,7 @@ impl<'a> PrototypeDatabase<'a> {
         if record_offset + item_size > db.data.len() {
             return Err(Report::new(AssetsBinError::OutOfBounds { offset: record_offset }));
         }
+        crate::data::deps::record_prototype(location.blob_index, location.record_index);
 
         // Return from record start to end of blob, so relptrs can resolve into OOL data.
         Ok(&db.data[record_offset..])

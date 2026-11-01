@@ -177,6 +177,7 @@ where
         let VfsEntryMeta::File(file_entry) = entry else {
             return Err(VfsError::from(VfsErrorKind::Other("not a file".into())));
         };
+        crate::data::deps::record_file(path);
 
         let data_start = file_entry.offset as usize;
         let data_end = data_start + file_entry.size as usize;

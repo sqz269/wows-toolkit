@@ -22,6 +22,8 @@ use thread_local::ThreadLocal;
 use vfs::VfsPath;
 use vfs::impls::overlay::OverlayFS;
 use wowsunpack::data::assets_bin_vfs::AssetsBinVfs;
+use wowsunpack::data::assets_bin_vfs::PrototypeType;
+use wowsunpack::data::assets_bin_vfs::RecordHash;
 use wowsunpack::data::idx;
 use wowsunpack::data::idx::VfsEntry;
 use wowsunpack::data::idx_vfs::IdxVfs;
@@ -67,6 +69,12 @@ struct Args {
     /// Ignored if `--game-dir` is specified.
     #[clap(short, long)]
     idx_files: Vec<PathBuf>,
+
+    /// Write the game files and assets.bin records this command read to a
+    /// JSON file (`wowsunpack.deps/v1`). Lets an export record exactly which
+    /// inputs it used, so a later game build can be checked against them.
+    #[clap(long, global = true)]
+    deps_out: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
@@ -120,6 +128,13 @@ enum Commands {
     Metadata {
         #[clap(short, long, default_value_t = MetadataFormat::Plain, value_enum)]
         format: MetadataFormat,
+
+        /// Add `source`, `prototype_type`, `content_hash` and `hash_kind`
+        /// fields. assets.bin records get a hash that only changes when the
+        /// record's content does, so two builds can be compared record by
+        /// record. JSON format only.
+        #[clap(long)]
+        content_hashes: bool,
 
         /// A value of "-" will print to stdout
         #[clap(default_value = "-")]
@@ -963,6 +978,7 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
     let mut vfs: Option<VfsPath> = None;
     let mut file_tree = HashMap::new();
     let mut assets_bin_paths = HashSet::new();
+    let mut record_hashes: HashMap<String, (RecordHash, PrototypeType)> = HashMap::new();
 
     if args.idx_files.is_empty() {
         let bin_dir = game_dir.join("bin");
@@ -1055,6 +1071,13 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
                         // Add assets.bin entries to the file_tree so list/extract can find them.
                         assets_bin_paths = add_vfs_entries_to_file_tree(&assets_vfs, &mut file_tree);
 
+                        if wowsunpack::data::deps::is_enabled() {
+                            let _ = DEPS_PROTOTYPE_PATHS.set(assets_vfs.prototype_paths());
+                        }
+                        if matches!(args.command, Commands::Metadata { content_hashes: true, .. }) {
+                            record_hashes = compute_record_hashes(&assets_vfs);
+                        }
+
                         let assets_layer = VfsPath::new(assets_vfs);
                         let overlay = OverlayFS::new(&[assets_layer, pkg_vfs]);
                         vfs = Some(VfsPath::new(overlay));
@@ -1068,6 +1091,10 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
                 vfs = Some(pkg_vfs);
             }
         }
+    }
+
+    if let Some(version) = game_version {
+        let _ = DEPS_GAME_VERSION.set(version);
     }
 
     match args.command {
@@ -1177,8 +1204,28 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
             }
             println!("Wrote {} files", files_written.load(Ordering::Relaxed));
         }
-        Commands::Metadata { format, out_file } => {
-            let data = serialization::tree_to_serialized_files(&file_tree);
+        Commands::Metadata { format, out_file, content_hashes } => {
+            let mut data = serialization::tree_to_serialized_files(&file_tree);
+            if content_hashes {
+                if !matches!(format, MetadataFormat::Json) {
+                    bail!("--content-hashes needs --format json");
+                }
+                for file in data.iter_mut() {
+                    if file.is_directory() {
+                        continue;
+                    }
+                    if let Some((hash, proto_type)) = record_hashes.get(file.path()) {
+                        file.source = Some("assets_bin");
+                        file.prototype_type = Some(proto_type.name());
+                        file.content_hash = Some(hash.hex());
+                        file.hash_kind = Some(hash.kind.name());
+                    } else if assets_bin_paths.contains(file.path()) {
+                        file.source = Some("assets_bin");
+                    } else {
+                        file.source = Some("pkg");
+                    }
+                }
+            }
             let out_file =
                 if out_file.to_str().unwrap() != "-" { Some(BufWriter::new(File::create(out_file)?)) } else { None };
             // TODO: use dynamic dispatch with Box<T>
@@ -4810,6 +4857,81 @@ fn emit_ammo_json(
     Ok(())
 }
 
+/// `(blob_index, record_index)` -> assets.bin paths, captured while the VFS is
+/// set up so `--deps-out` can name prototype records read by index.
+static DEPS_PROTOTYPE_PATHS: std::sync::OnceLock<HashMap<(usize, usize), Vec<String>>> = std::sync::OnceLock::new();
+/// Build number the command ran against, for `--deps-out`.
+static DEPS_GAME_VERSION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Content hashes for every assets.bin record, keyed by VFS path.
+fn compute_record_hashes(assets_vfs: &AssetsBinVfs) -> HashMap<String, (RecordHash, PrototypeType)> {
+    let entries: Vec<(&str, PrototypeType)> = assets_vfs.files_with_type().map(|(p, _, t)| (p, t)).collect();
+    entries
+        .par_iter()
+        .filter_map(|(path, proto_type)| {
+            assets_vfs.content_hash(path).map(|hash| (path.to_string(), (hash, *proto_type)))
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
+struct DepsFile {
+    schema: &'static str,
+    build: Option<u64>,
+    /// VFS files read from the game packages.
+    files: Vec<String>,
+    /// assets.bin records read, by path, whether opened through the VFS or
+    /// looked up in a parsed prototype database.
+    records: Vec<String>,
+}
+
+/// Write what the command read (see `--deps-out`).
+fn write_deps(path: &Path) -> Result<(), Report> {
+    wowsunpack::data::deps::disable();
+    let state = wowsunpack::data::deps::take();
+    let proto_paths = DEPS_PROTOTYPE_PATHS.get();
+    let assets_paths: HashSet<&str> =
+        proto_paths.map(|m| m.values().flatten().map(String::as_str).collect()).unwrap_or_default();
+
+    let mut files = std::collections::BTreeSet::new();
+    let mut records = std::collections::BTreeSet::new();
+    for file in state.files {
+        // Every command opens assets.bin to build the VFS; its records are
+        // listed individually instead.
+        if file.eq_ignore_ascii_case("/content/assets.bin") {
+            continue;
+        }
+        if assets_paths.contains(file.as_str()) {
+            records.insert(file);
+        } else {
+            files.insert(file);
+        }
+    }
+    if let Some(proto_paths) = proto_paths {
+        for key in state.prototypes {
+            if let Some(paths) = proto_paths.get(&key) {
+                records.extend(paths.iter().cloned());
+            }
+        }
+    }
+
+    let out = DepsFile {
+        schema: "wowsunpack.deps/v1",
+        build: DEPS_GAME_VERSION.get().copied(),
+        files: files.into_iter().collect(),
+        records: records.into_iter().collect(),
+    };
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    serde_json::to_writer(BufWriter::new(File::create(&tmp)?), &out)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 fn main() -> Result<(), Report> {
     // Pre-parse so the metadata-only `capabilities` subcommand can
     // short-circuit before the game-data setup and the "Finished in"
@@ -4822,7 +4944,17 @@ fn main() -> Result<(), Report> {
 
     let timestamp = Instant::now();
 
+    let mut args = args;
+    let deps_out = args.deps_out.take();
+    if deps_out.is_some() {
+        wowsunpack::data::deps::enable();
+    }
+
     run_with_args(args)?;
+
+    if let Some(path) = deps_out {
+        write_deps(&path)?;
+    }
 
     println!("Finished in {} seconds", (Instant::now() - timestamp).as_secs_f32());
 
