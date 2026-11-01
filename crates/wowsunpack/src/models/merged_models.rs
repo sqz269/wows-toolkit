@@ -244,6 +244,8 @@ pub struct SpaceUserObject {
 /// Parsed `space.bin` instance placements + lighting.
 #[derive(Debug)]
 pub struct SpaceInstances {
+    /// Record layout the file was parsed with (see [`SpaceLayout`]).
+    pub layout: SpaceLayout,
     pub instances: Vec<SpaceInstance>,
     pub obstacles: Vec<SpaceObstacle>,
     pub particles: Vec<SpaceParticle>,
@@ -330,9 +332,9 @@ fn parse_visual_proto_inline_fields(input: &mut &[u8]) -> WResult<VisualProtoInl
     })
 }
 
-// space.bin instance entry (engine `SpaceContent::ModelInstance`, stride 0x70)
+// space.bin instance entry (engine `SpaceContent::ModelInstance`)
 //
-// Layout (Ghidra @ FUN_1408985c0, audit doc 2026-05-21):
+// V1 layout, stride 0x70 (Ghidra @ FUN_1408985c0, audit doc 2026-05-21):
 //   +0x00  16× f32   transform
 //   +0x40  u64       stableGuid length
 //   +0x48  i64       stableGuid relptr
@@ -344,23 +346,40 @@ fn parse_visual_proto_inline_fields(input: &mut &[u8]) -> WResult<VisualProtoInl
 //   +0x5c  4 bytes   pad
 //   +0x60  i64       modelDyes relptr
 //   +0x68  i64       materialInstances relptr
+//
+// V2 layout, stride 0xb0 (client build 13357625+, byte-matched against V1
+// across every space present in both builds): the stableGuid descriptor is
+// gone, the remaining V1 fields move up 0x10, and five new
+// (u64 count, i64 relptr) array descriptors follow. Their relptrs resolve
+// from the descriptor's own address. They carry per-instance child objects
+// (records with their own matrices and `content/...` paths) and are not
+// decoded yet.
+//   +0x00  16× f32   transform
+//   +0x40  u64       resourceId
+//   +0x48  u8 ×4     isLandscape, modelDyesCount, materialInstanceCount,
+//                    minimumQualityLevel
+//   +0x4c  4 bytes   pad
+//   +0x50  i64       modelDyes relptr          (record-relative, as V1)
+//   +0x58  i64       materialInstances relptr  (record-relative, as V1)
+//   +0x60  5 × {u64 count, i64 relptr}         (undecoded child arrays)
 
-/// Parse a single ModelInstance record (0x70 bytes) into a fully-resolved
-/// `SpaceInstance`. Inner relptrs at +0x60 (modelDyes) and +0x68
-/// (materialInstances) are resolved relative to the start of the 0x70-byte
-/// ModelInstance record. The stable GUID descriptor at +0x40/+0x48 resolves
-/// relative to the descriptor base (`rec_base + 0x40`).
-fn parse_space_instance_record(file_data: &[u8], rec_base: usize) -> WResult<SpaceInstance> {
-    let input = &mut &file_data[rec_base..rec_base + SPACE_INSTANCE_SIZE];
+/// Parse a single ModelInstance record into a fully-resolved
+/// `SpaceInstance`. The modelDyes / materialInstances relptrs resolve
+/// relative to the start of the record. The V1 stable GUID descriptor at
+/// +0x40/+0x48 resolves relative to the descriptor base (`rec_base + 0x40`).
+fn parse_space_instance_record(file_data: &[u8], rec_base: usize, layout: SpaceLayout) -> WResult<SpaceInstance> {
+    let input = &mut &file_data[rec_base..rec_base + layout.instance_size()];
     let transform = parser_utils::parse_matrix4x4(input)?;
-    let stable_guid_len = le_u64.parse_next(input)?;
-    let stable_guid_relptr = le_i64.parse_next(input)?;
+    let (stable_guid_len, stable_guid_relptr) = match layout {
+        SpaceLayout::V1 => (le_u64.parse_next(input)?, le_i64.parse_next(input)?),
+        SpaceLayout::V2 => (0, 0),
+    };
     let path_id = le_u64.parse_next(input)?;
     let is_landscape = le_u8.parse_next(input)? != 0;
     let model_dyes_count = le_u8.parse_next(input)?;
     let material_instance_count = le_u8.parse_next(input)?;
     let min_quality_level = le_u8.parse_next(input)?;
-    let _ = take(4usize).parse_next(input)?; // +0x5c..+0x60: pad
+    let _ = take(4usize).parse_next(input)?; // pad
     let model_dyes_relptr = le_i64.parse_next(input)?;
     let material_instances_relptr = le_i64.parse_next(input)?;
 
@@ -500,13 +519,58 @@ pub fn parse_merged_models(file_data: &[u8]) -> Result<MergedModels, Report<Merg
 // ── space.bin parser ─────────────────────────────────────────────────────────
 
 const SPACE_HEADER_SIZE: usize = 0x60;
-const SPACE_INSTANCE_SIZE: usize = 0x70;
 const SPACE_OBSTACLE_SIZE: usize = 0x58;
-const SPACE_PARTICLE_SIZE: usize = 0x68;
-const SPACE_POINT_LIGHT_SIZE: usize = 0xc0;
 const SPACE_PROBE_SIZE: usize = 0x70;
 const SPACE_STATIC_DECAL_SIZE: usize = 0x68;
 const SPACE_USER_OBJECT_SIZE: usize = 0x70;
+
+/// `space.bin` record layout revision. The file has no version field (the
+/// header is identical across revisions), so [`detect_space_layout`] picks
+/// it from the records themselves.
+///
+/// - `V1`: clients up to build 13187581. ModelInstance 0x70, particle 0x68,
+///   point light 0xc0, user object descriptors (guid, type, properties).
+/// - `V2`: client build 13357625 onward. The GUID fields were dropped:
+///   ModelInstance 0xb0 (no stableGuid, five new child-array descriptors),
+///   particle 0x58 (no 16-byte GUID blob), point light 0xb0 (16 bytes
+///   before colorAnimation removed), user object descriptors reordered to
+///   (type, properties, guid). Obstacles, probes and static decals are
+///   unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpaceLayout {
+    V1,
+    V2,
+}
+
+impl SpaceLayout {
+    pub fn instance_size(self) -> usize {
+        match self {
+            SpaceLayout::V1 => 0x70,
+            SpaceLayout::V2 => 0xb0,
+        }
+    }
+
+    pub fn particle_size(self) -> usize {
+        match self {
+            SpaceLayout::V1 => 0x68,
+            SpaceLayout::V2 => 0x58,
+        }
+    }
+
+    pub fn point_light_size(self) -> usize {
+        match self {
+            SpaceLayout::V1 => 0xc0,
+            SpaceLayout::V2 => 0xb0,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SpaceLayout::V1 => "v1",
+            SpaceLayout::V2 => "v2",
+        }
+    }
+}
 
 // Header layout (see audit doc § "8 typed sub-arrays"):
 //   +0x00..+0x20  eight u32 counts in declaration order
@@ -556,13 +620,123 @@ fn parse_space_header(file_data: &[u8]) -> Result<[(u32, usize); 8], Report<Merg
     Ok(out)
 }
 
-/// Parse a `space.bin` file to extract the typed instance sub-arrays.
+fn read_u64_at(data: &[u8], offset: usize) -> Option<u64> {
+    data.get(offset..offset + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+}
+
+fn read_u32_at(data: &[u8], offset: usize) -> Option<u32> {
+    data.get(offset..offset + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+}
+
+fn read_f32_at(data: &[u8], offset: usize) -> Option<f32> {
+    read_u32_at(data, offset).map(f32::from_bits)
+}
+
+/// True when the 64 bytes at `base` are an affine column-major matrix
+/// (row 3 = 0,0,0,1), which every placement record starts with.
+fn is_affine_matrix_at(data: &[u8], base: usize) -> bool {
+    let ok = |o: usize, v: f32| read_f32_at(data, base + o).is_some_and(|x| x == v);
+    ok(0x0c, 0.0) && ok(0x1c, 0.0) && ok(0x2c, 0.0) && ok(0x3c, 1.0)
+}
+
+fn model_record_plausible(data: &[u8], rec: usize, layout: SpaceLayout) -> bool {
+    if !is_affine_matrix_at(data, rec) {
+        return false;
+    }
+    // resourceId, flag block (isLandscape, dyes, materials, minQuality), pad.
+    let (rid, flags) = match layout {
+        // V1 +0x40 is the stableGuid length: a short string or 0, never a
+        // 64-bit resource hash.
+        SpaceLayout::V1 if read_u64_at(data, rec + 0x40).is_none_or(|len| len > 0x1000) => return false,
+        SpaceLayout::V1 => (rec + 0x50, rec + 0x58),
+        SpaceLayout::V2 => (rec + 0x40, rec + 0x48),
+    };
+    let Some(f) = data.get(flags..flags + 8) else { return false };
+    read_u64_at(data, rid).is_some_and(|id| id != 0) && f[0] <= 1 && f[3] <= 6 && f[4..8] == [0; 4]
+}
+
+fn particle_record_plausible(data: &[u8], rec: usize, layout: SpaceLayout) -> bool {
+    let rid = match layout {
+        SpaceLayout::V1 => rec + 0x50,
+        SpaceLayout::V2 => rec + 0x40,
+    };
+    is_affine_matrix_at(data, rec)
+        && read_u64_at(data, rid).is_some_and(|id| id != 0)
+        && read_u32_at(data, rid + 8).is_some_and(|n| n < 0x1000)
+        && read_u32_at(data, rid + 12) == Some(0)
+}
+
+/// True when the string descriptor at `desc` resolves to an authoring GUID
+/// (`XXXXXXXX.XXXXXXXX.XXXXXXXX.XXXXXXXX`, hex, optional NUL).
+fn descriptor_is_guid(data: &[u8], desc: usize) -> bool {
+    let (Some(len), Some(rel)) = (read_u64_at(data, desc), read_u64_at(data, desc + 8)) else {
+        return false;
+    };
+    let start = desc as i64 + rel as i64;
+    if !(35..=36).contains(&len) || start < 0 {
+        return false;
+    }
+    let Some(s) = data.get(start as usize..start as usize + 35) else { return false };
+    s.iter().enumerate().all(|(i, &c)| if i % 9 == 8 { c == b'.' } else { c.is_ascii_hexdigit() })
+}
+
+/// Pick the record layout for a `space.bin` (it carries no version field).
+///
+/// Every candidate layout is scored by how many model / particle / point
+/// light records are plausible at that layout's stride: an affine matrix,
+/// a non-zero resource id, and in-range flag bytes. The wrong stride lands
+/// mid-record from the second record on (V2 read as V1 hits the zero tail
+/// of record 0; V1 read as V2 lands on record 1's +0x40), so real files
+/// separate cleanly. User objects keep their 0x70 stride but move the GUID
+/// descriptor (V1 +0x40, V2 +0x60), so a GUID-shaped string there scores
+/// too. Ties (files with none of these records) go to the current layout, V2.
+pub fn detect_space_layout(file_data: &[u8]) -> Result<SpaceLayout, Report<MergedModelsError>> {
+    let header = parse_space_header(file_data)?;
+    let score = |layout: SpaceLayout| -> usize {
+        let mut s = 0;
+        let (n, off) = header[SUBARRAY_MODELS];
+        for i in 0..n as usize {
+            s += model_record_plausible(file_data, off + i * layout.instance_size(), layout) as usize;
+        }
+        let (n, off) = header[SUBARRAY_PARTICLES];
+        for i in 0..n as usize {
+            s += particle_record_plausible(file_data, off + i * layout.particle_size(), layout) as usize;
+        }
+        let (n, off) = header[SUBARRAY_POINT_LIGHTS];
+        for i in 0..n as usize {
+            s += is_affine_matrix_at(file_data, off + i * layout.point_light_size()) as usize;
+        }
+        let guid_slot = match layout {
+            SpaceLayout::V1 => 0x40,
+            SpaceLayout::V2 => 0x60,
+        };
+        let (n, off) = header[SUBARRAY_USER_OBJECTS];
+        for i in 0..n as usize {
+            s += descriptor_is_guid(file_data, off + i * SPACE_USER_OBJECT_SIZE + guid_slot) as usize;
+        }
+        s
+    };
+    let (v1, v2) = (score(SpaceLayout::V1), score(SpaceLayout::V2));
+    Ok(if v1 > v2 { SpaceLayout::V1 } else { SpaceLayout::V2 })
+}
+
+/// Parse a `space.bin` file to extract the typed instance sub-arrays,
+/// detecting the record layout first (see [`detect_space_layout`]).
 ///
 /// The engine's `SpaceContent::Instances` block carries eight typed
 /// sub-arrays; we consume seven: models, obstacles, particles,
 /// pointLights, probes, staticDecals, and userObjects. Only `prefabs[]`
 /// is skipped (dead data in the shipped game — see the audit doc).
 pub fn parse_space_instances(file_data: &[u8]) -> Result<SpaceInstances, Report<MergedModelsError>> {
+    let layout = detect_space_layout(file_data)?;
+    parse_space_instances_with_layout(file_data, layout)
+}
+
+/// [`parse_space_instances`] with an explicit record layout.
+pub fn parse_space_instances_with_layout(
+    file_data: &[u8],
+    layout: SpaceLayout,
+) -> Result<SpaceInstances, Report<MergedModelsError>> {
     let header = parse_space_header(file_data)?;
     let (instance_count, instances_offset) = header[SUBARRAY_MODELS];
     let (obstacle_count, obstacles_offset) = header[SUBARRAY_OBSTACLES];
@@ -575,7 +749,8 @@ pub fn parse_space_instances(file_data: &[u8]) -> Result<SpaceInstances, Report<
     let instances = if instance_count == 0 {
         Vec::new()
     } else {
-        let need = instance_count as usize * SPACE_INSTANCE_SIZE;
+        let stride = layout.instance_size();
+        let need = instance_count as usize * stride;
         if instances_offset + need > file_data.len() {
             return Err(Report::new(MergedModelsError::DataTooShort {
                 offset: instances_offset,
@@ -585,8 +760,8 @@ pub fn parse_space_instances(file_data: &[u8]) -> Result<SpaceInstances, Report<
         }
         let mut out = Vec::with_capacity(instance_count as usize);
         for i in 0..instance_count as usize {
-            let rec_base = instances_offset + i * SPACE_INSTANCE_SIZE;
-            let rec = parse_space_instance_record(file_data, rec_base).map_err(|e: ErrMode<ContextError>| {
+            let rec_base = instances_offset + i * stride;
+            let rec = parse_space_instance_record(file_data, rec_base, layout).map_err(|e: ErrMode<ContextError>| {
                 Report::new(MergedModelsError::ParseError(format!("space instance[{i}] @ 0x{rec_base:x}: {e}")))
             })?;
             out.push(rec);
@@ -607,15 +782,15 @@ pub fn parse_space_instances(file_data: &[u8]) -> Result<SpaceInstances, Report<
         file_data,
         particles_offset,
         particle_count as usize,
-        SPACE_PARTICLE_SIZE,
-        parse_space_particle_record,
+        layout.particle_size(),
+        |data, rec| parse_space_particle_record(data, rec, layout),
         "space particles",
     )?;
 
     let point_lights = if light_count == 0 {
         Vec::new()
     } else {
-        let need = light_count as usize * SPACE_POINT_LIGHT_SIZE;
+        let need = light_count as usize * layout.point_light_size();
         if lights_offset + need > file_data.len() {
             return Err(Report::new(MergedModelsError::DataTooShort {
                 offset: lights_offset,
@@ -624,9 +799,11 @@ pub fn parse_space_instances(file_data: &[u8]) -> Result<SpaceInstances, Report<
             }));
         }
         let input = &mut &file_data[lights_offset..];
-        winnow::combinator::repeat(light_count as usize, parse_space_point_light_entry).parse_next(input).map_err(
-            |e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("space point lights: {e}"))),
-        )?
+        winnow::combinator::repeat(light_count as usize, |i: &mut &[u8]| parse_space_point_light_entry(i, layout))
+            .parse_next(input)
+            .map_err(|e: ErrMode<ContextError>| {
+                Report::new(MergedModelsError::ParseError(format!("space point lights: {e}")))
+            })?
     };
 
     let probes = parse_space_record_array(
@@ -652,11 +829,12 @@ pub fn parse_space_instances(file_data: &[u8]) -> Result<SpaceInstances, Report<
         user_objects_offset,
         user_object_count as usize,
         SPACE_USER_OBJECT_SIZE,
-        parse_space_user_object_record,
+        |data, rec| parse_space_user_object_record(data, rec, layout),
         "space user objects",
     )?;
 
     Ok(SpaceInstances {
+        layout,
         instances,
         obstacles,
         particles,
@@ -672,7 +850,7 @@ fn parse_space_record_array<T>(
     offset: usize,
     count: usize,
     stride: usize,
-    parser: fn(&[u8], usize) -> Result<T, Report<MergedModelsError>>,
+    parser: impl Fn(&[u8], usize) -> Result<T, Report<MergedModelsError>>,
     label: &str,
 ) -> Result<Vec<T>, Report<MergedModelsError>> {
     if count == 0 {
@@ -750,18 +928,24 @@ fn parse_space_obstacle_record(
     })
 }
 
+// Particle record: matrix, [V1 only: 16-byte GUID blob], u64 resourceId,
+// u32 intensity count, u32 pad, i64 intensity relptr (record-relative).
+// V1 stride 0x68, V2 stride 0x58.
 fn parse_space_particle_record(
     file_data: &[u8],
     rec_base: usize,
+    layout: SpaceLayout,
 ) -> Result<SpaceParticle, Report<MergedModelsError>> {
-    let input = &mut &file_data[rec_base..rec_base + SPACE_PARTICLE_SIZE];
+    let input = &mut &file_data[rec_base..rec_base + layout.particle_size()];
     let transform = parser_utils::parse_matrix4x4(input)
         .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("matrix: {e}"))))?;
-    let guid_bytes: &[u8] = take(16usize)
-        .parse_next(input)
-        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("guid blob: {e}"))))?;
     let mut raw_guid_blob = [0u8; 16];
-    raw_guid_blob.copy_from_slice(guid_bytes);
+    if layout == SpaceLayout::V1 {
+        let guid_bytes: &[u8] = take(16usize).parse_next(input).map_err(|e: ErrMode<ContextError>| {
+            Report::new(MergedModelsError::ParseError(format!("guid blob: {e}")))
+        })?;
+        raw_guid_blob.copy_from_slice(guid_bytes);
+    }
     let resource_id = le_u64
         .parse_next(input)
         .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("resource id: {e}"))))?;
@@ -909,33 +1093,31 @@ fn read_static_decal_texture_paths(file_data: &[u8], rec_base: usize, texture_bl
     paths
 }
 
+// User object record (0x70 in both layouts): matrix + three string
+// descriptors {u64 len, i64 relptr from the descriptor's own address}.
+// V1 order: guid, type, properties. V2 order: type, properties, guid.
 fn parse_space_user_object_record(
     file_data: &[u8],
     rec_base: usize,
+    layout: SpaceLayout,
 ) -> Result<SpaceUserObject, Report<MergedModelsError>> {
     let input = &mut &file_data[rec_base..rec_base + SPACE_USER_OBJECT_SIZE];
     let transform = parser_utils::parse_matrix4x4(input)
         .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("matrix: {e}"))))?;
-    let guid_len = le_u64
-        .parse_next(input)
-        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("guid len: {e}"))))?;
-    let guid_relptr = le_i64
-        .parse_next(input)
-        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("guid relptr: {e}"))))?;
-    let type_len = le_u64
-        .parse_next(input)
-        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("type len: {e}"))))?;
-    let type_relptr = le_i64
-        .parse_next(input)
-        .map_err(|e: ErrMode<ContextError>| Report::new(MergedModelsError::ParseError(format!("type relptr: {e}"))))?;
-    let properties_len = le_u64.parse_next(input).map_err(|e: ErrMode<ContextError>| {
-        Report::new(MergedModelsError::ParseError(format!("properties len: {e}")))
-    })?;
-    let properties_relptr = le_i64.parse_next(input).map_err(|e: ErrMode<ContextError>| {
-        Report::new(MergedModelsError::ParseError(format!("properties relptr: {e}")))
-    })?;
+    let (guid_desc, type_desc, properties_desc) = match layout {
+        SpaceLayout::V1 => (rec_base + 0x40, rec_base + 0x50, rec_base + 0x60),
+        SpaceLayout::V2 => (rec_base + 0x60, rec_base + 0x40, rec_base + 0x50),
+    };
+    let descriptor = |base: usize| -> (u64, i64) {
+        let len = u64::from_le_bytes(file_data[base..base + 8].try_into().unwrap());
+        let relptr = i64::from_le_bytes(file_data[base + 8..base + 0x10].try_into().unwrap());
+        (len, relptr)
+    };
+    let (guid_len, guid_relptr) = descriptor(guid_desc);
+    let (type_len, type_relptr) = descriptor(type_desc);
+    let (properties_len, properties_relptr) = descriptor(properties_desc);
 
-    let properties_xml = read_string_descriptor(file_data, rec_base + 0x60, properties_len, properties_relptr);
+    let properties_xml = read_string_descriptor(file_data, properties_desc, properties_len, properties_relptr);
     let (properties_well_formed, property_tags, property_values) = properties_xml
         .as_deref()
         .map(parse_user_object_properties)
@@ -944,8 +1126,8 @@ fn parse_space_user_object_record(
     Ok(SpaceUserObject {
         position: matrix_position(&transform),
         transform,
-        guid: read_string_descriptor(file_data, rec_base + 0x40, guid_len, guid_relptr),
-        object_type: read_string_descriptor(file_data, rec_base + 0x50, type_len, type_relptr),
+        guid: read_string_descriptor(file_data, guid_desc, guid_len, guid_relptr),
+        object_type: read_string_descriptor(file_data, type_desc, type_len, type_relptr),
         properties_xml,
         properties_well_formed,
         property_tags,
@@ -991,7 +1173,7 @@ fn walk_user_object_xml(
     path.pop();
 }
 
-// PointLightInstance layout (0xc0 stride). Cursor offsets are checked
+// PointLightInstance layout, V1 (0xc0 stride). Cursor offsets are checked
 // against the reflection registrations in FUN_140899190 / FUN_140712390.
 //
 //   +0x00  Matrix4x4  transform     (16 f32, 4×4 column-major like ModelInstance)
@@ -1004,11 +1186,16 @@ fn walk_user_object_xml(
 //   +0xb4  u32        minQuality
 //   +0xb8  2 bytes    animatedColor / animatedRadius (bools, skip)
 //   +0xba  6 bytes    padding to 0xc0
-fn parse_space_point_light_entry(input: &mut &[u8]) -> WResult<SpacePointLight> {
+//
+// V2 (0xb0 stride) drops the 16-byte block before colorAnimation; every
+// later field moves up 0x10 (byte-matched against V1 on every space).
+fn parse_space_point_light_entry(input: &mut &[u8], layout: SpaceLayout) -> WResult<SpacePointLight> {
     let transform = parser_utils::parse_matrix4x4(input)?;
-    let _ = take(16usize).parse_next(input)?; // +0x40 array desc (opaque)
-    let _ = take(32usize).parse_next(input)?; // +0x50 colorAnimation
-    let _ = take(32usize).parse_next(input)?; // +0x70 radiusAnimation
+    if layout == SpaceLayout::V1 {
+        let _ = take(16usize).parse_next(input)?; // +0x40 array desc (opaque)
+    }
+    let _ = take(32usize).parse_next(input)?; // colorAnimation
+    let _ = take(32usize).parse_next(input)?; // radiusAnimation
     let cr = le_f32.parse_next(input)?;
     let cg = le_f32.parse_next(input)?;
     let cb = le_f32.parse_next(input)?;
@@ -1442,7 +1629,7 @@ mod tests {
     #[test]
     fn parses_model_dyes_relative_to_model_instance_base() {
         let model_offset = SPACE_HEADER_SIZE;
-        let rec1 = model_offset + SPACE_INSTANCE_SIZE;
+        let rec1 = model_offset + SpaceLayout::V1.instance_size();
         let dye_offset = 0x160usize;
         let old_wrong_offset = dye_offset + 0x60;
 
@@ -1460,7 +1647,7 @@ mod tests {
         put_u32(&mut data, old_wrong_offset, 0x1111_1111);
         put_u32(&mut data, old_wrong_offset + 4, 0x2222_2222);
 
-        let parsed = parse_space_instances(&data).expect("space instances");
+        let parsed = parse_space_instances_with_layout(&data, SpaceLayout::V1).expect("space instances");
         let dye = parsed.instances[1].model_dyes[0];
         assert_eq!(dye.matter_id, 0x46f1_b231);
         assert_eq!(dye.replaces_id, 0x955d_be29);
@@ -1482,7 +1669,7 @@ mod tests {
         put_u64(&mut data, rec0 + 0x50, 0x1234_5678_90ab_cdef);
         data[guid_offset..guid_offset + guid.len()].copy_from_slice(guid);
 
-        let parsed = parse_space_instances(&data).expect("space instances");
+        let parsed = parse_space_instances_with_layout(&data, SpaceLayout::V1).expect("space instances");
         assert_eq!(
             parsed.instances[0].stable_guid.as_deref(),
             Some("2E8F86C7.4B8A6236.75A3978F.4D162DE3")
@@ -1492,7 +1679,7 @@ mod tests {
     #[test]
     fn parses_material_instances_relative_to_model_instance_base() {
         let model_offset = SPACE_HEADER_SIZE;
-        let rec1 = model_offset + SPACE_INSTANCE_SIZE;
+        let rec1 = model_offset + SpaceLayout::V1.instance_size();
         let material_offset = 0x180usize;
 
         let mut data = vec![0u8; 0x210];
@@ -1515,7 +1702,7 @@ mod tests {
         put_u16(&mut data, material_offset + 0x74, 3);
         put_f32(&mut data, material_offset + 0x78, 0.5);
 
-        let parsed = parse_space_instances(&data).expect("space instances");
+        let parsed = parse_space_instances_with_layout(&data, SpaceLayout::V1).expect("space instances");
         let material = &parsed.instances[1].material_instances[0];
         assert_eq!(material.shader_id, 0x700);
         assert_eq!(material.material_hash, 0x6a79c245);
@@ -1563,7 +1750,7 @@ mod tests {
     fn parses_particle_intensities_relative_to_record_base() {
         let particle_offset = SPACE_HEADER_SIZE;
         let rec = particle_offset;
-        let intensity_offset = particle_offset + SPACE_PARTICLE_SIZE;
+        let intensity_offset = particle_offset + SpaceLayout::V1.particle_size();
         let old_wrong_offset = intensity_offset + 0x60;
         let mut data = vec![0u8; old_wrong_offset + 24];
 
@@ -1587,7 +1774,7 @@ mod tests {
             put_f32(&mut data, old_wrong_offset + idx * 4, 99.0);
         }
 
-        let parsed = parse_space_instances(&data).expect("space instances");
+        let parsed = parse_space_instances_with_layout(&data, SpaceLayout::V1).expect("space instances");
         let particle = &parsed.particles[0];
         assert_eq!(particle.position, [-741.305, 13.294, -172.677]);
         assert_eq!(particle.raw_guid_blob, [0xAB; 16]);
@@ -1599,13 +1786,13 @@ mod tests {
     fn parses_particle_with_zero_intensity_count() {
         let particle_offset = SPACE_HEADER_SIZE;
         let rec = particle_offset;
-        let mut data = vec![0u8; particle_offset + SPACE_PARTICLE_SIZE];
+        let mut data = vec![0u8; particle_offset + SpaceLayout::V1.particle_size()];
 
         put_u32(&mut data, 0x08, 1);
         put_i64(&mut data, 0x30, particle_offset as i64);
         put_u64(&mut data, rec + 0x50, 0x0fed_cba9_8765_4321);
 
-        let parsed = parse_space_instances(&data).expect("space instances");
+        let parsed = parse_space_instances_with_layout(&data, SpaceLayout::V1).expect("space instances");
         let particle = &parsed.particles[0];
         assert_eq!(particle.resource_id, 0x0fed_cba9_8765_4321);
         assert_eq!(particle.intensity_count, 0);
@@ -1765,7 +1952,7 @@ mod tests {
         data[type_offset..type_offset + object_type.len()].copy_from_slice(object_type);
         data[properties_offset..properties_offset + properties.len()].copy_from_slice(properties);
 
-        let parsed = parse_space_instances(&data).expect("space instances");
+        let parsed = parse_space_instances_with_layout(&data, SpaceLayout::V1).expect("space instances");
         let object = &parsed.user_objects[0];
         assert_eq!(object.guid.as_deref(), Some("D03F81A8.4506DA63.2999C39B.9EB68E8D"));
         assert_eq!(object.object_type.as_deref(), Some("WayPoint"));
@@ -1776,6 +1963,136 @@ mod tests {
         assert_eq!(object.property_values[0].path, "next.item.guid");
         assert_eq!(object.property_values[1].path, "next.item.chunkId");
         assert_eq!(object.property_values[2].path, "speed");
+    }
+
+    fn put_identity(data: &mut [u8], rec: usize, translation: [f32; 3]) {
+        put_f32(data, rec, 1.0);
+        put_f32(data, rec + 0x14, 1.0);
+        put_f32(data, rec + 0x28, 1.0);
+        put_f32(data, rec + 0x3c, 1.0);
+        put_f32(data, rec + 0x30, translation[0]);
+        put_f32(data, rec + 0x34, translation[1]);
+        put_f32(data, rec + 0x38, translation[2]);
+    }
+
+    /// Two V2 model records (0xb0 stride): resourceId at +0x40, flags at
+    /// +0x48, dyes relptr at +0x50 (record-relative), no stable GUID.
+    fn v2_two_model_space() -> (Vec<u8>, usize) {
+        let rec0 = SPACE_HEADER_SIZE;
+        let rec1 = rec0 + SpaceLayout::V2.instance_size();
+        let dye_offset = rec1 + SpaceLayout::V2.instance_size();
+        let mut data = vec![0u8; dye_offset + 8];
+        put_u32(&mut data, 0x00, 2);
+        put_i64(&mut data, 0x20, rec0 as i64);
+        for (rec, x) in [(rec0, -24.661f32), (rec1, -10.026)] {
+            put_identity(&mut data, rec, [x, 6.842, 5.777]);
+            put_u64(&mut data, rec + 0x40, 0xceab_b910_ac94_e226);
+            data[rec + 0x48] = 1; // isLandscape
+            data[rec + 0x4b] = 4; // minimumQualityLevel
+        }
+        data[rec1 + 0x49] = 1; // modelDyesCount
+        put_i64(&mut data, rec1 + 0x50, dye_offset as i64 - rec1 as i64);
+        put_u32(&mut data, dye_offset, 0x46f1_b231);
+        put_u32(&mut data, dye_offset + 4, 0x955d_be29);
+        // A non-empty child-array descriptor must not disturb the parse.
+        put_u64(&mut data, rec0 + 0x90, 1);
+        put_i64(&mut data, rec0 + 0x98, 0x40);
+        (data, rec1)
+    }
+
+    #[test]
+    fn detects_and_parses_v2_model_instances() {
+        let (data, _) = v2_two_model_space();
+        assert_eq!(detect_space_layout(&data).unwrap(), SpaceLayout::V2);
+        let parsed = parse_space_instances(&data).expect("space instances");
+        assert_eq!(parsed.layout, SpaceLayout::V2);
+        assert_eq!(parsed.instances.len(), 2);
+        for inst in &parsed.instances {
+            assert_eq!(inst.path_id, 0xceab_b910_ac94_e226);
+            assert!(inst.is_landscape);
+            assert_eq!(inst.min_quality_level, 4);
+            assert!(inst.stable_guid.is_none());
+            assert_eq!(inst.transform.0[15], 1.0);
+        }
+        assert_eq!(parsed.instances[1].transform.0[12], -10.026);
+        assert_eq!(parsed.instances[1].model_dyes[0].matter_id, 0x46f1_b231);
+        assert_eq!(parsed.instances[1].model_dyes[0].replaces_id, 0x955d_be29);
+    }
+
+    #[test]
+    fn detects_v1_model_instances() {
+        let rec0 = SPACE_HEADER_SIZE;
+        let rec1 = rec0 + SpaceLayout::V1.instance_size();
+        let mut data = vec![0u8; rec1 + SpaceLayout::V1.instance_size()];
+        put_u32(&mut data, 0x00, 2);
+        put_i64(&mut data, 0x20, rec0 as i64);
+        for rec in [rec0, rec1] {
+            put_identity(&mut data, rec, [1.0, 2.0, 3.0]);
+            put_u64(&mut data, rec + 0x50, 0xceab_b910_ac94_e226);
+            data[rec + 0x5b] = 4;
+        }
+        assert_eq!(detect_space_layout(&data).unwrap(), SpaceLayout::V1);
+        let parsed = parse_space_instances(&data).expect("space instances");
+        assert_eq!(parsed.instances[1].path_id, 0xceab_b910_ac94_e226);
+        assert_eq!(parsed.instances[1].transform.0[15], 1.0);
+    }
+
+    #[test]
+    fn parses_v2_particle_light_and_user_object_records() {
+        let particles = SPACE_HEADER_SIZE;
+        let intensities = particles + SpaceLayout::V2.particle_size();
+        let lights = intensities + 8;
+        let objects = lights + SpaceLayout::V2.point_light_size();
+        let type_offset = objects + SPACE_USER_OBJECT_SIZE;
+        let guid_offset = type_offset + 0x10;
+        let object_type = b"Barge\0";
+        let guid = b"044f5d13.4fceff63.9757718b.b8fdf956\0";
+        let mut data = vec![0u8; guid_offset + guid.len()];
+        put_u32(&mut data, 0x08, 1);
+        put_i64(&mut data, 0x30, particles as i64);
+        put_u32(&mut data, 0x0c, 1);
+        put_i64(&mut data, 0x38, lights as i64);
+        put_u32(&mut data, 0x18, 1);
+        put_i64(&mut data, 0x50, objects as i64);
+
+        put_identity(&mut data, particles, [-741.305, 13.294, -172.677]);
+        put_u64(&mut data, particles + 0x40, 0x1b36_257b_0c1f_29f6);
+        put_u32(&mut data, particles + 0x48, 2);
+        put_i64(&mut data, particles + 0x50, (intensities - particles) as i64);
+        put_f32(&mut data, intensities, 0.25);
+        put_f32(&mut data, intensities + 4, 1.5);
+
+        put_identity(&mut data, lights, [10.0, 0.0, 0.0]);
+        put_f32(&mut data, lights + 0x80, 2.633);
+        put_f32(&mut data, lights + 0x8c, 0.38);
+        put_f32(&mut data, lights + 0x94, 0.5); // localPosition.y
+        put_f32(&mut data, lights + 0xa0, 9.532);
+        put_u32(&mut data, lights + 0xa4, 2);
+
+        put_identity(&mut data, objects, [1.0, 2.0, 3.0]);
+        put_u64(&mut data, objects + 0x40, object_type.len() as u64);
+        put_i64(&mut data, objects + 0x48, type_offset as i64 - (objects + 0x40) as i64);
+        put_u64(&mut data, objects + 0x60, guid.len() as u64);
+        put_i64(&mut data, objects + 0x68, guid_offset as i64 - (objects + 0x60) as i64);
+        data[type_offset..type_offset + object_type.len()].copy_from_slice(object_type);
+        data[guid_offset..guid_offset + guid.len()].copy_from_slice(guid);
+
+        let parsed = parse_space_instances(&data).expect("space instances");
+        assert_eq!(parsed.layout, SpaceLayout::V2);
+        let particle = &parsed.particles[0];
+        assert_eq!(particle.resource_id, 0x1b36_257b_0c1f_29f6);
+        assert_eq!(particle.raw_guid_blob, [0; 16]);
+        assert_eq!(particle.intensity_values, [0.25, 1.5]);
+        let light = &parsed.point_lights[0];
+        assert_eq!(light.color[0], 2.633);
+        assert_eq!(light.color[3], 0.38);
+        assert_eq!(light.radius, 9.532);
+        assert_eq!(light.min_quality, 2);
+        assert_eq!(light.world_position, [10.0, 0.5, 0.0]);
+        let object = &parsed.user_objects[0];
+        assert_eq!(object.object_type.as_deref(), Some("Barge"));
+        assert_eq!(object.guid.as_deref(), Some("044f5d13.4fceff63.9757718b.b8fdf956"));
+        assert!(object.properties_xml.is_none());
     }
 
     #[test]
@@ -1797,7 +2114,7 @@ mod tests {
         data[type_offset..type_offset + object_type.len()].copy_from_slice(object_type);
         data[properties_offset..properties_offset + properties.len()].copy_from_slice(properties);
 
-        let parsed = parse_space_instances(&data).expect("space instances");
+        let parsed = parse_space_instances_with_layout(&data, SpaceLayout::V1).expect("space instances");
         let object = &parsed.user_objects[0];
         assert_eq!(object.object_type.as_deref(), Some("Barge"));
         assert_eq!(object.properties_xml.as_deref(), Some("<properties><bad></properties>"));

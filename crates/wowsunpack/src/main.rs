@@ -3124,7 +3124,7 @@ fn run_export_map(
     let space = match read_file_data(&space_bin_path, no_vfs, vfs) {
         Ok(data) => match merged_models::parse_space_instances(&data) {
             Ok(s) => {
-                println!("  {} instances", s.instances.len());
+                println!("  {} instances (space.bin layout {})", s.instances.len(), s.layout.label());
                 Some(s)
             }
             Err(e) => {
