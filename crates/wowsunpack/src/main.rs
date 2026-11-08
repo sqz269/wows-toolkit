@@ -590,11 +590,13 @@ enum Commands {
         /// Write the parsed ArmorMap + per-zone aggregation to the given JSON
         /// file (in addition to the human-readable stdout summary). Shape:
         ///   { ship, materials_table: { "<mat_id>": { thickness_mm, layers,
-        ///     zones } }, zones: { "<zone>": { default_thickness_mm,
-        ///     max_thickness_mm, plate_count } }, hidden_zones: [...] }.
+        ///     layer_thickness_mm: { "<layer>": mm }, zones } },
+        ///     zones: { "<zone>": { default_thickness_mm, max_thickness_mm,
+        ///     plate_count } }, hidden_zones: [...] }.
         ///
-        /// Consumed by the Unity sidecar builder to populate
-        /// `armor.materials_table` + `armor.zones`.
+        /// A plate's thickness is `layer_thickness_mm[id >> 8]` of
+        /// `materials_table[id & 0xFF]`, where `id` is the armor mesh's
+        /// per-vertex `_MATERIAL_ID`; `thickness_mm` is the sum over layers.
         #[arg(long)]
         json: Option<PathBuf>,
     },
@@ -4468,20 +4470,25 @@ fn write_armor_materials_json(ctx: &wowsunpack::export::ship::ShipModelContext, 
     // not literal plate-count accuracy), track max + default (mode) thickness.
     #[derive(Default)]
     struct ZoneAccum {
-        /// (material_id → triangle count) for default-thickness mode.
-        mat_counts: std::collections::HashMap<u32, usize>,
-        /// max observed thickness (across layers summed per material).
+        /// ((material_id, layer_index) → triangle count) for default-thickness mode.
+        mat_counts: std::collections::HashMap<(u32, u32), usize>,
+        /// max observed per-triangle (own-layer) thickness.
         max_thickness_mm: f32,
         plate_count: usize,
     }
+    let armor_map = ctx.armor_map();
+    // A triangle's plate thickness is its own layer's value: each layer of a
+    // multi-layer material covers a different region of the hull, so the
+    // layers are never stacked on one triangle.
+    let layer_thickness = |mat_id: u32, layer: u32| -> f32 {
+        armor_map.and_then(|m| m.get(&mat_id)).and_then(|layers| layers.get(&layer)).copied().unwrap_or(0.0)
+    };
     let mut zones: std::collections::BTreeMap<String, ZoneAccum> = std::collections::BTreeMap::new();
     // Per-material: which zones it appears in.
     let mut mat_to_zones: std::collections::HashMap<u32, std::collections::BTreeSet<String>> =
         std::collections::HashMap::new();
-    // Per-material: union of (material_id, layer_index) pairs actually used by geometry.
+    // Material ids actually referenced by geometry.
     let mut mat_seen: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-
-    let armor_map = ctx.armor_map();
 
     let all_geom_bytes: Vec<&[u8]> = ctx.hull_geom_bytes().into_iter().chain(ctx.turret_geom_bytes()).collect();
     for geom_bytes in &all_geom_bytes {
@@ -4491,34 +4498,37 @@ fn write_armor_materials_json(ctx: &wowsunpack::export::ship::ShipModelContext, 
         for am in &geom.armor_models {
             for tri in &am.triangles {
                 let mat_id = tri.material_id as u32;
+                let layer = tri.layer_index as u32;
                 let mat_name = collision_material_name(tri.material_id);
                 let zone = zone_from_material_name(mat_name).to_string();
 
                 mat_seen.insert(mat_id);
                 mat_to_zones.entry(mat_id).or_default().insert(zone.clone());
 
-                // Total thickness = sum of all layers for this material id
-                // (geometry doesn't partition per-triangle by layer at this
-                // aggregation level; the per-vertex _MATERIAL_ID attribute is
-                // what gives runtime hit resolution its layer precision).
-                let total_thickness =
-                    armor_map.and_then(|m| m.get(&mat_id)).map(|layers| layers.values().sum::<f32>()).unwrap_or(0.0);
+                let thickness = layer_thickness(mat_id, layer);
 
                 let acc = zones.entry(zone).or_default();
                 acc.plate_count += 1;
-                *acc.mat_counts.entry(mat_id).or_insert(0) += 1;
-                if total_thickness > acc.max_thickness_mm {
-                    acc.max_thickness_mm = total_thickness;
+                *acc.mat_counts.entry((mat_id, layer)).or_insert(0) += 1;
+                if thickness > acc.max_thickness_mm {
+                    acc.max_thickness_mm = thickness;
                 }
             }
         }
     }
 
-    // --- materials_table: id → { thickness_mm, layers, zones }. ---
+    // --- materials_table: id → { thickness_mm, layers, layer_thickness_mm, zones }. ---
     //
     // Include every id the geometry actually references AND every id the
     // armor map carries (some materials may be unused in the current hull
     // but still part of the table, e.g. turret-scoped materials).
+    //
+    // `layer_thickness_mm` is the per-plate value: `{"<layer_index>": mm}`,
+    // keyed by the 1-based layer that the per-vertex `_MATERIAL_ID` packs as
+    // `(layer << 8) | material_id`. Zero-mm layers are kept so a lookup for
+    // such a plate yields 0 rather than falling back. `thickness_mm` (the sum
+    // of `layers`) and `layers` (values in ascending layer order) are kept for
+    // older readers; the sum is NOT the thickness of any one plate.
     let mut materials_table = serde_json::Map::new();
     let material_ids: std::collections::BTreeSet<u32> = {
         let mut set = mat_seen.clone();
@@ -4537,27 +4547,31 @@ fn write_armor_materials_json(ctx: &wowsunpack::export::ship::ShipModelContext, 
         // `layers.iter().sum()` on an empty iterator yields `-0.0`, which
         // serialises as "-0.0" — ugly for sidecar diffs. Collapse to +0.0.
         let thickness_mm: f32 = if layers.is_empty() { 0.0 } else { layers.iter().sum() };
+        let layer_thickness_mm: serde_json::Map<String, serde_json::Value> = armor_map
+            .and_then(|m| m.get(mat_id))
+            .map(|layers_map| layers_map.iter().map(|(layer, &mm)| (layer.to_string(), json!(mm))).collect())
+            .unwrap_or_default();
         let zones_list: Vec<String> = mat_to_zones.get(mat_id).map(|s| s.iter().cloned().collect()).unwrap_or_default();
 
         materials_table.insert(
             mat_id.to_string(),
             json!({
-                "thickness_mm": thickness_mm,
-                "layers":       layers,
-                "zones":        zones_list,
+                "thickness_mm":       thickness_mm,
+                "layers":             layers,
+                "layer_thickness_mm": layer_thickness_mm,
+                "zones":              zones_list,
             }),
         );
     }
 
-    // --- zones: default_thickness_mm (mode over triangles weighted by mat
+    // --- zones: default_thickness_mm (mode over triangles of their own-layer
     // thickness), max_thickness_mm, plate_count. ---
     let mut zones_out = serde_json::Map::new();
     for (zone, acc) in &zones {
         // "default" thickness = the thickness most common across the zone's
-        // triangles, with each triangle voting once for its material's total
-        // thickness. Several materials may share the same total thickness
-        // (e.g. Yamato's SteeringGear uses three different mats that all
-        // total 640 mm); their triangle counts add together so the dominant
+        // triangles, with each triangle voting once for its own layer's
+        // thickness. Several (material, layer) plates may share the same
+        // thickness; their triangle counts add together so the dominant
         // thickness wins regardless of how WG split the material slots.
         //
         // Tiebreak: when two thicknesses have the same triangle count, pick
@@ -4573,11 +4587,10 @@ fn write_armor_materials_json(ctx: &wowsunpack::export::ship::ShipModelContext, 
         // is well-defined; thickness is always positive finite mm so this is
         // safe and round-trip exact for the values we ever see.
         let mut by_thickness: std::collections::HashMap<u32, (f32, usize)> = std::collections::HashMap::new();
-        for (&mat_id, &count) in &acc.mat_counts {
-            let total =
-                armor_map.and_then(|m| m.get(&mat_id)).map(|layers| layers.values().sum::<f32>()).unwrap_or(0.0);
-            let key = (total * 1000.0).round() as u32;
-            let entry = by_thickness.entry(key).or_insert((total, 0));
+        for (&(mat_id, layer), &count) in &acc.mat_counts {
+            let thickness = layer_thickness(mat_id, layer);
+            let key = (thickness * 1000.0).round() as u32;
+            let entry = by_thickness.entry(key).or_insert((thickness, 0));
             entry.1 += count;
         }
         let default_thickness_mm = by_thickness

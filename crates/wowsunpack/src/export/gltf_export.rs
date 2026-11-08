@@ -297,11 +297,13 @@ pub fn export_glb(
     // Armor: emit the geometry's embedded armor model(s) as an "Armor" group,
     // mirroring `export_ship_glb`. Only guns/turrets carry armor models, so
     // this is a no-op for the ~80% of accessories that ship without one. The
-    // per-vertex `_MATERIAL_ID` is intrinsic to the model; we pass no thickness
-    // map (a single model has no ship/mount context), so COLOR_0 stays neutral
-    // and consumers resolve thickness from the ship sidecar's per-mount armor
-    // table keyed by material_id. Lets a turret GLB carry its own armor so a
-    // consumer can parent it to the yaw bone and have it rotate with the mount.
+    // per-vertex `_MATERIAL_ID` (`(layer << 8) | material_id`) is intrinsic to
+    // the model; we pass no thickness map (a single model has no ship/mount
+    // context, and mounts sharing a model differ in thickness), so COLOR_0
+    // stays neutral and consumers resolve thickness from the ship's per-mount
+    // armor table under GameParams key `((id >> 8) << 16) | (id & 0xFF)`. Lets
+    // a turret GLB carry its own armor so a consumer can parent it to the yaw
+    // bone and have it rotate with the mount.
     let mut armor_nodes: Vec<json::Index<json::Node>> = Vec::new();
     for am in &geometry.armor_models {
         for sub in armor_sub_models_by_zone(am, None, None) {
@@ -5644,12 +5646,13 @@ fn add_armor_primitive_to_root(
     // --- _MATERIAL_ID (custom user-defined attribute, u16 scalar) ---
     //
     // Emitted as a glTF 2.0 custom vertex attribute (leading `_` per spec)
-    // so Unity can resolve `RaycastHit.triangleIndex → material_id →
-    // sidecar.armor.materials_table[material_id].thickness_mm` at raycast
+    // so a consumer can resolve hit triangle → plate → thickness at hit
     // time. Blender's glTF importer preserves this as a named attribute
-    // layer. Value range is u8 natively (from `ArmorTriangle.material_id`);
-    // stored as u16 to leave headroom for a future packed `(layer << 8) |
-    // material_id` encoding without a schema break.
+    // layer. Armor-BVH triangles store `(layer_index << 8) | material_id`
+    // (see `ArmorTriangle::packed_material_id`): `id & 0xFF` is the collision
+    // material, `id >> 8` the 1-based layer, and the plate's thickness is the
+    // armor table's value for that (material, layer) pair. A layer of 0 means
+    // no layer was recorded (older exports, collision-derived building armor).
     if !armor.material_ids.is_empty() {
         // Buffer view stride must be multiple-of-4 for u16, but glTF allows
         // tightly-packed scalars. We pad the view length, not the stride.
@@ -5893,12 +5896,14 @@ pub struct ArmorTriangleInfo {
     pub material_name: String,
     /// Zone classification (e.g. "Citadel", "Bow", "Superstructure").
     pub zone: String,
-    /// Total armor thickness in millimeters (sum of all layers).
+    /// This triangle's plate thickness in millimeters: the value for its own
+    /// `(material_id, model_index)` layer, not the sum of the material's layers.
     pub thickness_mm: f32,
-    /// Per-layer thicknesses in mm, ordered by model_index.
-    /// Single-layer materials have one entry; `Dual_*` materials have two or more.
+    /// Non-zero thicknesses of all the material's layers in mm, ordered by
+    /// model_index. Each layer covers a different part of the model.
+    /// Single-layer materials have one entry.
     pub layers: Vec<f32>,
-    /// RGBA color [0.0–1.0] encoding the total thickness via the game's color scale.
+    /// RGBA color [0.0–1.0] encoding `thickness_mm` via the game's color scale.
     pub color: [f32; 4],
     /// Whether the in-game armor viewer hides this plate. Plates in the "Hull"
     /// parent zone (generic materials like `Trans`, `Deck`, `Belt`) are never
@@ -6038,13 +6043,15 @@ pub struct ArmorSubModel {
     /// Per-vertex RGBA color encoding armor thickness.
     /// All 3 vertices of a triangle share the same color.
     pub colors: Vec<[f32; 4]>,
-    /// Per-vertex collision material ID, zero-extended to u16.
+    /// Per-vertex packed plate id. All 3 vertices of a triangle share it.
     ///
-    /// All 3 vertices of a triangle share the same id. Emitted as the glTF
-    /// custom attribute `_MATERIAL_ID` so Unity can resolve
-    /// `RaycastHit.triangleIndex → material_id → sidecar.armor.materials_table`
-    /// for per-plate thickness at hit resolution. u16 leaves headroom for a
-    /// future packed `(layer_index << 8) | material_id` encoding.
+    /// Armor-BVH triangles store `(layer_index << 8) | material_id` (see
+    /// [`crate::models::geometry::pack_armor_material_id`]), so a consumer can
+    /// look up the triangle's own layer thickness: `materials_table[id & 0xFF]
+    /// .layer_thickness_mm[id >> 8]` for hull armor, or GameParams key
+    /// `((id >> 8) << 16) | (id & 0xFF)` in a mount's armor table. Emitted as
+    /// the glTF custom attribute `_MATERIAL_ID`. Collision-derived building
+    /// armor stores the bare material id (layer 0).
     pub material_ids: Vec<u16>,
     /// Optional world-space transform (column-major 4x4).
     /// Used for turret armor instances positioned at mount points.
@@ -6073,7 +6080,7 @@ impl ArmorSubModel {
             let layer = tri.layer_index as u32;
             let thickness_mm = lookup_thickness(mat_id, layer, mount_armor, armor_map);
             let color = thickness_to_color(thickness_mm);
-            let mat_id_u16 = tri.material_id as u16;
+            let mat_id_u16 = tri.packed_material_id();
 
             // Negate Z for left→right-handed conversion.
             for v in 0..3 {
@@ -6110,7 +6117,8 @@ impl ArmorSubModel {
 /// Returns `(armor, hitboxes)`:
 /// - `armor`: ONE merged `Armor_Hull` sub-model; per-vertex `_MATERIAL_ID` =
 ///   `field_30 & 0xFFFF` — the id space a consumer's `armor.materials_table`
-///   must be keyed by (GameParams keys folded with the same mask).
+///   must be keyed by (GameParams keys folded with the same mask). Unlike
+///   armor-BVH sub-models the layer is NOT packed in (it reads as layer 0).
 /// - `hitboxes`: one plain mesh per collision object (`CM_SB_Hull_<i>`), no
 ///   colors / material ids — consumers wrap them as convex trigger volumes.
 ///
@@ -6933,10 +6941,11 @@ pub fn collision_material_name(id: u8) -> &'static str {
 
 /// Split an armor model into per-zone `ArmorSubModel`s for selective visibility in Blender.
 ///
-/// Each triangle is classified by its collision material ID, which determines both:
-/// - The armor thickness (looked up from the GameParams armor dict)
+/// Each triangle is classified by its collision material ID and layer, which determine:
+/// - The armor thickness (GameParams value for the triangle's own `(layer, material)`)
 /// - The zone name (derived from the material name pattern)
 ///
+/// Every vertex carries the packed `(layer << 8) | material_id` (`_MATERIAL_ID`).
 /// Triangles are grouped into one mesh per zone for easy toggling in Blender.
 pub fn armor_sub_models_by_zone(
     armor: &crate::models::geometry::ArmorModel,
@@ -6971,7 +6980,9 @@ pub fn armor_sub_models_by_zone(
             let mut material_ids = Vec::with_capacity(vert_count);
 
             for (vi, (tri, color)) in tris.iter().enumerate() {
-                let mat_id_u16 = tri.material_id as u16;
+                // `(layer << 8) | material_id`: each layer of a material
+                // covers a different region with its own thickness.
+                let mat_id_u16 = tri.packed_material_id();
                 for v in 0..3 {
                     // Negate Z: converts left-handed (BigWorld) to right-handed
                     // (glTF) so these triangles land in the same frame as the
@@ -7485,4 +7496,57 @@ pub fn export_ship_glb(
     glb.to_writer(writer).map_err(|e| Report::new(ExportError::Io(e.to_string())))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod armor_layer_tests {
+    use super::*;
+    use crate::models::geometry::ArmorModel;
+    use crate::models::geometry::ArmorTriangle;
+
+    fn tri(material_id: u8, layer_index: u8, z: f32) -> ArmorTriangle {
+        ArmorTriangle {
+            vertices: [[0.0, 0.0, z], [1.0, 0.0, z], [0.0, 1.0, z]],
+            normals: [[0.0, 0.0, 1.0]; 3],
+            material_id,
+            layer_index,
+        }
+    }
+
+    /// Two layers of one material (`Cit_Belt`, 61) covering different regions,
+    /// 410 mm and 0 mm: each triangle keeps its own layer id and thickness.
+    #[test]
+    fn zone_sub_models_pack_layer_and_use_per_layer_thickness() {
+        let model = ArmorModel { name: "test".to_string(), triangles: vec![tri(61, 1, 0.0), tri(61, 2, 1.0)] };
+        let mut armor_map: ArmorMap = ArmorMap::new();
+        armor_map.insert(61, [(1, 410.0), (2, 0.0)].into_iter().collect());
+
+        let subs = armor_sub_models_by_zone(&model, Some(&armor_map), None);
+        assert_eq!(subs.len(), 1);
+        let sub = &subs[0];
+        assert_eq!(sub.material_ids.len(), 6);
+        assert!(sub.material_ids[..3].iter().all(|&id| id == (1 << 8) | 61));
+        assert!(sub.material_ids[3..].iter().all(|&id| id == (2 << 8) | 61));
+        assert_eq!(sub.colors[0], thickness_to_color(410.0));
+        // The 0 mm layer must not inherit the other layer (or the summed) thickness.
+        assert_eq!(sub.colors[3], thickness_to_color(0.0));
+    }
+
+    /// Mount armor resolves per layer before falling back to the hull map.
+    #[test]
+    fn mount_armor_lookup_is_per_layer() {
+        let model = ArmorModel { name: "turret".to_string(), triangles: vec![tri(33, 1, 0.0), tri(33, 4, 1.0)] };
+        let mut mount: ArmorMap = ArmorMap::new();
+        mount.insert(33, [(1, 70.0), (2, 105.0), (3, 80.0), (4, 90.0)].into_iter().collect());
+
+        let sub = ArmorSubModel::from_armor_model(&model, None, Some(&mount));
+        assert_eq!(sub.material_ids[0], (1 << 8) | 33);
+        assert_eq!(sub.material_ids[3], (4 << 8) | 33);
+        assert_eq!(sub.colors[0], thickness_to_color(70.0));
+        assert_eq!(sub.colors[3], thickness_to_color(90.0));
+
+        let info = InteractiveArmorMesh::from_armor_model(&model, None, Some(&mount));
+        assert_eq!(info.triangle_info[0].thickness_mm, 70.0);
+        assert_eq!(info.triangle_info[1].thickness_mm, 90.0);
+    }
 }

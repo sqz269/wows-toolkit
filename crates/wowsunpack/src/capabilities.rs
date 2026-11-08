@@ -44,8 +44,10 @@ const BUILD_PROFILE: &str = env!("WOWS_TOOLKIT_BUILD_PROFILE");
 /// new feature flag instead.
 const CONTRACTS: &[(&str, u32)] = &[
     ("toolkit_capabilities", 1),
-    ("ship_export", 1),
-    ("model_export", 1),
+    // v2: armor-mesh `_MATERIAL_ID` packs `(layer_index << 8) | material_id`
+    // (was the bare material id); see `armor.layer_packed_material_id`.
+    ("ship_export", 2),
+    ("model_export", 2),
     ("placements_json", 1),
     ("skel_ext_candidates_json", 3),
     ("material_mappings_json", 1),
@@ -93,6 +95,10 @@ const FEATURES: &[&str] = &[
     // `game-params --entity-hashes <file>`: one build-stable hash per
     // top-level entity (`wowsunpack.gameparams_hashes/v2`).
     "game_params.entity_hashes",
+    // Armor-mesh `_MATERIAL_ID` = `(layer_index << 8) | material_id` (ship
+    // and accessory GLBs), and armor JSON `materials_table` entries carry
+    // `layer_thickness_mm` (`{"<layer>": mm}`) — one thickness per plate.
+    "armor.layer_packed_material_id",
 ];
 
 /// Schema identifiers emitted in toolkit JSON outputs. Keyed by contract
@@ -184,7 +190,7 @@ mod tests {
     fn contract_count_matches_spec() {
         let caps = build();
         assert_eq!(caps.contracts.len(), 11);
-        assert_eq!(caps.features.len(), 20);
+        assert_eq!(caps.features.len(), 21);
         assert_eq!(caps.schemas.len(), 10);
     }
 
@@ -193,6 +199,8 @@ mod tests {
         let caps = build();
         assert_eq!(caps.contracts.get("toolkit_capabilities").copied(), Some(1));
         assert_eq!(caps.contracts.get("skel_ext_candidates_json").copied(), Some(3));
+        assert_eq!(caps.contracts.get("ship_export").copied(), Some(2));
+        assert_eq!(caps.contracts.get("model_export").copied(), Some(2));
         assert_eq!(caps.schemas.get("skel_ext_candidates_json").copied(), Some("wowsunpack.skel_ext_candidates/v3"),);
     }
 

@@ -54,7 +54,36 @@ pub struct ArmorTriangle {
     /// Multi-layer armor materials have separate BVH node groups per layer,
     /// each covering different spatial regions. This maps directly to the
     /// `model_index` in GameParams armor keys: `(model_index << 16) | material_id`.
+    /// Each layer carries its own thickness, so a triangle's plate thickness is
+    /// the GameParams value for `(layer_index, material_id)`, never the sum of
+    /// the material's layers.
     pub layer_index: u8,
+}
+
+/// Bit position of the layer index inside a packed armor material id
+/// (see [`ArmorTriangle::packed_material_id`]).
+pub const ARMOR_MATERIAL_ID_LAYER_SHIFT: u32 = 8;
+
+/// Mask selecting the collision material id from a packed armor material id.
+pub const ARMOR_MATERIAL_ID_MASK: u16 = 0xFF;
+
+/// Pack a collision material id and its 1-based layer index into one u16:
+/// `(layer_index << 8) | material_id`.
+///
+/// Decode with `packed & 0xFF` (material id) and `packed >> 8` (layer index).
+/// The GameParams armor key for the same plate is
+/// `((packed >> 8) << 16) | (packed & 0xFF)`. A layer of 0 means no layer was
+/// recorded.
+pub fn pack_armor_material_id(material_id: u8, layer_index: u8) -> u16 {
+    ((layer_index as u16) << ARMOR_MATERIAL_ID_LAYER_SHIFT) | material_id as u16
+}
+
+impl ArmorTriangle {
+    /// This triangle's `(layer_index << 8) | material_id`. See
+    /// [`pack_armor_material_id`].
+    pub fn packed_material_id(&self) -> u16 {
+        pack_armor_material_id(self.material_id, self.layer_index)
+    }
 }
 
 /// A parsed armor model containing triangle geometry for hit detection.
@@ -901,6 +930,47 @@ mod tests {
 
     fn push_f32(data: &mut Vec<u8>, value: f32) {
         data.extend_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn packed_armor_material_id_round_trips() {
+        let tri = ArmorTriangle { vertices: [[0.0; 3]; 3], normals: [[0.0; 3]; 3], material_id: 61, layer_index: 3 };
+        let packed = tri.packed_material_id();
+        assert_eq!(packed, (3 << 8) | 61);
+        assert_eq!(packed & ARMOR_MATERIAL_ID_MASK, 61);
+        assert_eq!(packed >> ARMOR_MATERIAL_ID_LAYER_SHIFT, 3);
+        // Same plate as a GameParams armor key.
+        let gp_key = (((packed >> ARMOR_MATERIAL_ID_LAYER_SHIFT) as u32) << 16) | (packed & ARMOR_MATERIAL_ID_MASK) as u32;
+        assert_eq!(gp_key, (3 << 16) | 61);
+        // Extremes stay inside u16.
+        assert_eq!(pack_armor_material_id(255, 255), 0xFFFF);
+        assert_eq!(pack_armor_material_id(254, 0), 254);
+    }
+
+    #[test]
+    fn armor_bvh_node_header_carries_layer_per_node_group() {
+        // 2 global header entries, then two node groups of the same material
+        // (61) in layers 1 and 2, one triangle each.
+        let mut data = vec![0u8; 16 * 2];
+        for (layer, z) in [(1u32, 0.0f32), (2u32, 5.0f32)] {
+            let mut entry0 = vec![0u8; 16];
+            put_u32(&mut entry0, 0, (layer << 16) | 61);
+            data.extend_from_slice(&entry0);
+            let mut entry1 = vec![0u8; 16];
+            put_u32(&mut entry1, 12, 3);
+            data.extend_from_slice(&entry1);
+            for v in 0..3 {
+                push_f32(&mut data, v as f32);
+                push_f32(&mut data, 0.0);
+                push_f32(&mut data, z);
+                data.extend_from_slice(&[128, 255, 128, 0]);
+            }
+        }
+        let tris = parse_armor_data(&data).expect("armor data parses");
+        assert_eq!(tris.len(), 2);
+        assert_eq!((tris[0].material_id, tris[0].layer_index), (61, 1));
+        assert_eq!((tris[1].material_id, tris[1].layer_index), (61, 2));
+        assert_eq!(tris[1].packed_material_id(), (2 << 8) | 61);
     }
 
     #[test]
