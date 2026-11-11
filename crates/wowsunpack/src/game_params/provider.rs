@@ -605,8 +605,117 @@ fn parse_armor_dict(dict: &BTreeMap<HashableValue, Value>) -> ArmorMap {
     by_material
 }
 
-/// Extract mount points (HP_* entries with model paths) from a component dict.
-fn extract_mounts(ship_data: &BTreeMap<HashableValue, Value>, component_name: &str) -> Vec<MountPoint> {
+/// Build one [`MountPoint`] at `hp_name` from a GameParams mount dict.
+///
+/// `pitch_dead_zones_override` replaces the mount's own `pitchDeadZones`
+/// (a node-list mount takes them from its node's weapon-control-system
+/// record, see [`extract_mounts`]).
+fn mount_point_from_dict(
+    hp_name: String,
+    mount_inner: &BTreeMap<HashableValue, Value>,
+    pitch_dead_zones_override: Option<&Vec<[f32; 4]>>,
+) -> Option<MountPoint> {
+    let model_path = read_string(mount_inner, keys::MODEL)?;
+
+    // Extract per-mount armor map (turret shell thickness).
+    let mount_armor: Option<ArmorMap> =
+        mount_inner.get(&pk(keys::ARMOR)).and_then(|v| v.dict_or_object_dict()).map(|d| parse_armor_dict(&d.inner()));
+
+    // Extract mount species from typeinfo.species.
+    let species = mount_inner
+        .get(&pk("typeinfo"))
+        .and_then(|v| v.dict_or_object_dict())
+        .and_then(|d| read_string(&d.inner(), "species"))
+        .and_then(|s| MountSpecies::from_gp_str(&s));
+
+    // Extract pitchDeadZones: list of [yaw_min, yaw_max, pitch_min, pitch_max].
+    let pitch_dead_zones: Vec<[f32; 4]> = match pitch_dead_zones_override {
+        Some(pdz) => pdz.clone(),
+        None => parse_pitch_dead_zones(mount_inner),
+    };
+
+    // Extract `ammoList`: declared order of Projectile GameParam names
+    // this mount can fire. Empty for non-firing mounts (directors,
+    // radars, finders, etc.). Tuple in pickled data; tolerate List too.
+    let ammo_list: Vec<String> = mount_inner
+        .get(&pk(keys::AMMO_LIST))
+        .map(|val| {
+            let mut out = Vec::new();
+            let push = |item: &Value, out: &mut Vec<String>| {
+                if let Some(s) = item.string_ref() {
+                    out.push(s.inner().clone());
+                }
+            };
+            match val {
+                Value::Tuple(t) => t.inner().iter().for_each(|v| push(v, &mut out)),
+                Value::List(l) => l.inner().iter().for_each(|v| push(v, &mut out)),
+                _ => {}
+            }
+            out
+        })
+        .unwrap_or_default();
+
+    Some(MountPoint::with_armor(hp_name, model_path, mount_armor, species, pitch_dead_zones, ammo_list))
+}
+
+/// The hardpoint names of a node-list mount (`Gun_1.nodes = ["HP_GGM_1", …]`).
+/// Empty when the mount carries no `nodes` list.
+fn mount_node_list(mount_inner: &BTreeMap<HashableValue, Value>) -> Vec<String> {
+    let Some(val) = mount_inner.get(&pk("nodes")) else {
+        return Vec::new();
+    };
+    let names = |items: &[Value]| -> Vec<String> {
+        items.iter().filter_map(|v| v.string_ref().map(|s| s.inner().clone())).collect()
+    };
+    match val {
+        Value::List(l) => names(&l.inner()),
+        Value::Tuple(t) => names(t.inner()),
+        _ => Vec::new(),
+    }
+}
+
+/// Per-node `pitchDeadZones` from a weapon-control-system component
+/// (`ABC_WeaponControlSystem.{ArtilleryNodes,ATBANodes,TorpedoNodes,MissileNodes}
+/// .<HP_name>`), keyed by hardpoint name. The record holds the per-node
+/// placement data (`horizSector`, `vertSector`, `deadZone`,
+/// `pitchDeadZones`, `position`, `HitLocation*`) of the node-list mounts.
+fn wcs_node_pitch_dead_zones(
+    ship_data: &BTreeMap<HashableValue, Value>,
+    wcs_name: &str,
+) -> HashMap<String, Vec<[f32; 4]>> {
+    let mut out = HashMap::new();
+    let Some(wcs) = ship_data.get(&pk(wcs_name)).and_then(|v| v.dict_or_object_dict()) else {
+        return out;
+    };
+    for bucket in wcs.inner().values() {
+        let Some(bucket) = bucket.dict_or_object_dict() else {
+            continue;
+        };
+        for (node, data) in bucket.inner().iter() {
+            let (Some(node), Some(data)) = (node.string_ref(), data.dict_or_object_dict()) else {
+                continue;
+            };
+            out.entry(node.inner().clone()).or_insert_with(|| parse_pitch_dead_zones(&data.inner()));
+        }
+    }
+    out
+}
+
+/// Extract mount points (entries with model paths) from a component dict.
+///
+/// Two encodings exist:
+/// - `HP_*` keys: one mount per hull hardpoint, keyed by that hardpoint.
+/// - Node-list mounts (event ships such as `PXSC999_Siegfried_1510`): a
+///   non-`HP_` key (`Gun_1`) whose `nodes` list names every hardpoint the
+///   same gun sits on. Each listed node becomes its own mount, keyed by that
+///   node, carrying the mount's params; the node's per-node record in the
+///   weapon-control-system component (`wcs_pitch_dead_zones`) supplies its
+///   `pitchDeadZones`.
+fn extract_mounts(
+    ship_data: &BTreeMap<HashableValue, Value>,
+    component_name: &str,
+    wcs_pitch_dead_zones: &HashMap<String, Vec<[f32; 4]>>,
+) -> Vec<MountPoint> {
     let Some(comp_data) = ship_data.get(&pk(component_name)).and_then(|v| v.dict_or_object_dict()) else {
         return Vec::new();
     };
@@ -614,55 +723,115 @@ fn extract_mounts(ship_data: &BTreeMap<HashableValue, Value>, component_name: &s
     comp_data
         .inner()
         .iter()
-        .filter_map(|(k, v)| {
-            let key_str = k.string_ref()?.inner();
-            if !key_str.starts_with(keys::HP_PREFIX) {
-                return None;
-            }
-            let mount_dict = v.dict_or_object_dict()?;
+        .flat_map(|(k, v)| {
+            let Some(key_str) = k.string_ref().map(|s| s.inner().clone()) else {
+                return Vec::new();
+            };
+            let Some(mount_dict) = v.dict_or_object_dict() else {
+                return Vec::new();
+            };
             let mount_inner = mount_dict.inner();
-            let model_path = read_string(&mount_inner, keys::MODEL)?;
-
-            // Extract per-mount armor map (turret shell thickness).
-            let mount_armor: Option<ArmorMap> = mount_inner
-                .get(&pk(keys::ARMOR))
-                .and_then(|v| v.dict_or_object_dict())
-                .map(|d| parse_armor_dict(&d.inner()));
-
-            // Extract mount species from typeinfo.species.
-            let species = mount_inner
-                .get(&pk("typeinfo"))
-                .and_then(|v| v.dict_or_object_dict())
-                .and_then(|d| read_string(&d.inner(), "species"))
-                .and_then(|s| MountSpecies::from_gp_str(&s));
-
-            // Extract pitchDeadZones: list of [yaw_min, yaw_max, pitch_min, pitch_max].
-            let pitch_dead_zones: Vec<[f32; 4]> = parse_pitch_dead_zones(&mount_inner);
-
-            // Extract `ammoList`: declared order of Projectile GameParam names
-            // this mount can fire. Empty for non-firing mounts (directors,
-            // radars, finders, etc.). Tuple in pickled data; tolerate List too.
-            let ammo_list: Vec<String> = mount_inner
-                .get(&pk(keys::AMMO_LIST))
-                .map(|val| {
-                    let mut out = Vec::new();
-                    let push = |item: &Value, out: &mut Vec<String>| {
-                        if let Some(s) = item.string_ref() {
-                            out.push(s.inner().clone());
-                        }
-                    };
-                    match val {
-                        Value::Tuple(t) => t.inner().iter().for_each(|v| push(v, &mut out)),
-                        Value::List(l) => l.inner().iter().for_each(|v| push(v, &mut out)),
-                        _ => {}
-                    }
-                    out
+            if key_str.starts_with(keys::HP_PREFIX) {
+                return mount_point_from_dict(key_str, &mount_inner, None).into_iter().collect();
+            }
+            mount_node_list(&mount_inner)
+                .into_iter()
+                .filter_map(|node| {
+                    let pdz = wcs_pitch_dead_zones.get(&node);
+                    mount_point_from_dict(node, &mount_inner, pdz)
                 })
-                .unwrap_or_default();
-
-            Some(MountPoint::with_armor(key_str.clone(), model_path, mount_armor, species, pitch_dead_zones, ammo_list))
+                .collect()
         })
         .collect()
+}
+
+/// One `ShipUpgradeInfo` module's place in its upgrade chain.
+struct UpgradeChainPos {
+    uc_type: String,
+    /// `branchId` of the chain's root module. Event ships with selectable
+    /// branches give each branch's hull, primary-weapon and secondary-weapon
+    /// chains the same root `branchId`; child modules carry a placeholder 0.
+    branch: i64,
+    /// Number of `prev` hops to the chain root (root = 0).
+    depth: usize,
+    /// The module's `components`: component type key -> component names.
+    components: BTreeMap<String, Vec<String>>,
+}
+
+/// Chain position of every `ShipUpgradeInfo` module, keyed by module name.
+fn upgrade_chain_positions(upgrade_data: &BTreeMap<HashableValue, Value>) -> BTreeMap<String, UpgradeChainPos> {
+    struct Raw {
+        uc_type: String,
+        prev: String,
+        branch_id: i64,
+        components: BTreeMap<String, Vec<String>>,
+    }
+    let mut raw: BTreeMap<String, Raw> = BTreeMap::new();
+    for (name_val, value) in upgrade_data.iter() {
+        let Some(name) = name_val.string_ref().map(|s| s.inner().clone()) else {
+            continue;
+        };
+        let Some(dict) = value.dict_or_object_dict() else {
+            continue;
+        };
+        let dict = dict.inner();
+        let Some(uc_type) = read_string(&dict, keys::UC_TYPE) else {
+            continue;
+        };
+        let prev = read_string(&dict, "prev").unwrap_or_default();
+        let branch_id = dict.get(&pk("branchId")).and_then(|v| v.i64_ref().copied()).unwrap_or(0);
+        let mut components = BTreeMap::new();
+        if let Some(c) = dict.get(&pk(keys::COMPONENTS)).and_then(|v| v.dict_or_object_dict()) {
+            for (k, v) in c.inner().iter() {
+                if let Some(k) = k.string_ref() {
+                    components.insert(k.inner().clone(), read_all_strings(v));
+                }
+            }
+        }
+        raw.insert(name, Raw { uc_type, prev, branch_id, components });
+    }
+
+    let mut out = BTreeMap::new();
+    for (name, r) in &raw {
+        let mut root = name.as_str();
+        let mut depth = 0usize;
+        let mut seen: HashSet<&str> = HashSet::new();
+        while seen.insert(root) {
+            let Some(cur) = raw.get(root) else { break };
+            if cur.prev.is_empty() || !raw.contains_key(cur.prev.as_str()) {
+                break;
+            }
+            root = cur.prev.as_str();
+            depth += 1;
+        }
+        let branch = raw.get(root).map(|x| x.branch_id).unwrap_or(0);
+        out.insert(
+            name.clone(),
+            UpgradeChainPos { uc_type: r.uc_type.clone(), branch, depth, components: r.components.clone() },
+        );
+    }
+    out
+}
+
+/// The `uc_type` module that rides with a hull module at `(branch, depth)`:
+/// the same branch's module at the same chain depth, or that branch's deepest
+/// module when its chain is shorter. Ties resolve to the lowest module name.
+fn branch_linked_module<'a>(
+    positions: &'a BTreeMap<String, UpgradeChainPos>,
+    uc_type: &str,
+    branch: i64,
+    depth: usize,
+) -> Option<&'a UpgradeChainPos> {
+    let mut best: Option<&UpgradeChainPos> = None;
+    for p in positions.values() {
+        if p.uc_type != uc_type || p.branch != branch || p.depth > depth {
+            continue;
+        }
+        if best.is_none_or(|b| p.depth > b.depth) {
+            best = Some(p);
+        }
+    }
+    best
 }
 
 fn build_ship(ship_data: &BTreeMap<HashableValue, Value>) -> Vehicle {
@@ -722,6 +891,10 @@ fn build_ship(ship_data: &BTreeMap<HashableValue, Value>) -> Vehicle {
     // components. We build a HullUpgradeConfig for each, keyed by upgrade name.
     let mut hull_upgrades = HashMap::new();
 
+    // Chain position (ucType, branch, depth) of every module, for the
+    // branch-linked weapon modules below.
+    let chain_positions = upgrade_chain_positions(&upgrade_data.inner());
+
     for (upgrade_name_val, upgrade_value) in upgrade_data.inner().iter() {
         let Some(upgrade_name) = upgrade_name_val.string_ref().map(|s| s.inner().clone()) else {
             continue;
@@ -762,6 +935,44 @@ fn build_ship(ship_data: &BTreeMap<HashableValue, Value>) -> Vehicle {
             }
         }
 
+        // Branch-linked weapon modules. Event ships with selectable branches
+        // (`PXSC999_Siegfried_1510`, `PXSB101_Amagi_H2020`, ...) carry their
+        // guns in `_PrimaryWeapons` / `_SecondaryWeapons` modules instead of
+        // the `_Hull` module's components. The hull rides with the module of
+        // the same branch (root `branchId`) at the same chain depth. Fills
+        // only component types the `_Hull` module leaves unset, so ships
+        // without these modules are unchanged.
+        let chain_pos = chain_positions.get(&upgrade_name);
+        if let Some(pos) = chain_pos {
+            for uc in [keys::UC_TYPE_PRIMARY_WEAPONS, keys::UC_TYPE_SECONDARY_WEAPONS] {
+                let Some(linked) = branch_linked_module(&chain_positions, uc, pos.branch, pos.depth) else {
+                    continue;
+                };
+                for ct in keys::ComponentType::ALL {
+                    if config.component_names.contains_key(ct) {
+                        continue;
+                    }
+                    let Some(all_names) = linked.components.get(ct.key()) else {
+                        continue;
+                    };
+                    if let Some(first) = all_names.first() {
+                        config.component_names.insert(*ct, first.clone());
+                    }
+                    if all_names.len() > 1 {
+                        config.component_alternatives.insert(*ct, all_names.clone());
+                    }
+                }
+            }
+        }
+
+        // Per-node records of the hull's weapon-control-system component
+        // (node-list mounts read their per-node data there).
+        let wcs_pitch_dead_zones: HashMap<String, Vec<[f32; 4]>> = chain_pos
+            .and_then(|pos| pos.components.get("wcs"))
+            .and_then(|names| names.first())
+            .map(|wcs_name| wcs_node_pitch_dead_zones(ship_data, wcs_name))
+            .unwrap_or_default();
+
         // Read hull detection data and hull model path.
         if let Some(hull_comp) = config.component_names.get(&keys::ComponentType::Hull)
             && let Some(hull_data) = ship_data.get(&pk(hull_comp)).and_then(|v| v.dict_or_object_dict())
@@ -777,7 +988,7 @@ fn build_ship(ship_data: &BTreeMap<HashableValue, Value>) -> Vehicle {
         // Extract mount points for all model component types.
         for ct in keys::ComponentType::ALL {
             if let Some(comp_name) = config.component_names.get(ct) {
-                let mounts = extract_mounts(ship_data, comp_name);
+                let mounts = extract_mounts(ship_data, comp_name, &wcs_pitch_dead_zones);
                 if !mounts.is_empty() {
                     config.mounts_by_type.insert(*ct, ComponentMounts::new(comp_name.clone(), mounts));
                 }
@@ -788,7 +999,7 @@ fn build_ship(ship_data: &BTreeMap<HashableValue, Value>) -> Vehicle {
         for alternatives in config.component_alternatives.values() {
             for alt_name in alternatives.iter().skip(1) {
                 // Skip the first (default) since it is already in mounts_by_type.
-                let mounts = extract_mounts(ship_data, alt_name);
+                let mounts = extract_mounts(ship_data, alt_name, &wcs_pitch_dead_zones);
                 if !mounts.is_empty() {
                     config.alternative_mounts.insert(alt_name.clone(), ComponentMounts::new(alt_name.clone(), mounts));
                 }
@@ -824,8 +1035,11 @@ fn build_ship(ship_data: &BTreeMap<HashableValue, Value>) -> Vehicle {
             continue;
         };
 
-        // Collect main battery maxDist from _Hull and _Artillery upgrades
-        if (uc_type == keys::UC_TYPE_HULL || uc_type == keys::UC_TYPE_ARTILLERY)
+        // Collect main battery maxDist from _Hull, _Artillery and (branch event
+        // ships) _PrimaryWeapons upgrades
+        if (uc_type == keys::UC_TYPE_HULL
+            || uc_type == keys::UC_TYPE_ARTILLERY
+            || uc_type == keys::UC_TYPE_PRIMARY_WEAPONS)
             && let Some(art_comp) = components.inner().get(&pk(keys::COMP_ARTILLERY)).and_then(read_first_string)
             && let Some(art_data) = ship_data.get(&pk(&art_comp)).and_then(|v| v.dict_or_object_dict())
         {

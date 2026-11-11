@@ -16,6 +16,9 @@ pub const COMPONENTS: &str = "components";
 pub const UC_TYPE_HULL: &str = "_Hull";
 pub const UC_TYPE_ARTILLERY: &str = "_Artillery";
 pub const UC_TYPE_TORPEDOES: &str = "_Torpedoes";
+/// Branch event ships: per-branch weapon modules (see `branch_linked_module`).
+pub const UC_TYPE_PRIMARY_WEAPONS: &str = "_PrimaryWeapons";
+pub const UC_TYPE_SECONDARY_WEAPONS: &str = "_SecondaryWeapons";
 
 // Component type keys (inside "components" dict).
 //
