@@ -995,6 +995,7 @@ impl ShipAssets {
         let loaded = self.load_mounts(&db, &self_id_index, &mount_points, &hull_parts, &info.model_dir)?;
         let turret_models = loaded.turret_models;
         let mounts = loaded.mounts;
+        let air_ops_hull_nodes = loaded.air_ops_hull_nodes;
 
         // Resolve material-based camouflage schemes (ship-specific + universal)
         // for the ship being exported: its own param index and permoflages,
@@ -1018,6 +1019,7 @@ impl ShipAssets {
             hull_parts,
             turret_models,
             mounts,
+            air_ops_hull_nodes,
             skel_ext_files,
             info,
             options: options.clone(),
@@ -1384,6 +1386,19 @@ impl ShipAssets {
             }
         }
 
+        // Air-operations hull nodes: no GameParams mount names them, so the
+        // mount loop below never emits them. Kept in name order.
+        let mut air_ops_hull_nodes: Vec<AirOpsHullNode> = hp_transforms
+            .iter()
+            .filter(|(name, _)| is_air_ops_hull_node(name))
+            .map(|(name, xform)| AirOpsHullNode {
+                name: name.clone(),
+                parent_section: hp_section.get(name).cloned(),
+                transform: *xform,
+            })
+            .collect();
+        air_ops_hull_nodes.sort_by(|a, b| a.name.cmp(&b.name));
+
         // Load unique turret models.
         let (turret_models, turret_model_index) = self.load_turret_models_deduped(db, self_id_index, mount_points)?;
 
@@ -1480,6 +1495,12 @@ impl ShipAssets {
 
             let visual_transform = Some(base_transform);
 
+            // A catapult's launch run, in the launch pose: the client attaches
+            // the catapult model to the raw hardpoint (rotation kept) and turns
+            // its rotator back to the authored pose before a launch, so the
+            // run is the raw hardpoint composed with the model's own nodes.
+            let air_ops_nodes = catapult_launch_nodes(turret_visual, &db.strings, &hp_transform);
+
             // Build per-vertex barrel pitch if pitchDeadZones applies.
             let min_pitch = mi.min_pitch_at_yaw(0.0);
             let barrel_pitch =
@@ -1496,10 +1517,11 @@ impl ShipAssets {
                 barrel_pitch,
                 model_path: mi.model_path().to_string(),
                 ammo_list: mi.ammo_list().to_vec(),
+                air_ops_nodes,
             });
         }
 
-        Ok(LoadedMounts { turret_models, turret_model_index, mounts })
+        Ok(LoadedMounts { turret_models, turret_model_index, mounts, air_ops_hull_nodes })
     }
 
     /// Load unique turret models, deduplicating by model path.
@@ -1590,6 +1612,10 @@ pub struct ShipModelContext {
     hull_parts: Vec<OwnedSubModel>,
     turret_models: Vec<OwnedSubModel>,
     mounts: Vec<ResolvedMount>,
+    /// Hull nodes of the deck launchpad (parked-plane spots, take-off and
+    /// landing runs), raw hardpoint transforms in name order. Empty for a
+    /// ship without a flight deck.
+    air_ops_hull_nodes: Vec<AirOpsHullNode>,
     /// Per-segment `.skel_ext` files (decorative placements, loaded from VFS).
     /// Empty if the ship's model_dir has no `.skel_ext` files.
     skel_ext_files: Vec<OwnedSkelExt>,
@@ -1879,6 +1905,7 @@ impl ShipModelContext {
         let mut antiair = Vec::new();
         let mut torpedoes = Vec::new();
         let mut accessories = Vec::new();
+        let mut air_ops_catapults = Vec::new();
 
         // Per-asset-id running counter for instance_id uniqueness.
         let mut asset_counts: HashMap<String, usize> = HashMap::new();
@@ -1957,6 +1984,22 @@ impl ShipModelContext {
                 obj.insert("ammo_ids".to_string(), json!(mount.ammo_list));
             }
 
+            if !mount.air_ops_nodes.is_empty() {
+                let nodes: serde_json::Map<String, serde_json::Value> = mount
+                    .air_ops_nodes
+                    .iter()
+                    .map(|(name, raw)| (name.clone(), placement_transform_json(raw)))
+                    .collect();
+                air_ops_catapults.push(json!({
+                    "instance_id":    instance_id,
+                    "asset_id":       asset_id,
+                    "hp_name":        mount.hp_name,
+                    "parent_section": mount.parent_section,
+                    "hardpoint":      placement_transform_json(&mount.armor_transform.unwrap_or(IDENTITY_4X4)),
+                    "nodes":          nodes,
+                }));
+            }
+
             match mount.species {
                 Some(MountSpecies::Main) => turrets.push(entry),
                 Some(MountSpecies::Secondary) => secondaries.push(entry),
@@ -1976,7 +2019,7 @@ impl ShipModelContext {
         let now = format_rfc3339_utc(SystemTime::now());
         let toolkit_version = env!("CARGO_PKG_VERSION");
 
-        let manifest = json!({
+        let mut manifest = json!({
             "schema_version": 1,
             "ship": {
                 "model_dir":    self.info.model_dir,
@@ -2001,6 +2044,29 @@ impl ShipModelContext {
                 "note": "Decorative skel_ext placements are emitted to a companion file via `--skel-ext-candidates-json` (see `write_skel_ext_candidates_json`).",
             },
         });
+
+        // Air-operations nodes, only on a ship that has them (a flight deck
+        // or a catapult): every other ship's manifest stays as it was.
+        //   hull      — deck launchpad nodes of the hull visuals (name order)
+        //   catapults — per catapult mount, its raw hardpoint and launch
+        //               nodes in the launch pose (mount order)
+        // Same transform shape and convention as the placement entries.
+        if (!self.air_ops_hull_nodes.is_empty() || !air_ops_catapults.is_empty())
+            && let Some(obj) = manifest.as_object_mut()
+        {
+            let hull: Vec<serde_json::Value> = self
+                .air_ops_hull_nodes
+                .iter()
+                .map(|n| {
+                    json!({
+                        "name":           n.name,
+                        "parent_section": n.parent_section,
+                        "transform":      placement_transform_json(&n.transform),
+                    })
+                })
+                .collect();
+            obj.insert("air_ops_nodes".to_string(), json!({ "hull": hull, "catapults": air_ops_catapults }));
+        }
 
         let file = std::fs::File::create(path)
             .context_with(|| format!("Failed to create placements JSON at {}", path.display()))?;
@@ -2433,6 +2499,19 @@ struct LoadedMounts {
     #[allow(dead_code)]
     turret_model_index: HashMap<String, usize>,
     mounts: Vec<ResolvedMount>,
+    air_ops_hull_nodes: Vec<AirOpsHullNode>,
+}
+
+/// A hull node of the deck launchpad, read from the hull visuals: a parked
+/// plane spot (`HP_Deck_NN`) or an end of the take-off run (`HP_DeckStart` ->
+/// `HP_LiftOffPoint`) or of the landing run (`HP_DeckLand` ->
+/// `HP_DisappearPoint`).
+struct AirOpsHullNode {
+    name: String,
+    /// Hull section whose visual holds the node (`Bow` / `MidFront` / ...).
+    parent_section: Option<String>,
+    /// Raw hardpoint transform (native units, column-major), as for mounts.
+    transform: [f32; 16],
 }
 
 /// A mount instance with resolved transform.
@@ -2469,6 +2548,11 @@ struct ResolvedMount {
     /// secondary / antiair / torpedo entry; downstream consumers resolve each
     /// against the per-ship ballistics file produced by `wowsunpack ammo`.
     ammo_list: Vec<String>,
+    /// Catapult launch nodes (`HP_Plane_Start`, `HP_Plane_End` and the
+    /// rotator / slider pivot), each the raw hardpoint composed with the
+    /// catapult model's node in the authored (launch) pose. Empty unless the
+    /// mount's model carries both `HP_Plane_*` nodes.
+    air_ops_nodes: Vec<(String, [f32; 16])>,
 }
 
 /// Pre-resolved material-based camouflage scheme (owned data, no lifetimes).
@@ -3004,6 +3088,54 @@ fn resolve_compound_hp<'a>(
     let child_xform = parent_turret.visual.find_hardpoint_transform(child_hp, strings)?;
 
     Some((parent_hp, *parent_xform, Some(child_xform)))
+}
+
+/// Whether a hull node belongs to the deck launchpad the client builds for a
+/// ship with a flight deck: the parked-plane spots `HP_Deck_NN` (filled from
+/// 00 up to the airArmament `deckPlaceCount`), the take-off run `HP_DeckStart`
+/// -> `HP_LiftOffPoint` and the landing run `HP_DeckLand` ->
+/// `HP_DisappearPoint`.
+fn is_air_ops_hull_node(name: &str) -> bool {
+    matches!(name, "HP_DeckStart" | "HP_LiftOffPoint" | "HP_DeckLand" | "HP_DisappearPoint")
+        || name.strip_prefix("HP_Deck_").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Nodes of a catapult model that define its launch: the plane's start and
+/// end of the launch run, and the rotator (`Rotate_Y`) or slider
+/// (`Translate_Z`) the client animates between the rest and launch poses.
+const CATAPULT_LAUNCH_NODES: [&str; 4] = ["HP_Plane_Start", "HP_Plane_End", "Rotate_Y", "Translate_Z"];
+
+/// The launch nodes of a catapult mount, each composed onto `hardpoint` (the
+/// raw hull hardpoint, rotation kept), in the model's authored pose — the
+/// pose the client turns the rotator back to before a launch. Empty when the
+/// model lacks either `HP_Plane_*` node (every mount that is not a catapult).
+fn catapult_launch_nodes(
+    visual: &VisualPrototype,
+    strings: &assets_bin::StringsSection<'_>,
+    hardpoint: &[f32; 16],
+) -> Vec<(String, [f32; 16])> {
+    if visual.find_node_index_by_name("HP_Plane_Start", strings).is_none()
+        || visual.find_node_index_by_name("HP_Plane_End", strings).is_none()
+    {
+        return Vec::new();
+    }
+    CATAPULT_LAUNCH_NODES
+        .iter()
+        .filter_map(|&name| {
+            visual
+                .find_hardpoint_transform(name, strings)
+                .map(|m| (name.to_string(), mat4_mul_col_major(hardpoint, &m)))
+        })
+        .collect()
+}
+
+/// A raw (native, column-major) transform in the placements-JSON shape:
+/// proper rotation, glTF axes (Z negated), translation in metres.
+#[cfg(feature = "json")]
+fn placement_transform_json(raw: &[f32; 16]) -> serde_json::Value {
+    let matrix = super::gltf_export::negate_z_and_scale_to_metres(ensure_proper_rotation(*raw));
+    let position = [matrix[12], matrix[13], matrix[14]];
+    serde_json::json!({ "matrix": matrix.as_slice(), "position": position.as_slice() })
 }
 
 /// Build a [`BarrelPitch`] config for per-vertex barrel rotation.

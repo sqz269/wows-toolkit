@@ -99,6 +99,10 @@ const FEATURES: &[&str] = &[
     // and accessory GLBs), and armor JSON `materials_table` entries carry
     // `layer_thickness_mm` (`{"<layer>": mm}`) — one thickness per plate.
     "armor.layer_packed_material_id",
+    // Placements JSON `air_ops_nodes` (only on ships with a flight deck or a
+    // catapult): the deck launchpad's hull nodes (parked-plane spots,
+    // take-off and landing runs) and each catapult's launch nodes.
+    "export_ship.placements_json.air_ops_nodes",
 ];
 
 /// Schema identifiers emitted in toolkit JSON outputs. Keyed by contract

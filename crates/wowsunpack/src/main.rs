@@ -421,6 +421,15 @@ enum Commands {
         ///   { instance_id, asset_id, hp_name, scope, category, subcategory,
         ///     species, transform: { matrix: [16 floats, col-major, metres],
         ///     position: [x,y,z] } }
+        ///
+        /// A ship with a flight deck or a catapult also gets `air_ops_nodes`:
+        ///   { hull: [ { name, parent_section, transform } ],
+        ///     catapults: [ { instance_id, asset_id, hp_name, parent_section,
+        ///                    hardpoint, nodes: { <node>: transform } } ] }
+        /// `hull` holds the deck launchpad nodes (HP_Deck_NN, HP_DeckStart,
+        /// HP_LiftOffPoint, HP_DeckLand, HP_DisappearPoint); `nodes` holds
+        /// each catapult's HP_Plane_Start / HP_Plane_End and its Rotate_Y or
+        /// Translate_Z pivot in the launch pose, on the raw hardpoint.
         #[arg(long)]
         placements_json: Option<PathBuf>,
 
