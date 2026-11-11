@@ -103,6 +103,13 @@ const FEATURES: &[&str] = &[
     // catapult): the deck launchpad's hull nodes (parked-plane spots,
     // take-off and landing runs) and each catapult's launch nodes.
     "export_ship.placements_json.air_ops_nodes",
+    // `export-model --visual-json <file>` (batch item `visual_json`): the
+    // model's `.visual` structure — node hierarchy, render sets and the
+    // authored LOD table (`wowsunpack.visual/v1`).
+    "export_model.visual_json",
+    // `export-model --bake-skin-mirror` (batch `shared`): Z-mirror skinned
+    // render sets baked into model space with their skin kept.
+    "export_model.bake_skin_mirror",
 ];
 
 /// Schema identifiers emitted in toolkit JSON outputs. Keyed by contract
@@ -122,6 +129,7 @@ const SCHEMAS: &[(&str, &str)] = &[
     // v2: atlas_contour records hash their frame point lists, not the fixed
     // bytes (whose offsets move whenever an earlier record grows).
     ("metadata.content_hashes", "wowsunpack.content_hashes/v2"),
+    ("export_model.visual_json", "wowsunpack.visual/v1"),
 ];
 
 #[derive(Debug, Serialize)]
@@ -194,8 +202,8 @@ mod tests {
     fn contract_count_matches_spec() {
         let caps = build();
         assert_eq!(caps.contracts.len(), 11);
-        assert_eq!(caps.features.len(), 22);
-        assert_eq!(caps.schemas.len(), 10);
+        assert_eq!(caps.features.len(), 24);
+        assert_eq!(caps.schemas.len(), 11);
     }
 
     #[test]

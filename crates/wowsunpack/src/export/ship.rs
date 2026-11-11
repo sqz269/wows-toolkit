@@ -2833,6 +2833,120 @@ pub fn write_model_material_mappings_json(
     Ok(())
 }
 
+/// Write the structure of a sub-model's `.visual` as JSON
+/// (`wowsunpack.visual/v1`, `export-model --visual-json`).
+///
+/// - `nodes`: every node of the visual in its own order, with the index of
+///   its parent (`null` for a root). Transforms are not repeated here; the
+///   GLB carries them.
+/// - `render_sets`: name (the GLB mesh name under `--all-render-sets`),
+///   material identifier, MFM stem, skinned flag and the bound node names
+///   (the bone palette of a skinned set, the single carrier node of a
+///   static one).
+/// - `lods`: the authored LOD table in order: `extent` (the camera distance,
+///   in the visual's own units, beyond which the LOD stops drawing),
+///   `casts_shadow`, and the member render-set names.
+/// - `bounding_box`: the visual's bounding box in the GLB frame (metres,
+///   Z negated like every exported position).
+///
+/// Render-set names do not encode their LOD reliably (`disc_Shape1` is a
+/// LOD-0 set of a second propeller; `chassis_off_BlendBone_lod1Shape2`
+/// sits in LOD 2), so a consumer that builds LOD groups reads `lods`.
+pub fn write_model_visual_json(
+    vp: &VisualPrototype,
+    db: &PrototypeDatabase<'_>,
+    geometry_vfs_path: &str,
+    visual_vfs_path: &str,
+    sub_model: &str,
+    out_path: &Path,
+) -> Result<(), Report> {
+    use serde_json::json;
+
+    let strings = &db.strings;
+    let self_id_index = db.build_self_id_index();
+    let name_of =
+        |id: u32| strings.get_string_by_id(id).map(|s| s.to_string()).unwrap_or_else(|| format!("0x{id:08X}"));
+    let leaf_of = |self_id: u64| -> Option<String> {
+        if self_id == 0 {
+            return None;
+        }
+        self_id_index.get(&self_id).map(|&idx| db.paths_storage[idx].name.clone())
+    };
+
+    let nodes: Vec<serde_json::Value> = vp
+        .nodes
+        .name_ids
+        .iter()
+        .enumerate()
+        .map(|(i, &name_id)| {
+            let parent = vp.nodes.parent_ids[i];
+            json!({
+                "name": name_of(name_id),
+                "parent": if parent == 0xFFFF { serde_json::Value::Null } else { json!(parent) },
+            })
+        })
+        .collect();
+
+    let render_sets: Vec<serde_json::Value> = vp
+        .render_sets
+        .iter()
+        .map(|rs| {
+            let mfm =
+                leaf_of(rs.material_mfm_path_id).map(|leaf| leaf.strip_suffix(".mfm").unwrap_or(&leaf).to_string());
+            json!({
+                "name": name_of(rs.name_id),
+                "material": name_of(rs.material_name_id),
+                "mfm": mfm,
+                "skinned": rs.skinned,
+                "nodes": rs.node_name_ids.iter().map(|&id| name_of(id)).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    let lods: Vec<serde_json::Value> = vp
+        .lods
+        .iter()
+        .map(|lod| {
+            json!({
+                "extent": lod.extent,
+                "casts_shadow": lod.casts_shadow,
+                "render_sets": lod.render_set_names.iter().map(|&id| name_of(id)).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    // GLB frame: metres, Z negated (so the min and max Z swap).
+    let s = super::gltf_export::NATIVE_TO_METRES;
+    let bb = &vp.bounding_box;
+    let bbox_min = [bb.min[0] * s, bb.min[1] * s, -bb.max[2] * s];
+    let bbox_max = [bb.max[0] * s, bb.max[1] * s, -bb.min[2] * s];
+
+    let manifest = json!({
+        "schema": "wowsunpack.visual/v1",
+        "model": {
+            "geometry_path":   geometry_vfs_path,
+            "visual_path":     visual_vfs_path,
+            "sub_model":       sub_model,
+            "merged_geometry": leaf_of(vp.merged_geometry_path_id),
+        },
+        "pipeline": {
+            "toolkit_version": env!("CARGO_PKG_VERSION"),
+        },
+        "underwater_model": vp.underwater_model,
+        "abovewater_model": vp.abovewater_model,
+        "bounding_box": { "min": bbox_min, "max": bbox_max },
+        "nodes": nodes,
+        "render_sets": render_sets,
+        "lods": lods,
+    });
+
+    let file = std::fs::File::create(out_path)
+        .context_with(|| format!("Failed to create visual JSON at {}", out_path.display()))?;
+    serde_json::to_writer_pretty(std::io::BufWriter::new(file), &manifest)
+        .map_err(|e| rootcause::report!("Failed to serialize visual JSON: {e}"))?;
+    Ok(())
+}
+
 /// Resolved MFM info: stem (leaf name without `.mfm`) and full VFS path.
 ///
 /// `material_mfm_path_id` is the MFM's `selfId` hash (matches

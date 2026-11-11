@@ -287,6 +287,17 @@ enum Commands {
         #[arg(long)]
         skel_ext_candidates_json: Option<PathBuf>,
 
+        /// If set, write the model's `.visual` structure as JSON
+        /// (`wowsunpack.visual/v1`): the node hierarchy, every render set
+        /// (material, MFM, skinned flag, bound nodes) and the authored LOD
+        /// table (extent, shadow flag, member render sets), with the
+        /// bounding box in the GLB's frame. Render-set names in the GLB do
+        /// not encode their LOD reliably (`disc_Shape1` is a LOD-0 set), so
+        /// consumers that assemble LOD groups read the table from here.
+        /// Written only when a `.visual` is found.
+        #[arg(long)]
+        visual_json: Option<PathBuf>,
+
         /// List available camouflage texture schemes, then exit
         #[arg(long)]
         list_textures: bool,
@@ -306,6 +317,16 @@ enum Commands {
         /// `HP_AIR_*` nodes that the default gates would drop from the GLB.
         #[arg(long)]
         emit_hardpoints: bool,
+
+        /// With `--all-render-sets`: bake the Z-mirror rest frame of
+        /// `*_BlendBone`-skinned render sets (`det(BlendBone) < 0`) into their
+        /// vertices, flipping their winding to match, and KEEP their skin.
+        /// The skinned parts then sit in model space with the static parts and
+        /// the node tree at rest, and posed joints move them as the engine
+        /// does. For models drawn whole without a placement (aircraft); mount
+        /// exports leave it off (their placement corrects the mirror).
+        #[arg(long)]
+        bake_skin_mirror: bool,
 
         /// Synthesize ship-convention `Armor` + `Hitboxes` GLB groups from the
         /// `.geometry` `hit_locations` collision model. For shore structures
@@ -1578,9 +1599,11 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
             raw_dds_dir,
             material_mappings_json,
             skel_ext_candidates_json,
+            visual_json,
             list_textures,
             bake_legacy_pbs,
             emit_hardpoints,
+            bake_skin_mirror,
             collision_hitbox_groups,
             no_vfs,
         } => {
@@ -1597,9 +1620,11 @@ fn run_with_args(mut args: Args) -> Result<(), Report> {
                 raw_dds_dir: raw_dds_dir.as_deref(),
                 material_mappings_json: material_mappings_json.as_deref(),
                 skel_ext_candidates_json: skel_ext_candidates_json.as_deref(),
+                visual_json: visual_json.as_deref(),
                 list_textures,
                 bake_legacy_pbs,
                 emit_hardpoints,
+                bake_skin_mirror,
                 collision_hitbox_groups,
                 no_vfs,
                 vfs: vfs.as_ref(),
@@ -2326,9 +2351,11 @@ struct ExportModelParams<'a> {
     raw_dds_dir: Option<&'a Path>,
     material_mappings_json: Option<&'a Path>,
     skel_ext_candidates_json: Option<&'a Path>,
+    visual_json: Option<&'a Path>,
     list_textures: bool,
     bake_legacy_pbs: bool,
     emit_hardpoints: bool,
+    bake_skin_mirror: bool,
     collision_hitbox_groups: bool,
     no_vfs: bool,
     vfs: Option<&'a VfsPath>,
@@ -2348,9 +2375,11 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
         raw_dds_dir,
         material_mappings_json,
         skel_ext_candidates_json,
+        visual_json,
         list_textures,
         bake_legacy_pbs,
         emit_hardpoints,
+        bake_skin_mirror,
         collision_hitbox_groups,
         no_vfs,
         vfs,
@@ -2375,9 +2404,11 @@ fn run_export_model(params: &ExportModelParams<'_>) -> Result<(), Report> {
         raw_dds_dir,
         material_mappings_json,
         skel_ext_candidates_json,
+        visual_json,
         list_textures,
         bake_legacy_pbs,
         emit_hardpoints,
+        bake_skin_mirror,
         collision_hitbox_groups,
         no_vfs,
         vfs,
@@ -2415,9 +2446,11 @@ fn export_one_model(
     raw_dds_dir: Option<&Path>,
     material_mappings_json: Option<&Path>,
     skel_ext_candidates_json: Option<&Path>,
+    visual_json: Option<&Path>,
     list_textures: bool,
     bake_legacy_pbs: bool,
     emit_hardpoints: bool,
+    bake_skin_mirror: bool,
     collision_hitbox_groups: bool,
     no_vfs: bool,
     vfs: Option<&VfsPath>,
@@ -2544,6 +2577,7 @@ fn export_one_model(
             lod_chain,
             &hitboxes,
             emit_hardpoints,
+            bake_skin_mirror,
             collision_hitbox_groups,
             &mut tex_out,
             &mut out_file,
@@ -2620,6 +2654,26 @@ fn export_one_model(
                 }
             }
         }
+
+        // Visual JSON — node hierarchy, render sets and the authored LOD
+        // table of the `.visual` the GLB was built from.
+        if let Some(vj_path) = visual_json {
+            let geom_stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            if let Some(parent) = vj_path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            wowsunpack::export::ship::write_model_visual_json(
+                vp,
+                db,
+                &file_str,
+                visual_suffix.as_deref().unwrap_or(""),
+                &geom_stem,
+                vj_path,
+            )?;
+            if verbose {
+                println!("  visual json: {}", vj_path.display());
+            }
+        }
     } else {
         // 4. Fallback: raw geometry export (no visual available).
         if list_textures {
@@ -2669,6 +2723,10 @@ struct BatchSharedOptions {
     /// Emit named static node trees (see `export-model --emit-hardpoints`).
     #[serde(default)]
     emit_hardpoints: bool,
+    /// Bake Z-mirror skins into model space, keeping the skin (see
+    /// `export-model --bake-skin-mirror`).
+    #[serde(default)]
+    bake_skin_mirror: bool,
     /// Synthesize Armor/Hitboxes groups from the `hit_locations` collision
     /// model (see `export-model --collision-hitbox-groups`).
     #[serde(default)]
@@ -2687,6 +2745,9 @@ struct BatchItem {
     material_mappings_json: Option<PathBuf>,
     #[serde(default)]
     skel_ext_candidates_json: Option<PathBuf>,
+    /// Write the model's `.visual` structure (see `export-model --visual-json`).
+    #[serde(default)]
+    visual_json: Option<PathBuf>,
 }
 
 #[derive(serde::Deserialize)]
@@ -2707,6 +2768,7 @@ impl Default for BatchSharedOptions {
             textures_uri_prefix: None,
             bake_legacy_pbs: false,
             emit_hardpoints: false,
+            bake_skin_mirror: false,
             collision_hitbox_groups: false,
         }
     }
@@ -2755,9 +2817,11 @@ fn run_batch_export_model(manifest_path: &Path, keep_going: bool, vfs: &VfsPath)
             item.raw_dds_dir.as_deref(),
             item.material_mappings_json.as_deref(),
             item.skel_ext_candidates_json.as_deref(),
+            item.visual_json.as_deref(),
             /* list_textures: */ false,
             shared.bake_legacy_pbs,
             shared.emit_hardpoints,
+            shared.bake_skin_mirror,
             shared.collision_hitbox_groups,
             /* no_vfs: */ false,
             Some(vfs),

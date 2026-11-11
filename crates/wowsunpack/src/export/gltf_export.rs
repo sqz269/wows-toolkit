@@ -118,6 +118,13 @@ pub fn export_glb(
     // static gun hardpoints (`HP_GUN_1`, `HP_AIR_*`) that the default gates
     // drop from the GLB; consumers need them as named nodes to mount guns.
     emit_hardpoints: bool,
+    // `--all-render-sets` only: bake the Z-mirror rest frame of
+    // `*_BlendBone`-skinned render sets into their vertices (and flip their
+    // winding to match) while KEEPING the skin. Default exports leave such
+    // sets in the mirrored bind frame (their placement conjugation corrects
+    // them); a model drawn as a whole with no placement (an aircraft) needs
+    // the skin in model space, where its static parts and nodes are.
+    bake_skin_mirror: bool,
     // Synthesize `Armor` + `Hitboxes` groups from the `.geometry`
     // `hit_locations` collision model (shore structures ship no armor BVH and
     // no `.splash`). See `collision_hit_locations_sub_models`.
@@ -147,8 +154,15 @@ pub fn export_glb(
     if all_render_sets {
         // Bundle every render set as its own named mesh (all LODs + both damage
         // states). See `collect_all_render_set_primitives` for the full rationale.
-        let named_primitives =
-            collect_all_render_set_primitives(visual, geometry, Some(db), Some(&self_id_index), None, false)?;
+        let named_primitives = collect_all_render_set_primitives(
+            visual,
+            geometry,
+            Some(db),
+            Some(&self_id_index),
+            None,
+            bake_skin_mirror,
+            bake_skin_mirror,
+        )?;
 
         if named_primitives.is_empty() {
             eprintln!("Warning: no render sets found in visual");
@@ -3657,6 +3671,9 @@ fn collect_all_render_set_primitives(
     self_id_index: Option<&HashMap<u64, usize>>,
     barrel_pitch: Option<&BarrelPitch>,
     bake_rest_skin: bool,
+    // With `bake_rest_skin`: keep the skin attributes of the baked sets (see
+    // `decode_render_set_primitive`).
+    keep_skin_after_bake: bool,
 ) -> Result<Vec<(String, DecodedPrimitive)>, Report<ExportError>> {
     let mut result = Vec::new();
 
@@ -3671,7 +3688,16 @@ fn collect_all_render_set_primitives(
             continue;
         }
 
-        match decode_render_set_primitive(visual, geometry, db, self_id_index, rs, barrel_pitch, bake_rest_skin) {
+        match decode_render_set_primitive(
+            visual,
+            geometry,
+            db,
+            self_id_index,
+            rs,
+            barrel_pitch,
+            bake_rest_skin,
+            keep_skin_after_bake,
+        ) {
             Ok(Some(prim)) => result.push((rs_name, prim)),
             Ok(None) => {}
             Err(e) => return Err(e),
@@ -3687,6 +3713,7 @@ fn collect_all_render_set_primitives(
 ///
 /// Extracted from `collect_primitives` so both the filtered (`--lod`/`--damaged`)
 /// and the all-render-sets paths share one decoder.
+#[allow(clippy::too_many_arguments)]
 fn decode_render_set_primitive(
     visual: &VisualPrototype,
     geometry: &MergedGeometry,
@@ -3704,6 +3731,12 @@ fn decode_render_set_primitive(
     // emit a real glTF Skin and their placement conjugation handles the
     // mirror (schema_v6).
     bake_rest_skin: bool,
+    // Keep the skin attributes of a set the rest bake touched. The joints'
+    // inverse-bind matrices stay the inverse of their rest worlds (the shared
+    // mirror for a Z-mirror skin), so the skinned rest pose is the baked
+    // positions and a posed joint `J(t)` maps a vertex to
+    // `J(t) * mirror^-1 * (mirror * v) = J(t) * v`: the engine's own skinning.
+    keep_skin_after_bake: bool,
 ) -> Result<Option<DecodedPrimitive>, Report<ExportError>> {
     let vertices_mapping_id = rs.vertices_mapping_id;
     let indices_mapping_id = rs.indices_mapping_id;
@@ -3799,7 +3832,15 @@ fn decode_render_set_primitive(
     // passes `all_render_sets=true`), so the gate is load-bearing here.
     let zmirror_skin =
         db.and_then(|db| visual.find_any_blendbone_local_matrix(&db.strings)).is_some_and(|m| mat3_det(&m) < 0.0);
-    if !(zmirror_skin && rs.skinned) {
+    // Keep-skin rest bake (`keep_skin_after_bake`): the mirror comes from THIS
+    // set's own bone palette — the shared rest world of its joints when that
+    // is a reflection. The model-wide gate above reads whichever BlendBone the
+    // name map lists first, which on an aircraft can be a static carrier
+    // (`chassis_off_BlendBone`, `pylon_*_BlendBone`, identity) instead of the
+    // mirrored skin root, and would leave the skin mirrored.
+    let palette_mirror =
+        if bake_rest_skin && keep_skin_after_bake && rs.skinned { palette_rest_reflection(visual, rs) } else { None };
+    if !(zmirror_skin && rs.skinned) && palette_mirror.is_none() {
         flip_triangle_winding(&mut indices);
     }
 
@@ -3817,7 +3858,14 @@ fn decode_render_set_primitive(
     // triangle orientation in the data — net result matches the standard
     // flipped static path, so the existing gate stays correct.
     let mut skin_mirror_baked = false;
-    if bake_rest_skin && rs.skinned && zmirror_skin {
+    if let Some(mirror) = palette_mirror {
+        // Same bake as below, from the set's own palette; the winding skipped
+        // the flip above, so the flip here leaves the standard flipped order.
+        let gltf_mirror = negate_z_transform(mirror);
+        transform_positions_normals(&mut verts.positions, &mut verts.normals, &gltf_mirror);
+        flip_triangle_winding(&mut indices);
+        skin_mirror_baked = true;
+    } else if bake_rest_skin && !keep_skin_after_bake && rs.skinned && zmirror_skin {
         if let Some(mirror) = db.and_then(|db| visual.find_root_blendbone_local_matrix(&db.strings)) {
             let gltf_mirror = negate_z_transform(mirror);
             transform_positions_normals(&mut verts.positions, &mut verts.normals, &gltf_mirror);
@@ -3867,7 +3915,8 @@ fn decode_render_set_primitive(
     // rest-frame mirror bake: baked positions + skin attributes would
     // double-apply the mirror on a skinning consumer.
     let baked_barrel_pitch = barrel_pitch.is_some();
-    let (bones, weights, bone_palette) = if rs.skinned && !baked_barrel_pitch && !skin_mirror_baked {
+    let keep_skin = !skin_mirror_baked || keep_skin_after_bake;
+    let (bones, weights, bone_palette) = if rs.skinned && !baked_barrel_pitch && keep_skin {
         (verts.bones, verts.weights, Some(rs.node_name_ids.clone()))
     } else {
         (None, None, None)
@@ -4161,6 +4210,30 @@ fn static_render_set_world_matrix(
     let map_index = nodes.name_map_name_ids.iter().position(|&name_id| name_id == node_name_id)?;
     let node_idx = *nodes.name_map_node_ids.get(map_index)?;
     visual_nodes_world_matrix(nodes, node_idx)
+}
+
+/// The rest world shared by a skinned render set's bone palette, when it is a
+/// reflection (`det < 0`): the bind frame a Z-mirror-authored skin stores its
+/// vertices in. Every palette joint must agree within a small tolerance
+/// (WG's articulated BlendBones carry tiny rest rotations), else `None`.
+fn palette_rest_reflection(visual: &VisualPrototype, rs: &crate::models::visual::RenderSet) -> Option<[f32; 16]> {
+    const TOL: f32 = 0.05;
+    let nodes = &visual.nodes;
+    let mut shared: Option<[f32; 16]> = None;
+    for &name_id in &rs.node_name_ids {
+        let map_index = nodes.name_map_name_ids.iter().position(|&n| n == name_id)?;
+        let node_idx = *nodes.name_map_node_ids.get(map_index)?;
+        let world = visual_nodes_world_matrix(nodes, node_idx)?;
+        match shared {
+            None => shared = Some(world),
+            Some(first) => {
+                if first.iter().zip(world.iter()).any(|(a, b)| (a - b).abs() > TOL) {
+                    return None;
+                }
+            }
+        }
+    }
+    shared.filter(|m| mat3_det(m) < 0.0)
 }
 
 fn visual_nodes_world_matrix(nodes: &VisualNodes, node_idx: u16) -> Option<[f32; 16]> {
@@ -7300,7 +7373,8 @@ pub fn export_ship_glb(
                 Some(db),
                 Some(&self_id_index),
                 sub.barrel_pitch.as_ref(),
-                true, // ship export: bake Z-mirror skinned hull parts static
+                true,  // ship export: bake Z-mirror skinned hull parts static
+                false, // ... and drop their skin (no consumer skins hull parts)
             )?;
 
             if named_primitives.is_empty() {
