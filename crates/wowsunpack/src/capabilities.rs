@@ -194,7 +194,7 @@ mod tests {
     fn contract_count_matches_spec() {
         let caps = build();
         assert_eq!(caps.contracts.len(), 11);
-        assert_eq!(caps.features.len(), 21);
+        assert_eq!(caps.features.len(), 22);
         assert_eq!(caps.schemas.len(), 10);
     }
 
